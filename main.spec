@@ -17,7 +17,7 @@ block_cipher = None
 datas = []
 binaries = []
 extra_hiddenimports = []
-for _pkg in ("pypdfium2", "pypdfium2_raw"):
+for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy"):
     _datas, _binaries, _hidden = collect_all(_pkg)
     datas += _datas
     binaries += _binaries
@@ -99,6 +99,7 @@ a = Analysis(
         'dataclasses',
         'collections',
         'charset_normalizer',
+        'sqlite3',
     ] + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -106,7 +107,6 @@ a = Analysis(
     excludes=[
         'matplotlib',
         'scipy',
-        'numpy',
         'IPython',
         'notebook',
         'pytest',

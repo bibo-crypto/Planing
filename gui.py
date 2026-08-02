@@ -52,6 +52,13 @@ from dfm_lookup import (
     save_dfm_cache,
 )
 from utils import find_pdfs, load_settings, logger, make_output_path, save_settings
+from modern_widgets import RoundedButton
+
+# Keep the existing button call sites and their commands, but render them as
+# rounded pill controls throughout the application.
+ttk.Button = RoundedButton
+
+from situazione_tab import SituazioneTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -106,6 +113,15 @@ class ConverterApp(tk.Tk):
         self.title(self.WINDOW_TITLE)
         self.minsize(self.WINDOW_MIN_W, self.WINDOW_MIN_H)
         self.resizable(True, True)
+        # Give the application a useful initial size.  Without an explicit
+        # geometry Tk can choose a size based on the currently selected page,
+        # which makes the notebook tabs easy to miss on smaller displays or
+        # with high-DPI scaling enabled.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        initial_w = min(1400, max(self.WINDOW_MIN_W, int(screen_w * 0.90)))
+        initial_h = min(900, max(self.WINDOW_MIN_H, int(screen_h * 0.90)))
+        self.geometry(f"{initial_w}x{initial_h}")
         self._set_window_icon()
 
         # ── Persisted state ───────────────────────────────────────────
@@ -175,6 +191,49 @@ class ConverterApp(tk.Tk):
         self.rowconfigure(1, weight=1)   # log area
 
         style = ttk.Style(self)
+        # Use the same renderer that gives Situazione its reliable colored
+        # headers, then modernize controls without changing the application's
+        # existing light palette or the dedicated Treeview colors.
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(
+            "TButton",
+            font=("Segoe UI", 9),
+            padding=(12, 7),
+            relief="flat",
+            borderwidth=1,
+            background="#f8fafc",
+            foreground="#16324f",
+            bordercolor="#b8c6d6",
+            lightcolor="#b8c6d6",
+            darkcolor="#b8c6d6",
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("pressed", "#cbd5e1"),
+                ("active", "#e2e8f0"),
+                ("disabled", "#eef2f6"),
+                ("!active", "#f8fafc"),
+            ],
+            foreground=[("disabled", "#94a3b8"), ("!disabled", "#16324f")],
+            relief=[("pressed", "sunken"), ("!pressed", "flat")],
+        )
+        style.configure(
+            "TEntry",
+            padding=(7, 5),
+            relief="flat",
+            borderwidth=1,
+            fieldbackground="#ffffff",
+            foreground="#1d2939",
+            bordercolor="#b8c6d6",
+            lightcolor="#b8c6d6",
+            darkcolor="#b8c6d6",
+        )
+        style.map("TEntry", bordercolor=[("focus", "#5b9bd5")])
+        # Keep the page tabs compact enough to remain visible on smaller
+        # displays while preserving the normal Notebook tab appearance.
+        style.configure("TNotebook.Tab", padding=(10, 5))
         # Distinct background for whichever tab is currently selected, so
         # it's obvious at a glance which tab is open. Only the background
         # is overridden — leaving foreground at its theme default avoids a
@@ -203,7 +262,19 @@ class ConverterApp(tk.Tk):
         self._build_po_tab(po_tab)
         self._build_bolla_tab(bolla_tab)
         self._build_elvy_invoice_tab(elvy_invoice_tab)
+
+        # Situazione tab is a self-contained module (situazione_tab.py) — it
+        # manages its own uploads, SQLite state, and UI, so it's built by
+        # instantiating it directly rather than through a _build_*_tab method.
+        situazione_tab = SituazioneTab(notebook)
+        notebook.add(situazione_tab, text="Situazione")
+
         self._build_log_area()
+        notebook.bind(
+            "<<NotebookTabChanged>>",
+            lambda _event: self._update_log_visibility(notebook, situazione_tab),
+        )
+        self._update_log_visibility(notebook, situazione_tab)
         self._restore_saved_paths()
 
     # ------------------------------------------------------------------
@@ -562,7 +633,9 @@ class ConverterApp(tk.Tk):
             )
             return
 
-        save_dfm_cache(lookup, Path(path).name)
+        # Keep the parsed reference and the original validated file location
+        # in one shared cache used by both Data Elvy and Situazione.
+        save_dfm_cache(lookup, Path(path).name, Path(path))
         self._refresh_dfm_status()
         messagebox.showinfo(
             "DFM Reference Loaded",
@@ -654,6 +727,7 @@ class ConverterApp(tk.Tk):
     def _build_log_area(self) -> None:
         log_frame = ttk.LabelFrame(self, text="Log", padding=6)
         log_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        self._log_frame = log_frame
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
 
@@ -673,6 +747,23 @@ class ConverterApp(tk.Tk):
         log_scroll = ttk.Scrollbar(log_frame, command=self._log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self._log_text.configure(yscrollcommand=log_scroll.set)
+
+    def _update_log_visibility(self, notebook: ttk.Notebook, situazione_tab: ttk.Frame) -> None:
+        """Hide the shared log where the page has its own full-screen workspace."""
+        selected_tab = notebook.select()
+        situazione_selected = selected_tab == str(situazione_tab)
+        data_elvy_selected = notebook.tab(selected_tab, "text") == "Data Elvy"
+        # DFM can be a large Excel export.  Do not parse it during application
+        # startup while Situazione is hidden; restore it when that page opens.
+        if situazione_selected:
+            situazione_tab.sync_shared_dfm()
+        self._refresh_dfm_status()
+        if situazione_selected or data_elvy_selected:
+            self._log_frame.grid_remove()
+            self.rowconfigure(1, weight=0)
+        else:
+            self._log_frame.grid()
+            self.rowconfigure(1, weight=1)
 
         self._log_text.tag_configure("INFO", foreground="#4FC1FF")
         self._log_text.tag_configure("WARNING", foreground="#FFD700")
