@@ -168,12 +168,17 @@ def build_dfm_lookup(xlsx_path: Path) -> list[dict[str, str]]:
     return entries
 
 
-def save_dfm_cache(entries: list[dict[str, str]], source_name: str) -> None:
+def save_dfm_cache(
+    entries: list[dict[str, str]],
+    source_name: str,
+    source_path: Path | None = None,
+) -> None:
     """Persist *entries* (plus metadata) to the cache file."""
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "source_file": source_name,
+            "source_path": str(source_path) if source_path else "",
             "loaded_at": datetime.now().isoformat(timespec="seconds"),
             "entries": entries,
         }
@@ -188,7 +193,9 @@ def load_dfm_cache() -> dict[str, Any]:
     Returns {"source_file": "", "loaded_at": "", "entries": []} if no
     cache exists yet or it can't be read.
     """
-    empty: dict[str, Any] = {"source_file": "", "loaded_at": "", "entries": []}
+    empty: dict[str, Any] = {
+        "source_file": "", "source_path": "", "loaded_at": "", "entries": []
+    }
     try:
         if CACHE_FILE.is_file():
             data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
