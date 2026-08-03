@@ -761,9 +761,18 @@ class ConverterApp(tk.Tk):
         if situazione_selected or data_elvy_selected:
             self._log_frame.grid_remove()
             self.rowconfigure(1, weight=0)
+            self.rowconfigure(0, weight=3)
+            notebook.configure(height=1)
         else:
             self._log_frame.grid()
-            self.rowconfigure(1, weight=1)
+            # Let the log occupy roughly two thirds of the window on the
+            # conversion tabs, leaving the active page the upper third.
+            self.rowconfigure(0, weight=1)
+            self.rowconfigure(1, weight=2)
+            # The conversion pages have a large natural requested height.
+            # Cap that request so the grid weights can actually give the log
+            # its intended share of the window.
+            notebook.configure(height=300)
 
         self._log_text.tag_configure("INFO", foreground="#4FC1FF")
         self._log_text.tag_configure("WARNING", foreground="#FFD700")

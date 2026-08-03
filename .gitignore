@@ -1,0 +1,42 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaged application output
+build/
+dist/
+installer_output/
+*.spec.bak
+*.exe
+*.msi
+
+# Runtime logs and local application settings
+logs/
+settings/
+*.log
+*.pkl
+
+# Situazione local database and SQLite sidecars
+situazione/*.db
+situazione/*.db-*
+situazione/*.sqlite
+situazione/*.sqlite-*
+
+# User-selected/imported data files
+*.xlsx
+*.xls
+*.pdf
+*.csv
+
+# Local IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+

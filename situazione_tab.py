@@ -96,11 +96,18 @@ class SourceRow(ttk.Frame):
         self.dot.grid(row=1, column=0, padx=(4, 2), sticky="w")
 
         button_name = SOURCE_BUTTON_NAMES.get(key, label)
-        self.button = ttk.Button(self, text=f"Upload {button_name}", command=self._browse, width=22)
+        self.button = ttk.Button(
+            self,
+            text=f"Upload {button_name}",
+            command=self._browse,
+            width=21,
+            font=("Segoe UI", 9, "bold"),
+            height=30,
+        )
         self.button.grid(row=0, column=0, columnspan=2, padx=4, pady=(3, 2), sticky="ew")
 
         self.status_lbl = ttk.Label(self, textvariable=self.status_var, anchor="w",
-                                    foreground="#667085", width=24)
+                                    foreground="#667085", width=22)
         self.status_lbl.grid(row=1, column=1, padx=(2, 4), sticky="w")
 
         self.columnconfigure(1, weight=1)
@@ -316,7 +323,7 @@ class SituazioneTab(ttk.Frame):
         self.loaded_frames["dfm"] = df
         self._shared_dfm_path = str(source_path)
         msg = f"✅ {len(df)} rows - {source_path.name}"
-        self.source_rows["dfm"].set_status(True, msg)
+        self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
         db.save_upload("dfm", source_path.name, len(df), "ok", msg, file_path=str(source_path))
 
     def _save_shared_dfm(self, path):
@@ -346,7 +353,7 @@ class SituazioneTab(ttk.Frame):
 
         self.loaded_frames[key] = df
         msg = f"✅ {len(df)} rows - {os.path.basename(path)}"
-        self.source_rows[key].set_status(True, msg)
+        self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
         db.save_upload(key, os.path.basename(path), len(df), "ok", msg, file_path=str(path))
         if key == "dfm":
             self._save_shared_dfm(path)
@@ -382,17 +389,16 @@ class SituazioneTab(ttk.Frame):
                         f"⚠ {info['message']} (select once to save path)",
                     )
                 else:
-                    row_widget.set_status(
-                        ok,
-                        f"{'✅' if ok else '❌'} {info['message']} (Last upload: {info['uploaded_at']})",
-                    )
+                    count = info.get("row_count", "")
+                    status_text = f"✅ {count} rows" if ok else f"❌ {info['message']}"
+                    row_widget.set_status(ok, status_text)
         codes_info = uploads.get("codes")
         if codes_info:
             if codes_info["status"] == "ok" and not codes_info.get("file_path"):
                 self.codes_row.set_status(False, "⚠ Saved status only (select once to save path)")
             else:
                 self.codes_row.set_status(codes_info["status"] == "ok",
-                                           f"✅ {codes_info['message']} (Last upload: {codes_info['uploaded_at']})")
+                                           f"✅ Saved ({codes_info.get('row_count', '')} codes)")
 
     # -------------------------------------------------------------- refresh
     def _on_refresh(self):

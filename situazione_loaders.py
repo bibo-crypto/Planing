@@ -68,12 +68,11 @@ def _load_with_header(path, required_cols, sheet_name=0):
 def load_wincoint_orders(path):
     """WINCOINT sheet / Table3: raw customer orders.
 
-    The real export uses ``Colore`` for the numeric colour code and
-    ``Sottolinea`` for the colour description.  Older code expected a
-    non-existent `` 4`` column, which made valid Wincoint files fail during
-    automatic reload.
+    In the current Wincoint export the display fields are positional:
+    column F is Codice and column G is Colore.  The remaining fields are
+    resolved by their header names so blank/extra columns cannot shift them.
     """
-    required = ["Cliente", "Articolo", "Colore", "Sottolinea", "Ordine", "Riga", "Data",
+    required = ["Cliente", "Articolo", "Data",
                 "Consegna", "Partita", "Ordinata", "Descrizione aggiuntiva ordine", "Bagno"]
     df, errors = _load_with_header(path, required)
     if df is None:
@@ -82,12 +81,15 @@ def load_wincoint_orders(path):
     df = df[df["Partita"].astype(str).str.strip() != ""]
     df = df[df["Partita"].astype(str) != "Partita"]
     df = df[df["Cliente"] != "TOTALE GENERALE"]
+    if len(df.columns) < 7:
+        return None, ["Wincoint must contain at least columns A through G (Codice and Colore)."]
+
     out = pd.DataFrame({
         "cliente": _s(df["Cliente"]),
         "articolo": _s(df["Articolo"]),
-        "codice": _s(df["Colore"]),        # "Colore" column here is actually the color code
-        "colore": _s(df["Sottolinea"]),     # colour description/name
-        "ordine": _s(df["Ordine"]),
+        "codice": _s(df.iloc[:, 5]),        # Wincoint column F -> Codice
+        "colore": _s(df.iloc[:, 6]),        # Wincoint column G -> Colore
+        "ordine": _s(df["Ordine"]) if "Ordine" in df.columns else _s(df.iloc[:, 5]),
         "riga": _s(df["Riga"]),
         "data": pd.to_datetime(df["Data"], errors="coerce"),
         "consegna": pd.to_datetime(df["Consegna"], errors="coerce"),
