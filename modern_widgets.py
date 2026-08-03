@@ -14,14 +14,15 @@ class RoundedButton(tk.Canvas):
         self._text = str(text)
         self._command = command
         self._state = "normal"
-        self._font = tkfont.Font(family="Segoe UI", size=9)
+        button_font = kwargs.pop("font", ("Segoe UI", 10, "bold"))
+        self._font = tkfont.Font(font=button_font)
         self._surface = self._frame_background(master)
-        self._height = 34
+        self._height = int(kwargs.pop("height", 40))
         text_width = self._font.measure(self._text)
         requested = int(width) if width is not None else 0
         if requested and requested <= 40:
-            requested = requested * 8 + 24
-        self._width = max(96, requested, text_width + 30)
+            requested = requested * 9 + 40
+        self._width = max(130, requested, text_width + 40)
 
         super().__init__(
             master,
@@ -38,6 +39,7 @@ class RoundedButton(tk.Canvas):
         self._hovered = False
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
+        self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._on_click)
         self.bind("<Return>", self._on_click)
         self.bind("<space>", self._on_click)
@@ -52,23 +54,28 @@ class RoundedButton(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
+        draw_width = max(self._width, self.winfo_width())
+        draw_height = max(self._height, self.winfo_height())
         disabled = self._state == "disabled"
         if disabled:
-            fill, outline, foreground = "#eef2f6", "#d6dee8", "#94a3b8"
+            fill, outline, foreground = "#dbe3ec", "#c4cfdb", "#7b8794"
         elif self._hovered:
-            fill, outline, foreground = "#e2e8f0", "#8fa8c0", "#16324f"
+            fill, outline, foreground = "#1d4ed8", "#1e40af", "#ffffff"
         else:
-            fill, outline, foreground = "#f8fafc", "#b8c6d6", "#16324f"
+            fill, outline, foreground = "#f8fafc", "#9fb2c5", "#16324f"
 
-        radius = self._height // 2
-        self.create_arc(1, 1, self._height - 1, self._height - 1,
-                        start=90, extent=180, fill=fill, outline=outline)
-        self.create_rectangle(radius, 1, self._width - radius, self._height - 1,
-                              fill=fill, outline=outline)
-        self.create_arc(self._width - self._height + 1, 1, self._width - 1, self._height - 1,
-                        start=270, extent=180, fill=fill, outline=outline)
-        self.create_text(self._width // 2, self._height // 2, text=self._text,
+        # A clean rectangular control keeps the hover/active area exactly
+        # aligned with the visible button bounds.
+        self.create_rectangle(1, 1, draw_width - 1, draw_height - 1,
+                              fill=fill, outline=outline, width=1)
+        self.create_text(draw_width // 2, draw_height // 2 - 1, text=self._text,
                          fill=foreground, font=self._font)
+
+    def _on_configure(self, _event):
+        # Grid/pack may stretch the Canvas beyond its requested width.  Redraw
+        # to that exact widget boundary so hover never activates in a blank
+        # area beside the visible button.
+        self._draw()
 
     def _on_enter(self, _event):
         if self._state != "disabled":
@@ -97,4 +104,3 @@ class RoundedButton(tk.Canvas):
         self._draw()
 
     config = configure
-
