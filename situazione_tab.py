@@ -9,6 +9,7 @@ sheets.
 """
 import os
 import json
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
@@ -20,6 +21,7 @@ import situazione_db as db
 import situazione_loaders as data_loaders
 import situazione_logic as business_logic
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
+from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
 
 STATUS_COLORS = {
@@ -314,10 +316,7 @@ class SituazioneTab(ttk.Frame):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not restore shared DFM file: %s", exc)
             return
-        # Wincoint is the base file.  An empty but structurally valid Wincoint
-        # is meaningful: it means all orders were removed and the saved
-        # situation should be cleared on the next Refresh.
-        if errors or df is None or (df.empty and key != "wincoint"):
+        if errors or df is None or df.empty:
             return
 
         self.loaded_frames["dfm"] = df
@@ -325,6 +324,43 @@ class SituazioneTab(ttk.Frame):
         msg = f"✅ {len(df)} rows - {source_path.name}"
         self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
         db.save_upload("dfm", source_path.name, len(df), "ok", msg, file_path=str(source_path))
+
+    def sync_shared_async(self):
+        """Restore shared large Excel sources in a worker, keeping tab changes responsive."""
+        self._sync_shared_source_async("dfm")
+        self._sync_shared_source_async("data_prod")
+
+    def _sync_shared_source_async(self, key):
+        cache = load_dfm_cache() if key == "dfm" else load_prod_cache()
+        source_path = Path(str(cache.get("source_path", "")))
+        syncing_key = f"_syncing_{key}"
+        if not source_path.is_file() or getattr(self, syncing_key, False):
+            return
+        if getattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", "") == str(source_path):
+            return
+        setattr(self, syncing_key, True)
+        loader = data_loaders.load_dfm if key == "dfm" else data_loaders.load_data_prod
+
+        def worker():
+            try:
+                df, errors = loader(str(source_path))
+            except Exception as exc:  # noqa: BLE001
+                df, errors = None, [str(exc)]
+
+            def apply_result():
+                setattr(self, syncing_key, False)
+                if errors or df is None or df.empty:
+                    return
+                self.loaded_frames[key] = df
+                setattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", str(source_path))
+                self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
+                db.save_upload(key, source_path.name, len(df), "ok",
+                               f"✅ {len(df)} rows - {source_path.name}",
+                               file_path=str(source_path))
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _save_shared_dfm(self, path):
         """Update the shared DFM cache when Situazione is the upload source."""
@@ -335,6 +371,37 @@ class SituazioneTab(ttk.Frame):
                 self._shared_dfm_path = str(Path(path))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared DFM reference: %s", exc)
+
+    def sync_shared_prod(self):
+        """Load the Produzione file selected in either page from the shared cache."""
+        cache = load_prod_cache()
+        source_path = Path(str(cache.get("source_path", "")))
+        if not source_path.is_file():
+            return
+        if getattr(self, "_shared_prod_path", "") == str(source_path):
+            return
+
+        try:
+            df, errors = data_loaders.load_data_prod(str(source_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not restore shared Produzione file: %s", exc)
+            return
+        if errors or df is None or df.empty:
+            return
+
+        self.loaded_frames["data_prod"] = df
+        self._shared_prod_path = str(source_path)
+        msg = f"✅ {len(df)} rows - {source_path.name}"
+        self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
+        db.save_upload("data_prod", source_path.name, len(df), "ok", msg, file_path=str(source_path))
+
+    def _save_shared_prod(self, path):
+        """Update the shared Produzione cache when Situazione is the upload source."""
+        try:
+            save_prod_cache(Path(path))
+            self._shared_prod_path = str(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not update shared Produzione reference: %s", exc)
 
     def _handle_upload(self, key, path):
         label, loader_fn = data_loaders.LOADERS[key]
@@ -357,6 +424,8 @@ class SituazioneTab(ttk.Frame):
         db.save_upload(key, os.path.basename(path), len(df), "ok", msg, file_path=str(path))
         if key == "dfm":
             self._save_shared_dfm(path)
+        if key == "data_prod":
+            self._save_shared_prod(path)
         logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(path))
 
     def _handle_codes_upload(self, _key, path):

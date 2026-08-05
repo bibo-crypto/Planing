@@ -105,6 +105,26 @@ def _twist_digit(descrizarticololi: str) -> str:
     return parts[-1] if parts and parts[-1].isdigit() else ""
 
 
+def _titolo(descrizarticololi: str) -> str:
+    """
+    Parse the yarn Titolo ('100/2', '70/1', ...) out of a DESCRIZARTICOLOLI
+    string like '0070  100.00 2' -- verified against a real Articoli.xlsx
+    reference: '0054  070.00 1' -> Titolo '70/1', '0070  100.00 2' -> '100/2'.
+    Returns "" if the format doesn't match.
+    """
+    parts = clean_text(descrizarticololi).split()
+    if len(parts) < 3:
+        return ""
+    count_str, ply = parts[-2], parts[-1]
+    if not ply.isdigit():
+        return ""
+    try:
+        count = int(round(float(count_str)))
+    except ValueError:
+        return ""
+    return f"{count}/{ply}"
+
+
 def _ne_twist_digit(ne: str) -> str:
     """Extract the twist digit from an Ne value like '100/2'. Returns "" if absent."""
     ne = clean_text(ne)
@@ -157,6 +177,7 @@ def build_dfm_lookup(xlsx_path: Path) -> list[dict[str, str]]:
             "coloredfm": coloredfm,
             "cldescr": cldescr,
             "twist": _twist_digit(row[col_idx["DESCRIZARTICOLOLI"]]),
+            "titolo": _titolo(row[col_idx["DESCRIZARTICOLOLI"]]),
             "date": date.isoformat() if date else "",
         })
 

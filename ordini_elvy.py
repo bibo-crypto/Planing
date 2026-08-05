@@ -192,3 +192,178 @@ def update_existing_ordini_file(target_path: Path, ordini_rows: list[OrdiniElvyR
     wb.save(target_path)
     wb.close()
     return len(ordini_rows)
+
+
+_FILATO_HEADER_TO_ATTR = {
+    "articolo": "articolo",
+    "titolo": "titolo",
+    "partita": "partita",
+    "rocce": "rocce",
+    "peso": "peso",
+    "تحضير خام": "label",
+}
+
+
+def read_filato_tinturia_sheet(source_path: Path) -> list[RawYarnMatch]:
+    """Read an existing 'Filato x Tinturia' sheet back into RawYarnMatch rows."""
+    import openpyxl  # local import: this module doesn't need openpyxl otherwise
+
+    wb = openpyxl.load_workbook(source_path, data_only=True)
+    if "Filato x Tinturia" not in wb.sheetnames:
+        wb.close()
+        raise ValueError(f"{source_path.name} has no \"Filato x Tinturia\" sheet.")
+    ws = wb["Filato x Tinturia"]
+
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    col_attr: dict[int, str] = {}
+    for cell in header_cells:
+        if cell.value is None:
+            continue
+        attr = _FILATO_HEADER_TO_ATTR.get(str(cell.value).strip().lower())
+        if attr:
+            col_attr[cell.column] = attr
+
+    rows: list[RawYarnMatch] = []
+    for row in ws.iter_rows(min_row=2):
+        values = {attr: row[col_idx - 1].value for col_idx, attr in col_attr.items()}
+        if not any(v not in (None, "") for v in values.values()):
+            continue
+        rows.append(RawYarnMatch(
+            articolo=str(values.get("articolo") or ""),
+            titolo=str(values.get("titolo") or ""),
+            partita=str(values.get("partita") or ""),
+            rocce=float(values.get("rocce") or 0),
+            peso=float(values.get("peso") or 0),
+            label=str(values.get("label") or "تحضير خام"),
+        ))
+    wb.close()
+    return rows
+
+
+def update_existing_filato_file(target_path: Path, matches: list[RawYarnMatch]) -> int:
+    """
+    Same transfer logic as update_existing_ordini_file(): open the existing
+    file at *target_path*, match its header row (any sheet/order, matched
+    by header TEXT) to Articolo/Titolo/Partita/Rocce/Peso/تحضير خام, clear
+    every data row from row 2 down, write *matches* starting at row 2, save.
+    Returns the number of rows written.
+    """
+    import openpyxl  # local import: this module doesn't need openpyxl otherwise
+
+    wb = openpyxl.load_workbook(target_path)
+    ws = wb.active
+
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    col_attr: dict[int, str] = {}
+    for cell in header_cells:
+        if cell.value is None:
+            continue
+        attr = _FILATO_HEADER_TO_ATTR.get(str(cell.value).strip().lower())
+        if attr:
+            col_attr[cell.column] = attr
+
+    if not col_attr:
+        wb.close()
+        raise ValueError(
+            "None of this file's column headers match the expected Filato x "
+            "Tinturia headers (Articolo, Titolo, Partita, Rocce, Peso, تحضير خام) "
+            "— is this the right file?"
+        )
+
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    for row_offset, match in enumerate(matches):
+        row_idx = 2 + row_offset
+        for col_idx, attr in col_attr.items():
+            ws.cell(row=row_idx, column=col_idx).value = getattr(match, attr, None)
+
+    wb.save(target_path)
+    wb.close()
+    return len(matches)
+
+
+@dataclass
+class RawYarnMatch:
+    """One row assigned for the "Filato x Tinturia" summary sheet."""
+    articolo: str = ""
+    titolo: str = ""
+    partita: str = ""
+    rocce: float = 0.0
+    peso: float = 0.0
+    label: str = "تحضير خام"
+
+
+def match_raw_yarn(ordini_rows: list["OrdiniElvyRow"], magazino_summary: "pd.DataFrame",
+                    codes_map: dict | None = None) -> list[RawYarnMatch]:
+    """
+    Fills in the Partita number in place of "X" in "PG-X-PO-..." for rows
+    that can be covered by available raw yarn, and returns the list of
+    batches actually assigned (for the "Filato x Tinturia" export sheet).
+
+    magazino_summary: output of magazino_logic.summarize_by_partita()
+      (columns: articolo, partita, mag_rocche, mag_peso) -- articolo here
+      is the raw (G-prefixed) code.
+    codes_map: optional {articolo_filato: titolo} lookup (Articoli.xlsx),
+      used only to fill in the Titolo column of the returned matches.
+
+    Matching rule (as specified): group the order rows still needing raw
+    yarn ("PG-X" in commento) by their G-code Articolo. For each group, if
+    a single available batch covers the group's total cones, assign that
+    batch's Partita to every row in the group. Otherwise, try to cover
+    each row individually with the smallest batch that fits it, leaving
+    any row that can't be covered as "PG-X".
+    """
+    if magazino_summary is None or magazino_summary.empty:
+        return []
+
+    pool: dict[str, list[dict]] = {}
+    for _, r in magazino_summary.iterrows():
+        pool.setdefault(str(r["articolo"]), []).append(
+            {"partita": str(r["partita"]), "rocche": float(r["mag_rocche"]), "peso": float(r["mag_peso"])}
+        )
+
+    groups: dict[str, list[int]] = {}
+    for i, row in enumerate(ordini_rows):
+        if "PG-X" not in (row.commento or ""):
+            continue
+        articolo_c = clean_text(row.articolo_delta).upper()
+        if not articolo_c.startswith("C"):
+            continue
+        articolo_g = "G" + articolo_c[1:]
+        groups.setdefault(articolo_g, []).append(i)
+
+    matches: list[RawYarnMatch] = []
+
+    def _assign(idxs, batch, cones_used):
+        for i in idxs:
+            ordini_rows[i].commento = ordini_rows[i].commento.replace("PG-X", f"PG-{batch['partita']}")
+        articolo_c_for_lookup = "C" + articolo_g[1:] if articolo_g.upper().startswith("G") else articolo_g
+        titolo = (codes_map or {}).get(articolo_c_for_lookup, "")
+        peso_used = batch["peso"] * (cones_used / batch["rocche"]) if batch["rocche"] else 0.0
+        matches.append(RawYarnMatch(articolo=articolo_g, titolo=titolo, partita=batch["partita"],
+                                     rocce=cones_used, peso=round(peso_used, 2)))
+
+    for articolo_g, idxs in groups.items():
+        batches = pool.get(articolo_g, [])
+        if not batches:
+            continue
+        total_needed = sum(ordini_rows[i].quantity_cones or 0 for i in idxs)
+
+        candidates = sorted((b for b in batches if b["rocche"] >= total_needed), key=lambda b: b["rocche"])
+        if candidates:
+            batch = candidates[0]
+            _assign(idxs, batch, total_needed)
+            batches.remove(batch)
+            continue
+
+        for i in idxs:
+            need = ordini_rows[i].quantity_cones or 0
+            fit = sorted((b for b in batches if b["rocche"] >= need), key=lambda b: b["rocche"])
+            if fit:
+                batch = fit[0]
+                _assign([i], batch, need)
+                batches.remove(batch)
+            # else: leave as PG-X -- nothing in stock covers this row yet
+
+    return matches

@@ -89,7 +89,7 @@ def load_wincoint_orders(path):
         "articolo": _s(df["Articolo"]),
         "codice": _s(df.iloc[:, 5]),        # Wincoint column F -> Codice
         "colore": _s(df.iloc[:, 6]),        # Wincoint column G -> Colore
-        "ordine": _s(df["Ordine"]) if "Ordine" in df.columns else _s(df.iloc[:, 5]),
+        "ordine": _s(df["Ordine"]) if "Ordine" in df.columns else "",  # no positional fallback: wrong index risks silently duplicating Codice
         "riga": _s(df["Riga"]),
         "data": pd.to_datetime(df["Data"], errors="coerce"),
         "consegna": pd.to_datetime(df["Consegna"], errors="coerce"),
@@ -103,7 +103,7 @@ def load_wincoint_orders(path):
 
 def load_dfm(path):
     """DFM sheet / Table8: machine + batch (Bagno) info."""
-    required = ["DESCRIZIONECDMACCHINA", "PARTITADFM", "NUMEROPROGRAMMANEWDFM"]
+    required = ["DESCRIZIONECDMACCHINA", "PARTITADFM", "NUMEROPROGRAMMANEWDFM", "ARTICOLODFM"]
     df, errors = _load_with_header(path, required)
     if df is None:
         return None, errors
@@ -113,6 +113,7 @@ def load_dfm(path):
         "partita": _s(df["PARTITADFM"]),
         "mc": pd.to_numeric(split[0], errors="coerce"),
         "bagno": _s(df["NUMEROPROGRAMMANEWDFM"]),
+        "articolo": _s(df["ARTICOLODFM"]),
     })
     out = out.sort_values("partita")
     return out, []
@@ -216,6 +217,41 @@ def load_codes(path):
         "titolo": _s(df["TITOLO"]),
     })
     out = out.drop_duplicates(subset="articolo_filato")
+    return out, []
+
+
+def load_produzione(path):
+    """
+    Raw production log (Situazione Settimana): one row per process event,
+    with the machine, batch (Partia Col), weight (Peso), yarn code, and the
+    date it was logged. Current Data prod exports call that date ``End``;
+    older weekly exports may call it ``Sheet Date``. Rework entries (Codice
+    ending in "RI" or "T.C") are excluded, matching the original report's
+    own rework flag.
+    """
+    # The file uploaded in Situazione is the same Data prod export used by
+    # the weekly page. It has ``End`` rather than ``Sheet Date``. Keep the
+    # common columns strict, then accept either date-column name.
+    required = ["Machine Name", "Partia Col", "Peso", "Codice"]
+    df, errors = _load_with_header(path, required)
+    if df is None:
+        return None, errors
+    date_column = "Sheet Date" if "Sheet Date" in df.columns else "End"
+    if date_column not in df.columns:
+        return None, ["Expected a production date column named End or Sheet Date"]
+    df = df[df["Partia Col"].notna()]
+    df = df[df["Partia Col"].astype(str) != "Partia Col"]
+    is_rework = _s(df["Codice"]).str.upper().str.endswith(("RI", "T.C"))
+    df = df[~is_rework]
+
+    out = pd.DataFrame({
+        "partita": _s(df["Partia Col"]),
+        "machine_name": _s(df["Machine Name"]),
+        "peso": pd.to_numeric(df["Peso"], errors="coerce"),
+        "sheet_date": pd.to_datetime(df[date_column], errors="coerce", dayfirst=True),
+    })
+    out = out.dropna(subset=["partita"])
+    out["week_of_year"] = out["sheet_date"].dt.isocalendar().week
     return out, []
 
 
