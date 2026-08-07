@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from typing import Callable
 import pandas as pd
 
 import situazione_loaders as data_loaders
@@ -28,16 +29,19 @@ HEADERS = {"cliente": "Cliente", "week_of_year": "Settimana", "machine_name": "M
 class SettimanaTab(ttk.Frame):
     """Embeddable 'Situazione Settimana' tab."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None):
         super().__init__(master)
+        self._on_shared_cache_changed = on_shared_cache_changed
         self.loaded_frames = {}          # "dfm" / "data_prod" -> DataFrame
         self._shared_dfm_path = ""
         self._shared_prod_path = ""
         self.batch_weights = pd.DataFrame()
+        self._shared_syncing = False
 
         self._build_upload_panel()
         self._build_toolbar()
         self._build_treeview()
+        self.after_idle(self.sync_shared_async)
 
     # ------------------------------------------------------------------ UI
     def _build_upload_panel(self):
@@ -119,6 +123,7 @@ class SettimanaTab(ttk.Frame):
             self._save_shared_dfm(path)
         if key == "data_prod":
             self._save_shared_prod(path)
+        self._auto_calculate_if_ready()
 
     # ---------------------------------------------------- shared DFM / Prod
     def sync_shared_dfm(self):
@@ -139,34 +144,46 @@ class SettimanaTab(ttk.Frame):
         self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
 
     def sync_shared_async(self):
-        """Restore shared DFM/Produzione files without blocking the UI thread."""
-        self._sync_shared_source_async("dfm")
-        self._sync_shared_source_async("data_prod")
+        """Restore shared DFM/Produzione in a worker so startup stays responsive."""
+        if self._shared_syncing:
+            return
+        dfm_path = str(load_dfm_cache().get("source_path", ""))
+        prod_path = str(load_prod_cache().get("source_path", ""))
+        needs_dfm = bool(dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path)
+        needs_prod = bool(prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path)
+        if not (needs_dfm or needs_prod):
+            return
 
-    def _sync_shared_source_async(self, key):
-        cache = load_dfm_cache() if key == "dfm" else load_prod_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        syncing_key = f"_syncing_{key}"
-        if not source_path.is_file() or getattr(self, syncing_key, False):
-            return
-        if getattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", "") == str(source_path):
-            return
-        setattr(self, syncing_key, True)
-        loader = data_loaders.load_dfm if key == "dfm" else data_loaders.load_produzione
+        self._shared_syncing = True
 
         def worker():
-            try:
-                df, errors = loader(str(source_path))
-            except Exception as exc:  # noqa: BLE001
-                df, errors = None, [str(exc)]
+            dfm_result = None
+            prod_result = None
+            if dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path:
+                try:
+                    dfm_result = data_loaders.load_dfm(dfm_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not restore shared DFM file: %s", exc)
+            if prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path:
+                try:
+                    prod_result = data_loaders.load_produzione(prod_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not restore shared Produzione file: %s", exc)
 
             def apply_result():
-                setattr(self, syncing_key, False)
-                if errors or df is None or df.empty:
-                    return
-                self.loaded_frames[key] = df
-                setattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", str(source_path))
-                self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
+                self._shared_syncing = False
+                if dfm_result and not dfm_result[1] and dfm_result[0] is not None and not dfm_result[0].empty:
+                    df = dfm_result[0]
+                    self.loaded_frames["dfm"] = df
+                    self._shared_dfm_path = dfm_path
+                    self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
+                if prod_result and not prod_result[1] and prod_result[0] is not None and not prod_result[0].empty:
+                    df = prod_result[0]
+                    self.loaded_frames["data_prod"] = df
+                    self._shared_prod_path = prod_path
+                    self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
+                self._auto_calculate_if_ready()
+                self.after_idle(self.sync_shared_async)
 
             self.after(0, apply_result)
 
@@ -178,6 +195,8 @@ class SettimanaTab(ttk.Frame):
             if entries:
                 save_dfm_cache(entries, Path(path).name, Path(path))
                 self._shared_dfm_path = str(Path(path))
+                if self._on_shared_cache_changed:
+                    self._on_shared_cache_changed()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared DFM reference: %s", exc)
 
@@ -202,8 +221,15 @@ class SettimanaTab(ttk.Frame):
         try:
             save_prod_cache(Path(path))
             self._shared_prod_path = str(Path(path))
+            if self._on_shared_cache_changed:
+                self._on_shared_cache_changed()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared Produzione reference: %s", exc)
+
+    def _auto_calculate_if_ready(self):
+        """Recalculate and refresh the weekly tree once both files are ready."""
+        if "dfm" in self.loaded_frames and "data_prod" in self.loaded_frames:
+            self._on_refresh()
 
     # -------------------------------------------------------------- refresh
     def _on_refresh(self):

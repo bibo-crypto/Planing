@@ -37,6 +37,7 @@ from excel_exporter import ExcelExporter
 from ordini_elvy import (
     build_ordini_elvy_rows,
     match_raw_yarn,
+    read_filato_tinturia_sheet,
     update_existing_filato_file,
     update_existing_ordini_file,
 )
@@ -56,6 +57,7 @@ from dfm_lookup import (
     lookup_dfm_color,
     save_dfm_cache,
 )
+from magazino_cache import load_magazino_cache, save_magazino_cache
 from utils import find_pdfs, load_settings, logger, make_output_path, save_settings
 from modern_widgets import RoundedButton
 
@@ -66,7 +68,7 @@ ttk.Button = RoundedButton
 from situazione_tab import SituazioneTab
 from situazione_settimana_tab import SettimanaTab
 from magazino_filato_tab import MagazinoFilatoTab
-from magazino_cache import load_magazino_cache, save_magazino_cache
+from kamal_tab import KamalTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -139,6 +141,8 @@ class ConverterApp(tk.Tk):
         self._po_pdf_path: Path | None = None
         self._po_folder_path: Path | None = None
         self._po_output_dir: Path | None = None
+        self._po_last_export_path: Path | None = None
+        self._po_filato_file_path: Path | None = None
         self._po_one_per_file = tk.BooleanVar(value=False)
         self._po_update_erp_file = tk.BooleanVar(value=False)
         self._po_update_erp_file.trace_add(
@@ -147,7 +151,6 @@ class ConverterApp(tk.Tk):
         )
         self._po_erp_file_path: Path | None = None
         self._po_raw_yarn_path: Path | None = None
-        self._po_filato_target_path: Path | None = None
 
         # ── Bolla tab state ────────────────────────────────────────────
         self._bolla_pdf_path: Path | None = None
@@ -197,7 +200,7 @@ class ConverterApp(tk.Tk):
     def _build_ui(self) -> None:
         """Build all widgets."""
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=3)   # all application pages
+        self.rowconfigure(0, weight=4)   # all application pages
         self.rowconfigure(1, weight=1)   # log area
 
         style = ttk.Style(self)
@@ -276,22 +279,54 @@ class ConverterApp(tk.Tk):
         # Situazione tab is a self-contained module (situazione_tab.py) — it
         # manages its own uploads, SQLite state, and UI, so it's built by
         # instantiating it directly rather than through a _build_*_tab method.
-        situazione_tab = SituazioneTab(notebook)
-        notebook.add(situazione_tab, text="Situazione")
+        self._situazione_tab = SituazioneTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        notebook.add(self._situazione_tab, text="Situazione")
 
-        settimana_tab = SettimanaTab(notebook)
-        notebook.add(settimana_tab, text="Situazione Settimana")
+        self._settimana_tab = SettimanaTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        notebook.add(self._settimana_tab, text="Situazione Settimana")
 
-        magazino_tab = MagazinoFilatoTab(notebook)
-        notebook.add(magazino_tab, text="Magazino Filato")
+        self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        notebook.add(self._magazino_tab, text="Magazino Filato")
+
+        self._kamal_tab = KamalTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        notebook.add(self._kamal_tab, text="Ordine Kamal")
 
         self._build_log_area()
         notebook.bind(
             "<<NotebookTabChanged>>",
-            lambda _event: self._update_log_visibility(notebook, situazione_tab, settimana_tab, magazino_tab),
+            lambda _event: self._update_log_visibility(notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab),
         )
-        self._update_log_visibility(notebook, situazione_tab, settimana_tab, magazino_tab)
+        self._update_log_visibility(notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab)
         self._restore_saved_paths()
+
+    def _on_shared_cache_changed(self) -> None:
+        """Update tabs when a shared DFM, Produzione or Magazino file is uploaded elsewhere."""
+        self._refresh_dfm_status()
+        self._refresh_magazino_status()
+        if getattr(self, "_situazione_tab", None):
+            self._situazione_tab.sync_shared_async()
+        if getattr(self, "_settimana_tab", None):
+            self._settimana_tab.sync_shared_async()
+        if getattr(self, "_kamal_tab", None):
+            self._kamal_tab.sync_shared_dfm()
+            self._kamal_tab.sync_shared_magazino()
+            self._kamal_tab.sync_shared_lotti()
+        if getattr(self, "_magazino_tab", None):
+            self._magazino_tab.sync_shared_async()
+            self._magazino_tab.sync_shared_lotti_async()
+
+    def _refresh_magazino_status(self) -> None:
+        cache = load_magazino_cache()
+        source_path = cache.get("source_path", "")
+        if source_path and Path(source_path).is_file():
+            current_path = getattr(self, "_po_raw_yarn_path", None)
+            if current_path is None or str(current_path) != str(source_path):
+                self._po_raw_yarn_path = Path(source_path)
+                self._po_lbl_raw_yarn.config(text=str(self._po_raw_yarn_path), foreground="black")
+                self._save_prefs(
+                    po_raw_yarn_path=str(self._po_raw_yarn_path),
+                    po_last_dir=str(self._po_raw_yarn_path.parent),
+                )
 
     # ------------------------------------------------------------------
     # Purchase Orders tab
@@ -301,52 +336,50 @@ class ConverterApp(tk.Tk):
         parent.columnconfigure(0, weight=1)
 
         # ── Input ────────────────────────────────────────────────────
-        sel_frame = ttk.LabelFrame(parent, text="Input", padding=4)
-        sel_frame.grid(row=0, column=0, sticky="ew", padx=3, pady=(2, 2))
+        sel_frame = ttk.LabelFrame(parent, text="Input", padding=6)
+        sel_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
         sel_frame.columnconfigure((0, 1, 2), weight=1)
 
         self._po_btn_pdf = ttk.Button(
-            sel_frame, text="📄 Select PDF", command=self._on_po_select_pdf, width=20
+            sel_frame, text="📄 Select PDF", command=self._on_po_select_pdf, width=16
         )
-        self._po_btn_pdf.grid(row=0, column=0, padx=3, pady=2, sticky="ew")
+        self._po_btn_pdf.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
 
         self._po_btn_folder = ttk.Button(
-            sel_frame, text="📁 Select Folder", command=self._on_po_select_folder, width=20
+            sel_frame, text="📁 Select Folder", command=self._on_po_select_folder, width=16
         )
-        self._po_btn_folder.grid(row=0, column=1, padx=3, pady=2, sticky="ew")
+        self._po_btn_folder.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
 
         self._po_btn_output = ttk.Button(
-            sel_frame, text="💾 Output Folder", command=self._on_po_select_output, width=20
+            sel_frame, text="💾 Output Folder", command=self._on_po_select_output, width=16
         )
-        self._po_btn_output.grid(row=0, column=2, padx=3, pady=2, sticky="ew")
+        self._po_btn_output.grid(row=0, column=2, padx=4, pady=4, sticky="ew")
 
         self._po_lbl_pdf_path = ttk.Label(
             sel_frame, text="No PDF selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_pdf_path.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4)
+        self._po_lbl_pdf_path.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 2))
 
         self._po_lbl_folder_path = ttk.Label(
             sel_frame, text="No folder selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_folder_path.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4)
+        self._po_lbl_folder_path.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 2))
 
         self._po_lbl_output_path = ttk.Label(
             sel_frame, text="No output folder selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_output_path.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4)
+        self._po_lbl_output_path.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 2))
 
         abbina_info = ttk.Label(
             parent,
-            text="Abbina is taken from the PDF's own Machine annotation when present; "
-                 "any row left without one is filled in automatically (smallest fitting "
-                 "machine for its same-colour group).",
-            foreground="grey", anchor="w", wraplength=720, justify="left",
+            text="Abbina uses the PDF Machine annotation when available. Rows without it are filled automatically.",
+            foreground="grey", anchor="w", wraplength=620, justify="left",
         )
-        abbina_info.grid(row=1, column=0, sticky="ew", padx=4, pady=(6, 0))
+        abbina_info.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
 
         # ── Update existing ERP file ─────────────────────────────────
-        erp_frame = ttk.LabelFrame(parent, text="Also Update Existing ERP File", padding=4)
-        erp_frame.grid(row=2, column=0, sticky="ew", padx=3, pady=(3, 2))
+        erp_frame = ttk.LabelFrame(parent, text="Also Update Existing ERP File", padding=6)
+        erp_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         erp_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
@@ -357,8 +390,8 @@ class ConverterApp(tk.Tk):
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Button(
-            erp_frame, text="📄 Select ERP File…", command=self._on_po_select_erp_file, width=20
-        ).grid(row=1, column=0, padx=(0, 6), pady=(2, 0), sticky="w")
+            erp_frame, text="📄 Select ERP File…", command=self._on_po_select_erp_file, width=16
+        ).grid(row=1, column=0, padx=(0, 6), pady=(3, 0), sticky="w")
 
         self._po_lbl_erp_file = ttk.Label(
             erp_frame, text="No file selected", foreground="grey", anchor="w"
@@ -374,39 +407,31 @@ class ConverterApp(tk.Tk):
 
         # ── Raw yarn (Magazino) matching ────────────────────────────
         raw_yarn_frame = ttk.LabelFrame(parent, text="Match Raw Yarn (optional)", padding=4)
-        raw_yarn_frame.grid(row=3, column=0, sticky="ew", padx=3, pady=(3, 2))
-        raw_yarn_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            raw_yarn_frame,
-            text="Upload the Magazino export to auto-fill \"PG-X\" with a matching raw yarn "
-                 "Partita wherever available stock covers a row's quantity — the Excel "
-                 "export then gets a \"Filato x Tinturia\" sheet listing what was assigned.",
-            foreground="grey", anchor="w", wraplength=720, justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        raw_yarn_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
+        raw_yarn_frame.columnconfigure(0, weight=1)
 
         ttk.Button(
-            raw_yarn_frame, text="📦 Select Raw Yarn File…", command=self._on_po_select_raw_yarn, width=22
-        ).grid(row=1, column=0, padx=(0, 6), pady=(2, 0), sticky="w")
+            raw_yarn_frame, text="📦 Select Magazino File…", command=self._on_po_select_raw_yarn, width=20
+        ).grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
 
         self._po_lbl_raw_yarn = ttk.Label(
-            raw_yarn_frame, text="No file selected", foreground="grey", anchor="w"
+            raw_yarn_frame, text="No Magazino file selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_raw_yarn.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        self._po_lbl_raw_yarn.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 2))
 
         ttk.Button(
-            raw_yarn_frame, text="📄 Select Filato x Tinturia File…",
-            command=self._on_select_filato_target,
-        ).grid(row=2, column=0, columnspan=2, pady=(3, 0), sticky="w")
+            raw_yarn_frame, text="🔄 Transfer Filato x Tinturia…",
+            command=self._on_transfer_filato_tinturia, width=20,
+        ).grid(row=2, column=0, padx=4, pady=(2, 4), sticky="ew")
 
-        self._po_lbl_filato_target = ttk.Label(
-            raw_yarn_frame, text="No target file selected", foreground="grey", anchor="w"
+        self._po_lbl_filato_file = ttk.Label(
+            raw_yarn_frame, text="No Filato x Tinturia target selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_filato_target.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self._po_lbl_filato_file.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 2))
 
         # ── Options + Convert ────────────────────────────────────────
-        opt_frame = ttk.Frame(parent, padding=(4, 2))
-        opt_frame.grid(row=4, column=0, sticky="ew", padx=3, pady=1)
+        opt_frame = ttk.Frame(parent, padding=(6, 3))
+        opt_frame.grid(row=4, column=0, sticky="ew", padx=4, pady=1)
         opt_frame.columnconfigure(0, weight=1)
 
         ttk.Checkbutton(
@@ -420,13 +445,13 @@ class ConverterApp(tk.Tk):
             text="▶  Convert",
             command=self._on_po_convert,
             style="Accent.TButton",
-            width=14,
+            width=12,
         )
-        self._po_btn_convert.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self._po_btn_convert.grid(row=0, column=1, sticky="e", padx=(8, 0), pady=(0, 1))
 
         # ── Progress + status ────────────────────────────────────────
         prog_frame = ttk.Frame(parent, padding=(4, 2))
-        prog_frame.grid(row=5, column=0, sticky="ew", padx=3, pady=1)
+        prog_frame.grid(row=5, column=0, sticky="ew", padx=4, pady=1)
         prog_frame.columnconfigure(0, weight=1)
 
         self._po_progress = ttk.Progressbar(prog_frame, mode="determinate", length=200)
@@ -547,9 +572,31 @@ class ConverterApp(tk.Tk):
         )
         info.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 8))
 
+        # ── Add / update entry ──────────────────────────────────────────
+        entry_frame = ttk.LabelFrame(parent, text="Add / Update Mapping", padding=8)
+        entry_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(4, 4))
+        entry_frame.columnconfigure(1, weight=1)
+        entry_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(entry_frame, text="Article No (Articolo Elvy):").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=4
+        )
+        self._elvy_entry_elvy = ttk.Entry(entry_frame)
+        self._elvy_entry_elvy.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=4)
+
+        ttk.Label(entry_frame, text="Articolo Delta:").grid(
+            row=0, column=2, sticky="w", padx=(0, 6), pady=4
+        )
+        self._elvy_entry_delta = ttk.Entry(entry_frame)
+        self._elvy_entry_delta.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=4)
+
+        ttk.Button(
+            entry_frame, text="💾  Save", command=self._on_elvy_save, width=10
+        ).grid(row=0, column=4, sticky="e")
+
         # ── DFM colour reference ─────────────────────────────────────────
         dfm_frame = ttk.LabelFrame(parent, text="DFM Color Reference", padding=8)
-        dfm_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=(4, 4))
+        dfm_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 4))
         dfm_frame.columnconfigure(1, weight=1)
 
         dfm_info = ttk.Label(
@@ -571,29 +618,6 @@ class ConverterApp(tk.Tk):
 
         self._dfm_lbl_status = ttk.Label(dfm_frame, text="", foreground="grey", anchor="w")
         self._dfm_lbl_status.grid(row=1, column=1, sticky="ew", padx=(12, 0))
-
-        # ── Add / update entry ──────────────────────────────────────────
-        # Keep the mapping/search controls immediately above the table.
-        entry_frame = ttk.LabelFrame(parent, text="Add / Update Mapping", padding=8)
-        entry_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 4))
-        entry_frame.columnconfigure(1, weight=1)
-        entry_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(entry_frame, text="Article No (Articolo Elvy):").grid(
-            row=0, column=0, sticky="w", padx=(0, 6), pady=4
-        )
-        self._elvy_entry_elvy = ttk.Entry(entry_frame)
-        self._elvy_entry_elvy.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=4)
-
-        ttk.Label(entry_frame, text="Articolo Delta:").grid(
-            row=0, column=2, sticky="w", padx=(0, 6), pady=4
-        )
-        self._elvy_entry_delta = ttk.Entry(entry_frame)
-        self._elvy_entry_delta.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=4)
-
-        ttk.Button(
-            entry_frame, text="💾  Save", command=self._on_elvy_save, width=10
-        ).grid(row=0, column=4, sticky="e")
 
         # ── Saved mappings table ─────────────────────────────────────────
         table_frame = ttk.LabelFrame(parent, text="Saved Mappings", padding=8)
@@ -686,6 +710,8 @@ class ConverterApp(tk.Tk):
         # in one shared cache used by both Data Elvy and Situazione.
         save_dfm_cache(lookup, Path(path).name, Path(path))
         self._refresh_dfm_status()
+        if self._on_shared_cache_changed:
+            self._on_shared_cache_changed()
         messagebox.showinfo(
             "DFM Reference Loaded",
             f"Loaded {len(lookup)} Elvy colour entries from {Path(path).name}.",
@@ -784,12 +810,12 @@ class ConverterApp(tk.Tk):
             log_frame,
             state="disabled",
             wrap="word",
-            font=("Courier New", 9),
+            font=("Courier New", 8),
             bg="#1e1e1e",
             fg="#d4d4d4",
             insertbackground="white",
             relief="flat",
-            height=18,
+            height=12,
         )
         self._log_text.grid(row=0, column=0, sticky="nsew")
 
@@ -798,53 +824,36 @@ class ConverterApp(tk.Tk):
         self._log_text.configure(yscrollcommand=log_scroll.set)
 
     def _update_log_visibility(self, notebook: ttk.Notebook, situazione_tab: ttk.Frame,
-                                settimana_tab: ttk.Frame, magazino_tab: ttk.Frame) -> None:
+                                settimana_tab: ttk.Frame, magazino_tab: ttk.Frame,
+                                kamal_tab: ttk.Frame) -> None:
         """Hide the shared log where the page has its own full-screen workspace."""
         selected_tab = notebook.select()
         situazione_selected = selected_tab == str(situazione_tab)
         settimana_selected = selected_tab == str(settimana_tab)
         magazino_selected = selected_tab == str(magazino_tab)
-        data_elvy_selected = notebook.tab(selected_tab, "text") == "Data Elvy"
-        # These operations only start background reads; changing tabs never
-        # waits for a large Excel file to finish parsing.
-        if situazione_selected:
-            situazione_tab.sync_shared_async()
-        if settimana_selected:
-            settimana_tab.sync_shared_async()
-        if magazino_selected:
-            magazino_tab.sync_shared_async()
-        self._sync_shared_magazino_path()
+        kamal_selected = selected_tab == str(kamal_tab)
+        tab_text = notebook.tab(selected_tab, "text")
+        data_elvy_selected = tab_text == "Data Elvy"
+        ordini_selected = tab_text == "Ordini ELVY"
+        # Do not trigger heavy shared-file loading while switching tabs.
+        # Keep the UI responsive; shared DFM/Produzione loads happen only when
+        # the user explicitly refreshes or uploads on the target page.
         self._refresh_dfm_status()
-        if situazione_selected or settimana_selected or magazino_selected or data_elvy_selected:
+        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected:
             self._log_frame.grid_remove()
             self.rowconfigure(1, weight=0)
-            self.rowconfigure(0, weight=3)
+            self.rowconfigure(0, weight=5)
             notebook.configure(height=1)
         else:
             self._log_frame.grid()
-            # The conversion pages (especially Ordini ELVY) contain several
-            # input sections plus the Convert button. Give the page the
-            # larger share so its lower controls are not clipped by the log.
-            self.rowconfigure(0, weight=2)
+            self.rowconfigure(0, weight=3)
             self.rowconfigure(1, weight=1)
-            # Include the complete Ordini ELVY form (including options and
-            # progress rows) before the shared log starts.
-            notebook.configure(height=600)
+            notebook.configure(height=220)
 
         self._log_text.tag_configure("INFO", foreground="#4FC1FF")
         self._log_text.tag_configure("WARNING", foreground="#FFD700")
         self._log_text.tag_configure("ERROR", foreground="#F44747")
         self._log_text.tag_configure("DEBUG", foreground="#858585")
-
-    def _sync_shared_magazino_path(self) -> None:
-        """Make a Magazino selected on either page available to Ordini ELVY."""
-        cache = load_magazino_cache()
-        source = Path(str(cache.get("source_path", "")))
-        if not source.is_file() or self._po_raw_yarn_path == source:
-            return
-        self._po_raw_yarn_path = source
-        if hasattr(self, "_po_lbl_raw_yarn"):
-            self._po_lbl_raw_yarn.config(text=str(source), foreground="black")
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -893,14 +902,30 @@ class ConverterApp(tk.Tk):
                 setattr(self, f"_{prefix}_output_dir", Path(output_str))
                 lbl_output.config(text=output_str, foreground="black")
 
+        raw_yarn_str = self._prefs.get("po_raw_yarn_path")
+        if raw_yarn_str and Path(raw_yarn_str).is_file():
+            self._po_raw_yarn_path = Path(raw_yarn_str)
+            self._po_lbl_raw_yarn.config(text=raw_yarn_str, foreground="black")
+
+        last_export_str = self._prefs.get("po_last_export_path")
+        if last_export_str and Path(last_export_str).is_file():
+            self._po_last_export_path = Path(last_export_str)
+
+        filato_target_str = self._prefs.get("po_filato_file_path")
+        if filato_target_str and Path(filato_target_str).is_file():
+            self._po_filato_file_path = Path(filato_target_str)
+            self._po_lbl_filato_file.config(text=filato_target_str, foreground="black")
+        else:
+            cache = load_magazino_cache()
+            source_path = cache.get("source_path", "")
+            if source_path and Path(source_path).is_file():
+                self._po_raw_yarn_path = Path(source_path)
+                self._po_lbl_raw_yarn.config(text=str(self._po_raw_yarn_path), foreground="black")
+
         erp_str = self._prefs.get("po_erp_file_path")
         if erp_str and Path(erp_str).is_file():
             self._po_erp_file_path = Path(erp_str)
             self._po_lbl_erp_file.config(text=erp_str, foreground="black")
-        filato_str = self._prefs.get("po_filato_target_path")
-        if filato_str and Path(filato_str).is_file():
-            self._po_filato_target_path = Path(filato_str)
-            self._po_lbl_filato_target.config(text=filato_str, foreground="black")
         if self._prefs.get("po_update_erp_file"):
             self._po_update_erp_file.set(True)
 
@@ -963,37 +988,29 @@ class ConverterApp(tk.Tk):
         )
         if path:
             self._po_raw_yarn_path = Path(path)
-            save_magazino_cache(self._po_raw_yarn_path)
             self._po_lbl_raw_yarn.config(text=str(self._po_raw_yarn_path), foreground="black")
-            # Cache the already-filtered summary in the background so the
-            # Magazino page can restore its Treeview immediately next time.
-            def cache_summary():
-                try:
-                    import magazino_logic
-                    df, errors = magazino_logic.load_magazino(str(self._po_raw_yarn_path))
-                    if not errors and df is not None and not df.empty:
-                        save_magazino_cache(
-                            self._po_raw_yarn_path,
-                            magazino_logic.summarize_by_partita(df),
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not cache Magazino summary: %s", exc)
+            save_magazino_cache(self._po_raw_yarn_path)
+            self._save_prefs(po_raw_yarn_path=str(self._po_raw_yarn_path))
+            self._on_shared_cache_changed()
 
-            threading.Thread(target=cache_summary, daemon=True).start()
-
-    def _on_select_filato_target(self) -> None:
-        """Select the existing workbook that will receive Filato x Tinturia rows."""
+    def _on_transfer_filato_tinturia(self) -> None:
         target = filedialog.askopenfilename(
             title="Select the target file for Filato x Tinturia",
             filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("po_filato_target_path") or None,
+            initialdir=self._prefs.get("po_last_dir") or None,
         )
-        if target:
-            self._po_filato_target_path = Path(target)
-            self._po_lbl_filato_target.config(
-                text=str(self._po_filato_target_path), foreground="black"
-            )
-            self._save_prefs(po_filato_target_path=str(self._po_filato_target_path))
+        if not target:
+            return
+        self._po_filato_file_path = Path(target)
+        self._po_lbl_filato_file.config(text=str(self._po_filato_file_path), foreground="black")
+        self._save_prefs(
+            po_filato_file_path=str(self._po_filato_file_path),
+            po_last_dir=str(self._po_filato_file_path.parent),
+        )
+        messagebox.showinfo(
+            "Target selected",
+            "The Filato x Tinturia sheet will be transferred to this file after Convert.",
+        )
 
     # ------------------------------------------------------------------
     # Purchase Orders — convert callback
@@ -1034,7 +1051,7 @@ class ConverterApp(tk.Tk):
                 self._po_update_erp_file.get(),
                 self._po_erp_file_path,
                 self._po_raw_yarn_path,
-                self._po_filato_target_path,
+                self._po_filato_file_path,
             ),
             daemon=True,
         )
@@ -1065,6 +1082,7 @@ class ConverterApp(tk.Tk):
         errors: list[str] = []
         merged_rows: list[OrderRow] = []
         all_rows: list[OrderRow] = []
+        last_export_path: Path | None = None
         total = len(pdf_list)
         calculator = AbbinaCalculator()
         elvy_mapping = load_elvy_mapping()
@@ -1115,6 +1133,7 @@ class ConverterApp(tk.Tk):
                 if one_per_file:
                     out_path = make_output_path(pdf_path, output_dir)
                     ExcelExporter(rows, out_path, magazino_summary, codes_map).export()
+                    last_export_path = out_path
                     logger.info("Saved: %s", out_path.name)
                 else:
                     merged_rows.extend(rows)
@@ -1131,31 +1150,22 @@ class ConverterApp(tk.Tk):
             try:
                 out_path = output_dir / "merged_purchase_orders.xlsx"
                 ExcelExporter(merged_rows, out_path, magazino_summary, codes_map).export()
+                last_export_path = out_path
                 logger.info("Merged export saved: %s", out_path.name)
             except Exception as exc:  # noqa: BLE001
                 msg = f"Error saving merged Excel: {exc}"
                 logger.error(msg)
                 errors.append(msg)
 
-        # Write the matches generated from this conversion directly into the
-        # selected Filato target. Like the ERP update, row 1 is preserved and
-        # all existing data from row 2 down is replaced.
-        if filato_target_path is not None:
-            if magazino_summary is None:
-                msg = "Filato x Tinturia target was selected, but no Magazino file was selected."
+        if filato_target_path is not None and last_export_path is not None:
+            try:
+                matches = read_filato_tinturia_sheet(last_export_path)
+                n = update_existing_filato_file(filato_target_path, matches)
+                logger.info("Filato x Tinturia: transferred %d row(s) to %s", n, filato_target_path.name)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"Error transferring Filato x Tinturia to {filato_target_path.name}: {exc}"
                 logger.error(msg)
                 errors.append(msg)
-            else:
-                try:
-                    filato_rows = build_ordini_elvy_rows(all_rows)
-                    filato_matches = match_raw_yarn(filato_rows, magazino_summary, codes_map)
-                    n = update_existing_filato_file(filato_target_path, filato_matches)
-                    logger.info("Updated Filato x Tinturia file: %s (%d rows)",
-                                filato_target_path.name, n)
-                except Exception as exc:  # noqa: BLE001
-                    msg = f"Error updating Filato x Tinturia file {filato_target_path.name}: {exc}"
-                    logger.error(msg)
-                    errors.append(msg)
 
         # Also push every row processed in this run into the existing ERP
         # file, if configured — this clears its old data rows first.
@@ -1176,10 +1186,13 @@ class ConverterApp(tk.Tk):
                     logger.error(msg)
                     errors.append(msg)
 
+        self._po_last_export_path = last_export_path
         self.after(0, self._on_po_conversion_done, errors, total)
 
     def _on_po_conversion_done(self, errors: list[str], total: int) -> None:
         self._set_po_ui_enabled(True)
+        if self._po_last_export_path and self._po_last_export_path.is_file():
+            self._save_prefs(po_last_export_path=str(self._po_last_export_path))
 
         if errors:
             summary = "\n".join(errors)

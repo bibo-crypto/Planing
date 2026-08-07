@@ -22,7 +22,7 @@ ARTICOLO_PREFIX_TO_CLIENTE = {
     "C011": "MED",
     "C170": "ELKAMAL",
     "C130": "ELVY",
-    "C150": "SHARABATI",
+    "C150": "SHSRABATI",
     "C700": "ICA",
 }
 

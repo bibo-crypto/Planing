@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
 from datetime import datetime
+from typing import Callable
 import pandas as pd
 
 import situazione_db as db
@@ -102,14 +103,14 @@ class SourceRow(ttk.Frame):
             self,
             text=f"Upload {button_name}",
             command=self._browse,
-            width=21,
+            width=15,
             font=("Segoe UI", 9, "bold"),
             height=30,
         )
         self.button.grid(row=0, column=0, columnspan=2, padx=4, pady=(3, 2), sticky="ew")
 
         self.status_lbl = ttk.Label(self, textvariable=self.status_var, anchor="w",
-                                    foreground="#667085", width=22)
+                                    foreground="#667085", width=14)
         self.status_lbl.grid(row=1, column=1, padx=(2, 4), sticky="w")
 
         self.columnconfigure(1, weight=1)
@@ -128,10 +129,12 @@ class SourceRow(ttk.Frame):
 class SituazioneTab(ttk.Frame):
     """Embeddable 'Situazione' tab — hosted inside gui.py's main Notebook."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None):
         super().__init__(master)
 
         self._configure_styles()
+
+        self._on_shared_cache_changed = on_shared_cache_changed
 
         db.init_db()
 
@@ -139,6 +142,7 @@ class SituazioneTab(ttk.Frame):
         self.sort_state = {}      # column -> ascending bool
         self.current_df = pd.DataFrame()
         self._filter_after_id = None
+        self._shared_syncing = False
 
         self._build_upload_panel()
         self._build_toolbar()
@@ -146,6 +150,7 @@ class SituazioneTab(ttk.Frame):
         self._refresh_source_labels_from_db()
         # Load the saved table after all widgets have completed initialization.
         self.after_idle(self._load_table_from_db)
+        self.after_idle(self.sync_shared_async)
 
     # ------------------------------------------------------------------ UI
     def _configure_styles(self):
@@ -326,37 +331,47 @@ class SituazioneTab(ttk.Frame):
         db.save_upload("dfm", source_path.name, len(df), "ok", msg, file_path=str(source_path))
 
     def sync_shared_async(self):
-        """Restore shared large Excel sources in a worker, keeping tab changes responsive."""
-        self._sync_shared_source_async("dfm")
-        self._sync_shared_source_async("data_prod")
+        """Restore shared Excel files without blocking the Tk event loop."""
+        if self._shared_syncing:
+            return
+        dfm_path = str(load_dfm_cache().get("source_path", ""))
+        prod_path = str(load_prod_cache().get("source_path", ""))
+        needs_dfm = bool(dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path)
+        needs_prod = bool(prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path)
+        if not (needs_dfm or needs_prod):
+            return
 
-    def _sync_shared_source_async(self, key):
-        cache = load_dfm_cache() if key == "dfm" else load_prod_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        syncing_key = f"_syncing_{key}"
-        if not source_path.is_file() or getattr(self, syncing_key, False):
-            return
-        if getattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", "") == str(source_path):
-            return
-        setattr(self, syncing_key, True)
-        loader = data_loaders.load_dfm if key == "dfm" else data_loaders.load_data_prod
+        self._shared_syncing = True
 
         def worker():
-            try:
-                df, errors = loader(str(source_path))
-            except Exception as exc:  # noqa: BLE001
-                df, errors = None, [str(exc)]
+            dfm_result = None
+            prod_result = None
+            if dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path:
+                try:
+                    dfm_result = data_loaders.load_dfm(dfm_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not restore shared DFM file: %s", exc)
+            if prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path:
+                try:
+                    prod_result = data_loaders.load_data_prod(prod_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not restore shared Produzione file: %s", exc)
 
             def apply_result():
-                setattr(self, syncing_key, False)
-                if errors or df is None or df.empty:
-                    return
-                self.loaded_frames[key] = df
-                setattr(self, f"_shared_{'dfm' if key == 'dfm' else 'prod'}_path", str(source_path))
-                self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-                db.save_upload(key, source_path.name, len(df), "ok",
-                               f"✅ {len(df)} rows - {source_path.name}",
-                               file_path=str(source_path))
+                self._shared_syncing = False
+                if dfm_result and not dfm_result[1] and dfm_result[0] is not None and not dfm_result[0].empty:
+                    df = dfm_result[0]
+                    self.loaded_frames["dfm"] = df
+                    self._shared_dfm_path = dfm_path
+                    self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
+                    db.save_upload("dfm", Path(dfm_path).name, len(df), "ok", f"✅ {len(df)} rows - {Path(dfm_path).name}", file_path=dfm_path)
+                if prod_result and not prod_result[1] and prod_result[0] is not None and not prod_result[0].empty:
+                    df = prod_result[0]
+                    self.loaded_frames["data_prod"] = df
+                    self._shared_prod_path = prod_path
+                    self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
+                    db.save_upload("data_prod", Path(prod_path).name, len(df), "ok", f"✅ {len(df)} rows - {Path(prod_path).name}", file_path=prod_path)
+                self.after_idle(self.sync_shared_async)
 
             self.after(0, apply_result)
 
@@ -369,6 +384,8 @@ class SituazioneTab(ttk.Frame):
             if entries:
                 save_dfm_cache(entries, Path(path).name, Path(path))
                 self._shared_dfm_path = str(Path(path))
+                if self._on_shared_cache_changed:
+                    self._on_shared_cache_changed()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared DFM reference: %s", exc)
 
@@ -400,6 +417,8 @@ class SituazioneTab(ttk.Frame):
         try:
             save_prod_cache(Path(path))
             self._shared_prod_path = str(Path(path))
+            if self._on_shared_cache_changed:
+                self._on_shared_cache_changed()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared Produzione reference: %s", exc)
 
