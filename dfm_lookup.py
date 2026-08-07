@@ -139,12 +139,12 @@ def _ne_twist_digit(ne: str) -> str:
 # Building / caching the filtered reference
 # ---------------------------------------------------------------------------
 
-def build_dfm_lookup(xlsx_path: Path) -> list[dict[str, str]]:
+def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list[dict[str, str]]:
     """
-    Read *xlsx_path* (a DFM.xlsx-style export) and return the list of Elvy
-    (ARTICOLODFM starting with "C130") rows, reduced to just the fields
-    needed for matching: articolo, coloredfm, cldescr, twist, date (ISO
-    string, for sorting — "" if unparseable).
+    Read *xlsx_path* (a DFM.xlsx-style export) and return the list of rows
+    whose ARTICOLODFM starts with *prefix* (default "C130", Elvy), reduced
+    to just the fields needed for matching: articolo, coloredfm, cldescr,
+    twist, titolo, date (ISO string, for sorting — "" if unparseable).
     """
     wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
     ws = wb.active
@@ -163,7 +163,7 @@ def build_dfm_lookup(xlsx_path: Path) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         articolo = clean_text(row[col_idx["ARTICOLODFM"]])
-        if not articolo.startswith(ELVY_ARTICLE_PREFIX):
+        if not articolo.startswith(prefix):
             continue
 
         coloredfm = clean_text(row[col_idx["COLOREDFM"]])
@@ -431,3 +431,39 @@ def lookup_dfm_color(
                     return best["coloredfm"], best["cldescr"]
 
     return _guess_new_colour(colour_code, colour_name, yarn)
+
+
+def load_dfm_entries_by_prefix(prefix: str) -> list[dict[str, str]]:
+    """
+    Re-parses the last-uploaded DFM file (its path is remembered in the
+    shared cache, whichever page uploaded it) filtered to a different
+    article prefix -- e.g. "C170" for Kamal, instead of the Elvy-only
+    "C130" cache. Returns [] if no DFM file has been uploaded yet, or it's
+    no longer at that path.
+    """
+    cache = load_dfm_cache()
+    source_path = cache.get("source_path", "")
+    if not source_path or not Path(source_path).is_file():
+        return []
+    try:
+        return build_dfm_lookup(Path(source_path), prefix=prefix)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not load DFM entries for prefix %s: %s", prefix, exc)
+        return []
+
+
+def find_articolo_by_titolo(entries: list[dict[str, str]], titolo: str) -> str:
+    """
+    Look up an Articolo whose Titolo matches *titolo* exactly (e.g. '80/2')
+    within the given entries. Returns "" if titolo is blank or no match is
+    found. If more than one distinct Articolo shares this Titolo, the first
+    one encountered is returned -- ambiguous by nature, since Titolo alone
+    doesn't uniquely identify an Articolo in general.
+    """
+    titolo = clean_text(titolo)
+    if not titolo:
+        return ""
+    for e in entries:
+        if e.get("titolo") == titolo:
+            return e["articolo"]
+    return ""

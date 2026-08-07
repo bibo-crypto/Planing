@@ -157,19 +157,26 @@ def update_existing_ordini_file(target_path: Path, ordini_rows: list[OrdiniElvyR
     import openpyxl  # local import: this module doesn't need openpyxl otherwise
 
     wb = openpyxl.load_workbook(target_path)
-    ws = wb.active
-
-    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    ws = None
     col_attr: dict[int, str] = {}
-    for cell in header_cells:
-        if cell.value is None:
-            continue
-        key = str(cell.value).strip().lower()
-        attr = _HEADER_TO_ATTR.get(key)
-        if attr:
-            col_attr[cell.column] = attr
+    # ERP templates may contain several sheets and the active sheet is not
+    # guaranteed to be the import sheet. Find the sheet by its headers.
+    for candidate in wb.worksheets:
+        candidate_attrs: dict[int, str] = {}
+        header_cells = next(candidate.iter_rows(min_row=1, max_row=1))
+        for cell in header_cells:
+            if cell.value is None:
+                continue
+            key = " ".join(str(cell.value).strip().lower().split())
+            attr = _HEADER_TO_ATTR.get(key)
+            if attr:
+                candidate_attrs[cell.column] = attr
+        if candidate_attrs:
+            ws = candidate
+            col_attr = candidate_attrs
+            break
 
-    if not col_attr:
+    if ws is None or not col_attr:
         wb.close()
         raise ValueError(
             "None of this file's column headers match the expected Ordini "
@@ -294,10 +301,14 @@ class RawYarnMatch:
     label: str = "تحضير خام"
 
 
-def match_raw_yarn(ordini_rows: list["OrdiniElvyRow"], magazino_summary: "pd.DataFrame",
-                    codes_map: dict | None = None) -> list[RawYarnMatch]:
+def match_raw_yarn(
+    ordini_rows: list["OrdiniElvyRow"],
+    magazino_summary: "pd.DataFrame",
+    codes_map: dict | None = None,
+    quantity_attr: str = "quantity_cones",
+) -> list[RawYarnMatch]:
     """
-    Fills in the Partita number in place of "X" in "PG-X-PO-..." for rows
+    Fills in the Partita number in place of "X" in "PG-X-..." for rows
     that can be covered by available raw yarn, and returns the list of
     batches actually assigned (for the "Filato x Tinturia" export sheet).
 
@@ -306,16 +317,20 @@ def match_raw_yarn(ordini_rows: list["OrdiniElvyRow"], magazino_summary: "pd.Dat
       is the raw (G-prefixed) code.
     codes_map: optional {articolo_filato: titolo} lookup (Articoli.xlsx),
       used only to fill in the Titolo column of the returned matches.
+    quantity_attr: the OrdiniElvyRow attribute to use for requested raw-yarn
+      quantity (default: quantity_cones). Kamal rows use peso_kg.
 
     Matching rule (as specified): group the order rows still needing raw
     yarn ("PG-X" in commento) by their G-code Articolo. For each group, if
-    a single available batch covers the group's total cones, assign that
+    a single available batch covers the group's total quantity, assign that
     batch's Partita to every row in the group. Otherwise, try to cover
     each row individually with the smallest batch that fits it, leaving
     any row that can't be covered as "PG-X".
     """
     if magazino_summary is None or magazino_summary.empty:
         return []
+
+    batch_capacity_attr = "rocche" if quantity_attr == "quantity_cones" else "peso"
 
     pool: dict[str, list[dict]] = {}
     for _, r in magazino_summary.iterrows():
@@ -335,22 +350,35 @@ def match_raw_yarn(ordini_rows: list["OrdiniElvyRow"], magazino_summary: "pd.Dat
 
     matches: list[RawYarnMatch] = []
 
-    def _assign(idxs, batch, cones_used):
+    def _assign(idxs, batch, quantity_used):
         for i in idxs:
             ordini_rows[i].commento = ordini_rows[i].commento.replace("PG-X", f"PG-{batch['partita']}")
         articolo_c_for_lookup = "C" + articolo_g[1:] if articolo_g.upper().startswith("G") else articolo_g
         titolo = (codes_map or {}).get(articolo_c_for_lookup, "")
-        peso_used = batch["peso"] * (cones_used / batch["rocche"]) if batch["rocche"] else 0.0
-        matches.append(RawYarnMatch(articolo=articolo_g, titolo=titolo, partita=batch["partita"],
-                                     rocce=cones_used, peso=round(peso_used, 2)))
+        if batch_capacity_attr == "rocche":
+            peso_used = batch["peso"] * (quantity_used / batch["rocche"]) if batch["rocche"] else 0.0
+            rocce_used = quantity_used
+        else:
+            peso_used = quantity_used
+            rocce_used = quantity_used
+        matches.append(RawYarnMatch(
+            articolo=articolo_g,
+            titolo=titolo,
+            partita=batch["partita"],
+            rocce=rocce_used,
+            peso=round(peso_used, 2),
+        ))
 
     for articolo_g, idxs in groups.items():
         batches = pool.get(articolo_g, [])
         if not batches:
             continue
-        total_needed = sum(ordini_rows[i].quantity_cones or 0 for i in idxs)
+        total_needed = sum(getattr(ordini_rows[i], quantity_attr, 0) or 0 for i in idxs)
 
-        candidates = sorted((b for b in batches if b["rocche"] >= total_needed), key=lambda b: b["rocche"])
+        candidates = sorted(
+            (b for b in batches if b.get(batch_capacity_attr, 0) >= total_needed),
+            key=lambda b: b.get(batch_capacity_attr, 0),
+        )
         if candidates:
             batch = candidates[0]
             _assign(idxs, batch, total_needed)
@@ -358,8 +386,12 @@ def match_raw_yarn(ordini_rows: list["OrdiniElvyRow"], magazino_summary: "pd.Dat
             continue
 
         for i in idxs:
-            need = ordini_rows[i].quantity_cones or 0
-            fit = sorted((b for b in batches if b["rocche"] >= need), key=lambda b: b["rocche"])
+            row = ordini_rows[i]
+            need = getattr(row, quantity_attr, 0) or 0
+            fit = sorted(
+                (b for b in batches if b.get(batch_capacity_attr, 0) >= need),
+                key=lambda b: b.get(batch_capacity_attr, 0),
+            )
             if fit:
                 batch = fit[0]
                 _assign([i], batch, need)

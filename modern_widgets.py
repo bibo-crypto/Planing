@@ -17,7 +17,7 @@ class RoundedButton(tk.Canvas):
         button_font = kwargs.pop("font", ("Segoe UI", 10, "bold"))
         self._font = tkfont.Font(font=button_font)
         self._surface = self._frame_background(master)
-        # Keep the custom buttons compact inside dense form sections.  A
+        # Keep the custom buttons compact inside dense form sections. A
         # taller default makes the Ordini ELVY page overflow its notebook.
         self._height = int(kwargs.pop("height", 32))
         text_width = self._font.measure(self._text)

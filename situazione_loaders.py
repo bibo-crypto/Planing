@@ -224,14 +224,11 @@ def load_produzione(path):
     """
     Raw production log (Situazione Settimana): one row per process event,
     with the machine, batch (Partia Col), weight (Peso), yarn code, and the
-    date it was logged. Current Data prod exports call that date ``End``;
+    date it was logged. Current Data Prod exports call that column ``End``;
     older weekly exports may call it ``Sheet Date``. Rework entries (Codice
     ending in "RI" or "T.C") are excluded, matching the original report's
     own rework flag.
     """
-    # The file uploaded in Situazione is the same Data prod export used by
-    # the weekly page. It has ``End`` rather than ``Sheet Date``. Keep the
-    # common columns strict, then accept either date-column name.
     required = ["Machine Name", "Partia Col", "Peso", "Codice"]
     df, errors = _load_with_header(path, required)
     if df is None:
@@ -239,6 +236,7 @@ def load_produzione(path):
     date_column = "Sheet Date" if "Sheet Date" in df.columns else "End"
     if date_column not in df.columns:
         return None, ["Expected a production date column named End or Sheet Date"]
+
     df = df[df["Partia Col"].notna()]
     df = df[df["Partia Col"].astype(str) != "Partia Col"]
     is_rework = _s(df["Codice"]).str.upper().str.endswith(("RI", "T.C"))

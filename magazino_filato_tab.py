@@ -3,75 +3,169 @@ magazino_filato_tab.py
 Raw yarn warehouse summary tab ("Magazino Filato"): upload the Magazino
 export, apply the filter rules in magazino_logic.py, and show one row per
 raw-yarn Partita with its total cones (Mag.rocche) and weight (Mag.peso).
+Optionally upload the LOTTI reference too, to add each Partita's Lotto
+number (the same reference Kamal calls their raw yarn "message number").
 """
 import os
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+from typing import Callable
 import pandas as pd
 
+import lotti_logic
 import magazino_logic as logic
-from utils import logger
+from lotti_cache import load_lotti_cache, save_lotti_cache
 from magazino_cache import load_magazino_cache, save_magazino_cache
+from utils import logger
 
-COLUMNS = ["articolo", "partita", "mag_rocche", "mag_peso"]
-HEADERS = {"articolo": "Articolo", "partita": "Partita", "mag_rocche": "Mag.rocche", "mag_peso": "Mag.peso"}
+COLUMNS = ["articolo", "partita", "mag_rocche", "mag_peso", "lotto"]
+HEADERS = {
+    "articolo": "Articolo", "partita": "Partita", "mag_rocche": "Mag.rocche",
+    "mag_peso": "Mag.peso", "lotto": "Lotto",
+}
 
 
 class MagazinoFilatoTab(ttk.Frame):
     """Embeddable 'Magazino Filato' tab."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None):
         super().__init__(master)
+        self.magazino_summary = pd.DataFrame()
+        self.lotti_summary = pd.DataFrame()
+        self._base_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
         self._shared_path = ""
+        self._shared_lotti_path = ""
+        self._lotti_syncing = False
         self._syncing = False
+        self._uploading = False
+        self._on_shared_cache_changed = on_shared_cache_changed
+        self._search_var = tk.StringVar()
+        self._sort_column = ""
+        self._sort_reverse = False
 
         self._build_upload_panel()
         self._build_treeview()
-        self._restore_cached_data()
+        self.after_idle(self.sync_shared_lotti_async)
+        self.after_idle(self.sync_shared_async)
+
+    def _restore_shared_lotti(self):
+        cache = load_lotti_cache()
+        source_path = cache.get("source_path", "")
+        if not source_path or not Path(source_path).is_file() or not self.lotti_summary.empty:
+            return
+
+        try:
+            df, errors = lotti_logic.load_lotti(source_path)
+        except Exception as exc:  # noqa: BLE001
+            df, errors = None, [str(exc)]
+
+        if errors or df is None or df.empty:
+            return
+
+        self.lotti_summary = lotti_logic.summarize_by_partita(df)
+        self._shared_lotti_path = str(source_path)
+        self.lotti_status_var.set(
+            f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {Path(source_path)}"
+        )
+        self._recompute()
+
+    def sync_shared_lotti(self):
+        """Restore a LOTTI file selected elsewhere in the app."""
+        cache = load_lotti_cache()
+        source_path = cache.get("source_path", "")
+        if not source_path or not Path(source_path).is_file():
+            return
+        if self._shared_lotti_path == str(source_path):
+            return
+
+        try:
+            df, errors = lotti_logic.load_lotti(source_path)
+        except Exception as exc:  # noqa: BLE001
+            df, errors = None, [str(exc)]
+
+        if errors or df is None or df.empty:
+            return
+
+        self.lotti_summary = lotti_logic.summarize_by_partita(df)
+        self._shared_lotti_path = str(source_path)
+        self.lotti_status_var.set(
+            f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {Path(source_path)}"
+        )
+        self._recompute()
+
+    def sync_shared_lotti_async(self):
+        """Restore LOTTI in a worker so opening the app stays responsive."""
+        if self._lotti_syncing:
+            return
+        source_path = str(load_lotti_cache().get("source_path", ""))
+        if not source_path or not Path(source_path).is_file() or self._shared_lotti_path == source_path:
+            return
+
+        self._lotti_syncing = True
+
+        def worker():
+            try:
+                df, errors = lotti_logic.load_lotti(source_path)
+            except Exception as exc:  # noqa: BLE001
+                df, errors = None, [str(exc)]
+
+            def apply_result():
+                self._lotti_syncing = False
+                if errors or df is None or df.empty:
+                    return
+                self.lotti_summary = lotti_logic.summarize_by_partita(df)
+                self._shared_lotti_path = source_path
+                self.lotti_status_var.set(
+                    f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {Path(source_path)}"
+                )
+                self._recompute()
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_upload_panel(self):
-        panel = ttk.LabelFrame(self, text="1) Upload the Magazino export")
+        panel = ttk.LabelFrame(self, text="1) Upload files")
         panel.pack(side="top", fill="x", padx=8, pady=6)
 
         row = ttk.Frame(panel)
         row.pack(fill="x", padx=4, pady=4)
-
-        self.status_var = tk.StringVar(value="No file uploaded")
-        ttk.Button(row, text="Select Magazino File", command=self._on_upload).pack(side="left")
+        self.status_var = tk.StringVar(value="No Magazino file uploaded")
+        self._btn_magazino = ttk.Button(row, text="Select Magazino file...", command=self._on_upload_magazino)
+        self._btn_magazino.pack(side="left")
         ttk.Label(row, textvariable=self.status_var, foreground="#666666").pack(side="left", padx=8)
 
-        ttk.Button(row, text="Export Excel", command=self._on_export).pack(side="right")
+        row2 = ttk.Frame(panel)
+        row2.pack(fill="x", padx=4, pady=4)
+        self.lotti_status_var = tk.StringVar(value="No LOTTI file uploaded (optional)")
+        ttk.Button(row2, text="Select LOTTI file...", command=self._on_upload_lotti).pack(side="left")
+        ttk.Label(row2, textvariable=self.lotti_status_var, foreground="#666666").pack(side="left", padx=8)
+
+        row_search = ttk.Frame(panel)
+        row_search.pack(fill="x", padx=4, pady=4)
+        ttk.Label(row_search, text="Search:").pack(side="left", padx=(0, 8))
+        search_entry = ttk.Entry(row_search, textvariable=self._search_var, width=36)
+        search_entry.pack(side="left", padx=(0, 8))
+        search_entry.bind("<KeyRelease>", lambda _e: self._on_search_changed())
+        self._search_var.trace_add("write", lambda *_: self._on_search_changed())
+
+        row3 = ttk.Frame(panel)
+        row3.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row3, text="Export Excel", command=self._on_export).pack(side="right")
 
     def _build_treeview(self):
-        toolbar = ttk.Frame(self)
-        toolbar.pack(side="top", fill="x", padx=8, pady=(2, 0))
-        self.search_var = tk.StringVar()
-        self._search_after_id = None
-        self.search_var.trace_add("write", self._on_search_changed)
-        ttk.Label(toolbar, text="Search:").pack(side="left", padx=(0, 5))
-        ttk.Entry(toolbar, textvariable=self.search_var, width=30).pack(side="left")
-        ttk.Button(toolbar, text="Clear", command=lambda: self.search_var.set("")).pack(side="left", padx=6)
-
         frame = ttk.Frame(self)
         frame.pack(side="top", fill="both", expand=True, padx=8, pady=6)
 
-        style = ttk.Style(self)
-        style.configure("Magazino.Treeview", font=("Segoe UI", 9, "bold"), rowheight=25)
-        style.configure("Magazino.Treeview.Heading", font=("Segoe UI", 9, "bold"),
-                        background="#16324F", foreground="#FFFFFF")
-
-        self.tree = ttk.Treeview(frame, columns=COLUMNS, show="headings", selectmode="browse",
-                                 style="Magazino.Treeview")
+        self.tree = ttk.Treeview(frame, columns=COLUMNS, show="headings", selectmode="browse")
         for c in COLUMNS:
-            self.tree.heading(c, text=HEADERS[c], command=lambda col=c: self._on_sort(col))
-            self.tree.column(c, width=170, anchor="center")
-
-        self.tree.tag_configure("evenrow", background="#EAF1FB", foreground="#111827")
-        self.tree.tag_configure("oddrow", background="#FFFFFF", foreground="#111827")
-        self._sort_column = "articolo"
-        self._sort_reverse = False
+            self.tree.heading(c, text=HEADERS[c], command=lambda c=c: self._sort_by(c))
+            self.tree.column(c, width=140, anchor="w" if c == "articolo" else "center")
+        self.tree.tag_configure("oddrow", background="#FFFFFF")
+        self.tree.tag_configure("evenrow", background="#EAF1FB")
 
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -80,108 +174,163 @@ class MagazinoFilatoTab(ttk.Frame):
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-    def _on_upload(self):
+    def _on_upload_magazino(self):
+        if self._uploading:
+            return
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+        if not path:
+            return
+        self._uploading = True
+        self._btn_magazino.config(state="disabled")
+        self.status_var.set("Loading Magazino file…")
+
+        def worker():
+            try:
+                df, errors = logic.load_magazino(path)
+            except Exception as exc:  # noqa: BLE001
+                errors = [f"An error occurred while reading the file: {exc}"]
+                df = None
+
+            def apply_result():
+                self._uploading = False
+                self._btn_magazino.config(state="normal")
+                if errors or df is None or df.empty:
+                    msg = "; ".join(errors) if errors else "The file is empty after filtering"
+                    self.status_var.set(f"❌ {msg}")
+                    messagebox.showerror("Error", msg)
+                    return
+
+                # Raw files need aggregation; app-generated summary files are
+                # already normalized and can be used as-is.
+                if {"mag_rocche", "mag_peso"}.issubset(df.columns):
+                    self.magazino_summary = df
+                else:
+                    self.magazino_summary = logic.summarize_by_partita(df)
+                self._base_df = self.magazino_summary.copy()
+                self._shared_path = str(path)
+                save_magazino_cache(path, self.magazino_summary)
+                if self._on_shared_cache_changed:
+                    self._on_shared_cache_changed()
+                self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {os.path.basename(path)}")
+                logger.info("Magazino Filato: loaded %d batches from %s",
+                            len(self.magazino_summary), os.path.basename(path))
+                self._recompute()
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_upload_lotti(self):
         path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if not path:
             return
         try:
-            df, errors = logic.load_magazino(path)
+            df, errors = lotti_logic.load_lotti(path)
         except Exception as exc:  # noqa: BLE001
             errors = [f"An error occurred while reading the file: {exc}"]
             df = None
 
         if errors or df is None or df.empty:
             msg = "; ".join(errors) if errors else "The file is empty after filtering"
-            self.status_var.set(f"❌ {msg}")
+            self.lotti_status_var.set(f"❌ {msg}")
             messagebox.showerror("Error", msg)
             return
 
-        self.summary_df = logic.summarize_by_partita(df)
-        self._shared_path = str(path)
-        save_magazino_cache(path, self.summary_df)
-        self.status_var.set(f"✅ {len(self.summary_df)} batches - {os.path.basename(path)}")
-        logger.info("Magazino Filato: loaded %d batches from %s", len(self.summary_df), os.path.basename(path))
-        self._render()
+        self.lotti_summary = lotti_logic.summarize_by_partita(df)
+        self._shared_lotti_path = str(path)
+        save_lotti_cache(path)
+        if self._on_shared_cache_changed:
+            self._on_shared_cache_changed()
+        self.lotti_status_var.set(f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {path}")
+        logger.info("Magazino Filato: loaded %d Lotto entries from %s",
+                    len(self.lotti_summary), os.path.basename(path))
+        self._recompute()
 
     def sync_shared_async(self):
-        """Load a Magazino selected on the Ordini ELVY page without blocking Tk."""
-        cache = load_magazino_cache()
-        source = str(cache.get("source_path", ""))
-        if not source or not os.path.isfile(source) or source == self._shared_path or self._syncing:
+        """Restore a Magazino export selected elsewhere in the app without blocking the UI."""
+        if self._syncing:
             return
+        cache = load_magazino_cache()
+        source_path = str(cache.get("source_path", ""))
+        if not source_path or self._shared_path == source_path or not os.path.isfile(source_path):
+            return
+
         self._syncing = True
 
         def worker():
             try:
-                df, errors = logic.load_magazino(source)
-                summary = logic.summarize_by_partita(df) if not errors and df is not None else None
+                df, errors = logic.load_magazino(source_path)
             except Exception as exc:  # noqa: BLE001
-                errors, summary = [str(exc)], None
+                df, errors = None, [str(exc)]
 
             def apply_result():
                 self._syncing = False
-                if errors or summary is None or summary.empty:
+                if errors or df is None or df.empty:
                     return
-                self.summary_df = summary
-                self._shared_path = source
-                save_magazino_cache(source, summary)
-                self.status_var.set(f"✅ {len(summary)} batches - {os.path.basename(source)}")
-                self._render()
+                self.magazino_summary = logic.summarize_by_partita(df)
+                self._base_df = self.magazino_summary.copy()
+                self._shared_path = source_path
+                save_magazino_cache(source_path, self.magazino_summary)
+                self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {source_path}")
+                self._recompute()
 
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _get_unfiltered_df(self):
+        if self._base_df.empty:
+            return pd.DataFrame()
+
+        if not self.lotti_summary.empty:
+            df = self._base_df.merge(self.lotti_summary, on="partita", how="left")
+        else:
+            df = self._base_df.copy()
+            df["lotto"] = ""
+
+        return df
+
+    def _recompute(self):
+        self._apply_search_and_sort()
+
     def _render(self):
         self.tree.delete(*self.tree.get_children())
-        query = self.search_var.get().strip().lower()
-        visible = self.summary_df
-        if query:
-            values = visible.reindex(columns=COLUMNS, fill_value="").astype(str)
-            visible = visible[values.apply(
-                lambda col: col.str.contains(query, case=False, regex=False)
-            ).any(axis=1)]
-        visible = visible.sort_values(
-            by=self._sort_column,
-            key=lambda col: col.astype(str).str.lower(),
-            ascending=not self._sort_reverse,
-        )
-        for i, (_, r) in enumerate(visible.iterrows()):
+        for idx, r in self.summary_df.iterrows():
+            tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.tree.insert("", "end", values=(
                 r["articolo"], r["partita"], f"{r['mag_rocche']:g}", f"{r['mag_peso']:g}",
-            ), tags=("evenrow" if i % 2 == 0 else "oddrow",))
+                r.get("lotto", "") if pd.notna(r.get("lotto", "")) else "",
+            ), tags=(tag,))
 
-    def _apply_filter(self):
-        self._search_after_id = None
+    def _apply_search_and_sort(self):
+        df = self._get_unfiltered_df()
+        if df.empty:
+            self.summary_df = pd.DataFrame()
+            self._render()
+            return
+
+        q = self._search_var.get().strip().lower()
+        if q:
+            mask = df.apply(lambda row: row.astype(str).str.lower().str.contains(q).any(), axis=1)
+            df = df[mask]
+
+        if self._sort_column:
+            ascending = not self._sort_reverse
+            df = df.sort_values(self._sort_column, ascending=ascending, kind="mergesort")
+
+        self.summary_df = df.reset_index(drop=True)
         self._render()
 
-    def _on_search_changed(self, *_args):
-        """Filter automatically while typing, with a small debounce."""
-        if self._search_after_id is not None:
-            self.after_cancel(self._search_after_id)
-        self._search_after_id = self.after(120, self._apply_filter)
-
-    def _on_sort(self, column):
+    def _sort_by(self, column: str) -> None:
         if self._sort_column == column:
             self._sort_reverse = not self._sort_reverse
         else:
             self._sort_column = column
             self._sort_reverse = False
-        self._render()
+        self._apply_search_and_sort()
 
-    def _restore_cached_data(self):
-        cache = load_magazino_cache()
-        source = str(cache.get("source_path", ""))
-        rows = cache.get("summary_rows")
-        if not source or not os.path.isfile(source) or not isinstance(rows, list) or not rows:
-            return
-        try:
-            self.summary_df = pd.DataFrame(rows).reindex(columns=COLUMNS)
-            self._shared_path = source
-            self.status_var.set(f"✅ {len(self.summary_df)} batches - {os.path.basename(source)}")
-            self._render()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not restore Magazino table: %s", exc)
+    def _on_search_changed(self):
+        self._apply_search_and_sort()
 
     def _on_export(self):
         if self.summary_df.empty:
@@ -213,7 +362,9 @@ class MagazinoFilatoTab(ttk.Frame):
             cell.border = border
 
         for _, r in self.summary_df.iterrows():
-            ws.append([r["articolo"], r["partita"], r["mag_rocche"], r["mag_peso"]])
+            lotto_val = r.get("lotto", "")
+            lotto_val = "" if pd.isna(lotto_val) else lotto_val
+            ws.append([r["articolo"], r["partita"], r["mag_rocche"], r["mag_peso"], lotto_val])
             for cell in ws[ws.max_row]:
                 cell.font = Font(name="Arial")
                 cell.alignment = center

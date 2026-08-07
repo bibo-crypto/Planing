@@ -20,7 +20,7 @@ one 900160/ORDINE=0 row present, and rule 4 dropped the 3 COLLI=0 rows.
 """
 import pandas as pd
 
-RAW_ARTICOLO_PREFIX = "G130"
+RAW_ARTICOLO_PREFIXES = ("G130", "G170")   # Elvy, Kamal
 KEEP_MAGAZZINI = {900910, 900160}
 
 
@@ -32,30 +32,68 @@ def _to_number(series):
     )
 
 
-def _find_header_row(raw, required_cols, search_rows=6):
-    required_set = set(required_cols)
+def _header_key(value):
+    return " ".join(str(value).replace("\ufeff", " ").strip().upper().split())
+
+
+def _find_header_row(raw, required_cols, search_rows=20):
+    required_set = {_header_key(value) for value in required_cols}
     for r in range(min(search_rows, len(raw))):
-        row_vals = set(str(v) for v in raw.iloc[r].tolist() if v is not None)
+        row_vals = set(_header_key(v) for v in raw.iloc[r].tolist() if v is not None)
         if required_set.issubset(row_vals):
             return r
     return None
 
 
-def load_magazino(path):
+def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
     """
     Reads the raw Magazino export and applies filter rules 1-4.
+    *articolo_prefix* selects which client's raw-yarn family/families to
+    keep (rule 2) -- default keeps both Elvy (G130) and Kamal (G170) in
+    one pass; pass a single string (e.g. "G170") to narrow it to one.
     Returns (DataFrame with columns [articolo, partita, ordine, esistenza,
     colli, magazzino], errors:list).
     """
     required = ["MAGAZZINO", "ARTICOLO", "PARTITA", "ORDINE", "ESISTENZA", "COLLI"]
-    raw = pd.read_excel(path, header=None)
+    # The app can also consume its own exported summary (Articolo, Partita,
+    # Mag.rocche, Mag.peso).  Accepting it avoids forcing users to keep the
+    # original ERP export around for every conversion.
+    summary_raw = pd.read_excel(path, header=None)
+    summary_header_row = _find_header_row(
+        summary_raw, ["Articolo", "Partita", "Mag.rocche", "Mag.peso"]
+    )
+    if summary_header_row is not None:
+        header = [_header_key(v) for v in summary_raw.iloc[summary_header_row].tolist()]
+        summary = summary_raw.iloc[summary_header_row + 1:].copy()
+        summary.columns = header
+        aliases = {
+            "ARTICOLO": "articolo", "PARTITA": "partita",
+            "MAG.ROCCHE": "mag_rocche", "MAG.PESO": "mag_peso",
+        }
+        columns = {name: aliases.get(name, name) for name in summary.columns}
+        summary = summary.rename(columns=columns)
+        required_summary = {"articolo", "partita", "mag_rocche", "mag_peso"}
+        if required_summary.issubset(summary.columns):
+            prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+            summary["articolo"] = summary["articolo"].astype(str).str.strip()
+            summary["partita"] = summary["partita"].astype(str).str.strip()
+            summary["mag_rocche"] = _to_number(summary["mag_rocche"])
+            summary["mag_peso"] = _to_number(summary["mag_peso"])
+            summary = summary[
+                summary["articolo"].str.startswith(prefixes)
+                & summary["partita"].ne("")
+            ]
+            return summary[["articolo", "partita", "mag_rocche", "mag_peso"]].reset_index(drop=True), []
+
+    raw = summary_raw
     header_row = _find_header_row(raw, required)
     if header_row is None:
         return None, [f"Couldn't find a header row with: {', '.join(required)}"]
 
     df = raw.iloc[header_row + 1:].copy()
-    df.columns = raw.iloc[header_row].tolist()
-    if len(df) and all(str(df.iloc[0][c]).strip() == str(c).strip() for c in required):
+    df.columns = [_header_key(value) for value in raw.iloc[header_row].tolist()]
+    required = [_header_key(value) for value in required]
+    if len(df) and all(str(df.iloc[0].get(c, "")).strip().upper() == c for c in required):
         df = df.iloc[1:]
     df = df.reset_index(drop=True)
 
@@ -73,7 +111,8 @@ def load_magazino(path):
     # rule 1: only these two warehouses
     df = df[df["MAGAZZINO"].isin(KEEP_MAGAZZINI)]
     # rule 2: only the raw-yarn article family
-    df = df[df["ARTICOLO"].str.startswith(RAW_ARTICOLO_PREFIX)]
+    prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+    df = df[df["ARTICOLO"].str.startswith(prefixes)]
     # rule 3: 900160 with ORDINE==0 means used up -> drop; 900910/ORDINE==0 is normal, keep
     used_up = (df["MAGAZZINO"] == 900160) & (df["ORDINE"] == 0)
     df = df[~used_up]
