@@ -43,7 +43,7 @@ RAW_KAMAL_COLUMNS: list[tuple[str, str, str]] = [
 ORDINE_KAMAL_COLUMNS: list[tuple[str, str, str]] = [
     ("CLIENTE",              "cliente",              "integer"),
     ("ARTICOLO",             "articolo_delta",       "text"),
-    ("COLORE",               "coloredfm",            "text"),
+    ("COLORE",               "coloredfm",            "integer"),
     ("Q.TA",                 "peso_kg",              "number"),
     ("CONSEGNA",             "data_consegna",        "date"),
     ("COMMENTO",             "commento",             "text"),
@@ -111,6 +111,18 @@ class KamalExcelExporter:
                 continue
             matching = next((row for row in kamal_rows if clean_text(row.coloredfm) == c), None)
             r.abbina = matching.abbina if matching else ""
+
+        # The raw sheet was written before the derived rows were calculated.
+        # Update its Abbina cells after the machine assignment so the parsed
+        # Kamal Order sheet contains the same values used by Ordine Kamal.
+        abbina_col = next(
+            (index + 1 for index, (_header, attr, _dtype) in enumerate(RAW_KAMAL_COLUMNS)
+             if attr == "abbina"),
+            None,
+        )
+        if abbina_col is not None:
+            for row_index, parsed_row in enumerate(self.rows, start=2):
+                ws.cell(row=row_index, column=abbina_col).value = getattr(parsed_row, "abbina", "") or ""
 
         write_header(ws2, ORDINE_KAMAL_COLUMNS)
         write_data(ws2, ORDINE_KAMAL_COLUMNS, kamal_rows)

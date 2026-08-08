@@ -165,7 +165,12 @@ def write_data(
                     )
 
             elif dtype == "integer":
-                cell.value = int(raw_value) if raw_value is not None else None
+                if raw_value in (None, ""):
+                    cell.value = None
+                else:
+                    # Excel integer columns may receive values parsed from
+                    # PDF/Excel text, including a decimal-looking string.
+                    cell.value = int(float(str(raw_value).replace(",", ".")))
                 cell.number_format = INTEGER_FORMAT
                 cell.alignment = Alignment(
                     horizontal="center", vertical="center"
@@ -327,5 +332,4 @@ class ExcelExporter(_LegacyMethodShims):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
 
