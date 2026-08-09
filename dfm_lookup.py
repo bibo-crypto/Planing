@@ -75,6 +75,14 @@ from utils import APP_DATA_DIR, clean_text, logger
 
 CACHE_FILE = APP_DATA_DIR / "settings" / "dfm_color_cache.json"
 
+
+def _cache_file_for(prefix: str) -> Path:
+    """Elvy's C130 cache keeps its original filename (backward compatible);
+    every other prefix (e.g. Kamal's C170) gets its own cache file."""
+    if prefix == ELVY_ARTICLE_PREFIX:
+        return CACHE_FILE
+    return APP_DATA_DIR / "settings" / f"dfm_color_cache_{prefix}.json"
+
 # Only rows whose ARTICOLODFM starts with this prefix are relevant to Elvy.
 ELVY_ARTICLE_PREFIX = "C130"
 
@@ -193,24 +201,26 @@ def save_dfm_cache(
     entries: list[dict[str, str]],
     source_name: str,
     source_path: Path | None = None,
+    prefix: str = ELVY_ARTICLE_PREFIX,
 ) -> None:
-    """Persist *entries* (plus metadata) to the cache file."""
+    """Persist *entries* (plus metadata) to the cache file for *prefix*."""
     try:
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cache_file = _cache_file_for(prefix)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "source_file": source_name,
             "source_path": str(source_path) if source_path else "",
             "loaded_at": datetime.now().isoformat(timespec="seconds"),
             "entries": entries,
         }
-        CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not save DFM colour cache: %s", exc)
+        logger.warning("Could not save DFM colour cache (%s): %s", prefix, exc)
 
 
-def load_dfm_cache() -> dict[str, Any]:
+def load_dfm_cache(prefix: str = ELVY_ARTICLE_PREFIX) -> dict[str, Any]:
     """
-    Load the cached DFM reference from disk.
+    Load the cached DFM reference for *prefix* from disk.
     Returns {"source_file": "", "loaded_at": "", "entries": []} if no
     cache exists yet or it can't be read.
     """
@@ -218,12 +228,13 @@ def load_dfm_cache() -> dict[str, Any]:
         "source_file": "", "source_path": "", "loaded_at": "", "entries": []
     }
     try:
-        if CACHE_FILE.is_file():
-            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        cache_file = _cache_file_for(prefix)
+        if cache_file.is_file():
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("entries"), list):
                 return data
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not load DFM colour cache: %s", exc)
+        logger.warning("Could not load DFM colour cache (%s): %s", prefix, exc)
     return empty
 
 
@@ -435,21 +446,31 @@ def lookup_dfm_color(
 
 def load_dfm_entries_by_prefix(prefix: str) -> list[dict[str, str]]:
     """
-    Re-parses the last-uploaded DFM file (its path is remembered in the
-    shared cache, whichever page uploaded it) filtered to a different
-    article prefix -- e.g. "C170" for Kamal, instead of the Elvy-only
-    "C130" cache. Returns [] if no DFM file has been uploaded yet, or it's
-    no longer at that path.
+    Filtered to a different article prefix -- e.g. "C170" for Kamal,
+    instead of the Elvy-only "C130" cache. The source DFM file's path is
+    remembered in the Elvy cache, whichever page uploaded it. Results are
+    cached per prefix (dfm_color_cache_<prefix>.json); re-parsing the raw
+    DFM export (which can be 20k+ rows) only happens when that file has
+    actually changed since it was last cached for this prefix. Returns []
+    if no DFM file has been uploaded yet, or it's no longer at that path.
     """
-    cache = load_dfm_cache()
-    source_path = cache.get("source_path", "")
+    elvy_cache = load_dfm_cache()
+    source_path = elvy_cache.get("source_path", "")
     if not source_path or not Path(source_path).is_file():
         return []
+
+    prefix_cache = load_dfm_cache(prefix=prefix)
+    if prefix_cache.get("source_path") == source_path and prefix_cache.get("entries"):
+        return prefix_cache["entries"]
+
     try:
-        return build_dfm_lookup(Path(source_path), prefix=prefix)
+        entries = build_dfm_lookup(Path(source_path), prefix=prefix)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not load DFM entries for prefix %s: %s", prefix, exc)
         return []
+
+    save_dfm_cache(entries, Path(source_path).name, Path(source_path), prefix=prefix)
+    return entries
 
 
 def find_articolo_by_titolo(entries: list[dict[str, str]], titolo: str) -> str:

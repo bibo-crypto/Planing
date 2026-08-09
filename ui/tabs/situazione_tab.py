@@ -21,6 +21,7 @@ import pandas as pd
 import situazione_db as db
 import situazione_loaders as data_loaders
 import situazione_logic as business_logic
+from abbina_suggestions import build_suggestions
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
@@ -143,26 +144,29 @@ class SituazioneTab(ttk.Frame):
         self.current_df = pd.DataFrame()
         self._filter_after_id = None
         self._shared_syncing = False
+        self._startup_restore_in_progress = False
+        self._startup_snapshot_current = False
         self._table_loaded_callbacks = []
+        self._shared_dfm_path = ""
+        self._shared_prod_path = ""
 
         self._build_upload_panel()
         self._build_toolbar()
         self._build_treeview()
         self._refresh_source_labels_from_db()
         # Load the saved table after all widgets have completed initialization.
+        self.after_idle(self._auto_restore_saved_files)
         self.after_idle(self._load_table_from_db)
         self.after_idle(self.sync_shared_async)
-        self.after_idle(self._auto_restore_saved_files)
 
     # ------------------------------------------------------------------ UI
     def _configure_styles(self):
-        # Note: intentionally does NOT call style.theme_use(...) — this tab
-        # shares a ttk.Style with the rest of the app (Data Elvy, Ordini
-        # ELVY, Med Bolla, Elvy Invoice tabs), so switching the global theme
-        # here would also change how every other tab looks.  The native
-        # Windows theme ignores Treeview heading background colors, so use
-        # the built-in clam renderer when available; it honors the explicit
-        # header colors below.
+        # Note: the app's main window (ui/gui.py) already sets the global
+        # ttk theme to "clam" once at startup for the same reason (the
+        # native Windows theme ignores Treeview heading background colors).
+        # Calling it again here is redundant but harmless (idempotent) —
+        # kept as a safety net in case this tab is ever instantiated on its
+        # own, outside the main app.
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
@@ -218,6 +222,9 @@ class SituazioneTab(ttk.Frame):
 
         self.export_btn = ttk.Button(bar, text="Export to Excel", command=self._on_export)
         self.export_btn.pack(side="left", padx=4)
+
+        self.abbina_btn = ttk.Button(bar, text="Da abbinare", command=self._open_abbina)
+        self.abbina_btn.pack(side="left", padx=4)
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
@@ -321,12 +328,24 @@ class SituazioneTab(ttk.Frame):
             return
         self._auto_restore_started = True
         uploads = db.get_all_uploads()
+
+        # The SQLite snapshot is already the fast local cache for the
+        # Situazione grid. If none of the saved source workbooks changed since
+        # their last upload, do not parse all six Excel files on every startup.
+        # The user can still use Upload Data when a fresh rebuild is needed.
+        if self._saved_snapshot_is_current(uploads):
+            self._startup_snapshot_current = True
+            logger.info("Situazione: startup snapshot is current; skipped Excel restore")
+            return
+
         paths = {
             key: str(uploads.get(key, {}).get("file_path", ""))
             for key in SOURCE_ORDER + ["codes"]
         }
         if not any(paths.values()):
             return
+
+        self._startup_restore_in_progress = True
 
         def worker():
             loaded = {}
@@ -363,6 +382,7 @@ class SituazioneTab(ttk.Frame):
                     codes_error = f"file not found: {codes_path}"
 
             def apply_result():
+                self._startup_restore_in_progress = False
                 for key, df in loaded.items():
                     self.loaded_frames[key] = df
                     self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
@@ -391,6 +411,25 @@ class SituazioneTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @staticmethod
+    def _saved_snapshot_is_current(uploads):
+        """Return True when the SQLite table can be used without Excel I/O."""
+        if not db.get_all_states():
+            return False
+        for key in SOURCE_ORDER:
+            info = uploads.get(key, {})
+            path = info.get("file_path", "")
+            uploaded_at = info.get("uploaded_at", "")
+            if info.get("status") != "ok" or not path or not os.path.isfile(path) or not uploaded_at:
+                return False
+            try:
+                uploaded_timestamp = datetime.fromisoformat(str(uploaded_at)).timestamp()
+                if os.path.getmtime(path) > uploaded_timestamp + 1:
+                    return False
+            except (OSError, TypeError, ValueError):
+                return False
+        return True
+
     def sync_shared_dfm(self):
         """Load the DFM selected in either page from the shared persistent cache."""
         cache = load_dfm_cache()
@@ -416,6 +455,13 @@ class SituazioneTab(ttk.Frame):
 
     def sync_shared_async(self):
         """Restore shared Excel files without blocking the Tk event loop."""
+        # Startup restore owns the source loading pass. Running this second
+        # pass at the same time would read DFM/Produzione twice.
+        if self._startup_restore_in_progress:
+            return
+        if self._startup_snapshot_current:
+            self._startup_snapshot_current = False
+            return
         if self._shared_syncing:
             return
         dfm_path = str(load_dfm_cache().get("source_path", ""))
@@ -708,6 +754,143 @@ class SituazioneTab(ttk.Frame):
         self.current_df = self.current_df.sort_values(by=col, ascending=ascending, key=lambda s: s.astype(str))
         self.sort_state[col] = not ascending
         self._apply_filter()
+
+    def _open_abbina(self):
+        suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
+        window = tk.Toplevel(self)
+        window.title("Da abbinare")
+        window.geometry("1250x600")
+        window.minsize(850, 350)
+        window.resizable(True, True)
+
+        top = ttk.Frame(window)
+        top.pack(fill="x", padx=8, pady=8)
+        ttk.Label(top, text=(f"{len(suggestions)} righe — stesso Codice/Colore, Titolo compatibile; limite extra 20% (oltre = ⚠)"),
+                  foreground="#344054").pack(side="left")
+        ttk.Label(top, text="Auto search:").pack(side="left", padx=(18, 4))
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(top, textvariable=search_var, width=24)
+        search_entry.pack(side="left")
+        ttk.Button(top, text="Export Abbina", command=lambda: self._export_abbina(suggestions)).pack(side="right")
+
+        cols = ["titolo", "codice", "colore", "rocche", "partita", "bagno", "abbina",
+                "tot_rocche", "mc_target", "polmoni", "extra_percent", "motivo", "new_comment"]
+        labels = {"titolo": "Titolo", "codice": "Codice", "colore": "Colore", "rocche": "Rocche",
+                  "partita": "Partita", "bagno": "Bagno", "abbina": "Abbina", "tot_rocche": "Tot. Rocche",
+                  "mc_target": "Capacità", "polmoni": "Polmoni", "extra_percent": "Extra %",
+                  "motivo": "Motivo", "new_comment": "New Comment"}
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        style = ttk.Style(window)
+        style.configure("Abbina.Treeview", rowheight=28, font=("Segoe UI", 9))
+        tree = ttk.Treeview(frame, columns=cols, show="headings", style="Abbina.Treeview")
+        for col in cols:
+            tree.heading(col, text=labels[col])
+            tree.column(col, width=105 if col not in ("motivo", "abbina", "new_comment") else 230, anchor="center")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.tag_configure("group_a", background="#eaf2f8")
+        tree.tag_configure("group_b", background="#fff7e6")
+
+        def render():
+            tree.delete(*tree.get_children())
+            query = search_var.get().strip().casefold()
+            visible = suggestions
+            if query:
+                mask = suggestions[cols].fillna("").astype(str).apply(
+                    lambda column: column.str.casefold().str.contains(query, regex=False)
+                ).any(axis=1)
+                visible = suggestions[mask]
+            group_tags = {
+                group: "group_a" if index % 2 == 0 else "group_b"
+                for index, group in enumerate(
+                    suggestions.apply(
+                        lambda row: f"{row.get('codice', '')}|{row.get('colore', '')}|{row.get('motivo', '')}",
+                        axis=1,
+                    ).drop_duplicates()
+                )
+            }
+            for _, row in visible.iterrows():
+                group = f"{row.get('codice', '')}|{row.get('colore', '')}|{row.get('motivo', '')}"
+                values = [f"{row[c]:.1%}" if c == "extra_percent" else row.get(c, "") for c in cols]
+                tree.insert("", "end", values=values, tags=(group_tags[group],))
+
+        search_var.trace_add("write", lambda *_: render())
+        render()
+
+    def _export_abbina(self, suggestions):
+        if suggestions.empty:
+            messagebox.showinfo("Da abbinare", "Non ci sono combinazioni entro il limite del 20%.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+                                             initialfile="Da_abbinare.xlsx")
+        if not path:
+            return
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+
+        headers = ["Titolo", "Codice", "Colore", "Rocche", "Partita", "Bagno", "Abbina",
+                   "Tot. Rocche", "Capacità M/C", "Polmoni", "Extra %", "Motivo", "New Comment"]
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Da abbinare"
+        ws.append(headers)
+
+        header_fill = PatternFill("solid", fgColor="16324F")
+        header_font = Font(name="Arial", bold=True, color="FFFFFF")
+        thin = Side(style="thin", color="B8C6D6")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center
+            cell.border = border
+
+        group_colors = {"group_a": "EAF2F8", "group_b": "FFF7E6"}
+        group_tags = {
+            group: "group_a" if index % 2 == 0 else "group_b"
+            for index, group in enumerate(
+                suggestions.apply(
+                    lambda row: f"{row.get('codice', '')}|{row.get('colore', '')}|{row.get('motivo', '')}",
+                    axis=1,
+                ).drop_duplicates()
+            )
+        }
+        for _, row in suggestions.iterrows():
+            group = f"{row.get('codice', '')}|{row.get('colore', '')}|{row.get('motivo', '')}"
+            values = [row.get("titolo", ""), row.get("codice", ""), row.get("colore", ""),
+                      row.get("rocche", ""), row.get("partita", ""), row.get("bagno", ""),
+                      row.get("abbina", ""), row.get("tot_rocche", ""), row.get("mc_target", ""),
+                      row.get("polmoni", ""), f"{row.get('extra_percent', 0):.1%}",
+                      row.get("motivo", ""), row.get("new_comment", "")]
+            ws.append(values)
+            fill = PatternFill("solid", fgColor=group_colors[group_tags[group]])
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
+                cell.font = Font(name="Arial")
+                cell.alignment = center
+                cell.border = border
+
+        last_row = ws.max_row
+        last_col = get_column_letter(len(headers))
+        ws.auto_filter.ref = f"A1:{last_col}{last_row}"
+        ws.freeze_panes = "A2"
+        for column_index, header in enumerate(headers, start=1):
+            letter = get_column_letter(column_index)
+            values = [str(ws.cell(row=row, column=column_index).value or "") for row in range(1, last_row + 1)]
+            width = min(max(max(len(value) for value in values) + 3, len(header) + 2, 10), 45)
+            ws.column_dimensions[letter].width = width
+        ws.row_dimensions[1].height = 28
+        wb.save(path)
+        messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")
 
     # -------------------------------------------------------------- export
     @staticmethod

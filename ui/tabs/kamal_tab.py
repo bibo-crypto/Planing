@@ -49,6 +49,12 @@ class KamalTab(ttk.Frame):
 
         self._build_ui()
         self._restore_saved_paths()
+        # DFM sync is cheap (reads a small cached path, not the DFM Excel
+        # itself) and has no competing per-tab preference to conflict with,
+        # unlike Magazino/LOTTI above -- so it's safe to do proactively here,
+        # fixing the gap where a returning session wouldn't reflect an
+        # already-uploaded DFM until the user re-uploads it this session.
+        self.sync_shared_dfm()
         self.sync_shared_dfm()
         self.sync_shared_magazino()
         self.sync_shared_lotti()
@@ -339,15 +345,21 @@ class KamalTab(ttk.Frame):
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
 
+    def _set_status(self, text: str):
+        """Thread-safe status label update — safe to call from the background conversion thread."""
+        self.after(0, lambda: self._lbl_status.config(text=text, foreground="grey"))
+
     def _run_conversion(self):
         errors: list[str] = []
         all_rows = []
+        self._set_status("Reading PDF(s)…")
         try:
             for pdf_path in self._pdf_paths:
                 all_rows.extend(KamalParser(pdf_path).parse())
         except Exception as exc:  # noqa: BLE001
             errors.append(f"Error parsing PDF(s): {exc}")
 
+        self._set_status("Loading DFM reference (C170)…")
         dfm_c170_entries = load_dfm_entries_by_prefix(KAMAL_ARTICLE_PREFIX)
         if not dfm_c170_entries:
             errors.append(
@@ -358,6 +370,7 @@ class KamalTab(ttk.Frame):
         magazino_summary = None
         codes_map = None
         if self._raw_yarn_path is not None:
+            self._set_status("Loading raw yarn stock (Magazino)…")
             try:
                 magazino_df, magazino_errors = magazino_logic.load_magazino(
                     str(self._raw_yarn_path), articolo_prefix="G170"
@@ -375,6 +388,7 @@ class KamalTab(ttk.Frame):
 
         lotti_summary = None
         if self._lotti_path is not None:
+            self._set_status("Loading LOTTI reference…")
             try:
                 lotti_df, lotti_errors = lotti_logic.load_lotti(str(self._lotti_path), articolo_prefix=lotti_logic.RAW_ARTICOLO_PREFIXES)
                 if lotti_errors or lotti_df is None or lotti_df.empty:
@@ -387,6 +401,7 @@ class KamalTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Error loading LOTTI file: {exc}")
 
+        self._set_status("Matching raw yarn and exporting…")
         if all_rows:
             try:
                 KamalExcelExporter(
