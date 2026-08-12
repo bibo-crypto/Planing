@@ -306,7 +306,7 @@ class SettimanaTab(ttk.Frame):
             return
         path = filedialog.asksaveasfilename(defaultextension=".xlsx",
                                              filetypes=[("Excel", "*.xlsx")],
-                                             initialfile="Situazione_Settimana.xlsx")
+                                             initialfile="Situazione_Settimanale.xlsx")
         if not path:
             return
 

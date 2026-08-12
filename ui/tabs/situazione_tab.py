@@ -22,6 +22,7 @@ import situazione_db as db
 import situazione_loaders as data_loaders
 import situazione_logic as business_logic
 from abbina_suggestions import build_suggestions
+from yarn_shortage_tab import YarnShortageTab
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
@@ -225,6 +226,9 @@ class SituazioneTab(ttk.Frame):
 
         self.abbina_btn = ttk.Button(bar, text="Da abbinare", command=self._open_abbina)
         self.abbina_btn.pack(side="left", padx=4)
+
+        self.yarn_shortage_btn = ttk.Button(bar, text="Mancanza Filato", command=self._open_yarn_shortage)
+        self.yarn_shortage_btn.pack(side="left", padx=4)
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
@@ -892,6 +896,28 @@ class SituazioneTab(ttk.Frame):
         wb.save(path)
         messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")
 
+    def _open_yarn_shortage(self):
+        """Opens Mancanza Filato as a popup window (same pattern as Da abbinare)."""
+        window = tk.Toplevel(self)
+        window.title("Mancanza Filato")
+        window.geometry("1100x650")
+        window.minsize(750, 350)
+        window.resizable(True, True)
+
+        shortage_view = YarnShortageTab(window, self)
+        shortage_view.pack(fill="both", expand=True)
+        self.add_table_loaded_callback(shortage_view.refresh)
+
+        def on_close():
+            try:
+                self._table_loaded_callbacks.remove(shortage_view.refresh)
+            except ValueError:
+                pass
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        shortage_view.refresh()
+
     # -------------------------------------------------------------- export
     @staticmethod
     def _to_number(text):
@@ -930,7 +956,7 @@ class SituazioneTab(ttk.Frame):
             return
         path = filedialog.asksaveasfilename(defaultextension=".xlsx",
                                              filetypes=[("Excel", "*.xlsx")],
-                                             initialfile="Situazione.xlsx")
+                                             initialfile="Situazione_Generale.xlsx")
         if not path:
             return
 
