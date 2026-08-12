@@ -69,7 +69,6 @@ from situazione_tab import SituazioneTab
 from situazione_settimana_tab import SettimanaTab
 from magazino_filato_tab import MagazinoFilatoTab
 from kamal_tab import KamalTab
-from yarn_shortage_tab import YarnShortageTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -266,44 +265,66 @@ class ConverterApp(tk.Tk):
         notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 4))
 
         elvy_tab = ttk.Frame(notebook)
-        po_tab = ttk.Frame(notebook)
-        bolla_tab = ttk.Frame(notebook)
-        elvy_invoice_tab = ttk.Frame(notebook)
         notebook.add(elvy_tab, text="Data Elvy")
-        notebook.add(po_tab, text="Ordini ELVY")
-        notebook.add(bolla_tab, text="Med Bolla")
-        notebook.add(elvy_invoice_tab, text="Elvy Invoice")
-
         self._build_elvy_tab(elvy_tab)
+
+        # ── Ordine: Ordine Elvy + Ordine Kamal, grouped under one parent tab ──
+        ordine_parent = ttk.Frame(notebook)
+        notebook.add(ordine_parent, text="Ordine")
+        ordine_notebook = ttk.Notebook(ordine_parent)
+        ordine_notebook.pack(fill="both", expand=True)
+
+        po_tab = ttk.Frame(ordine_notebook)
+        ordine_notebook.add(po_tab, text="Ordine Elvy")
         self._build_po_tab(po_tab)
+
+        self._kamal_tab = KamalTab(ordine_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        ordine_notebook.add(self._kamal_tab, text="Ordine Kamal")
+
+        # ── Invoice: Bolla Med + Invoice Elvy, grouped under one parent tab ──
+        invoice_parent = ttk.Frame(notebook)
+        notebook.add(invoice_parent, text="Invoice")
+        invoice_notebook = ttk.Notebook(invoice_parent)
+        invoice_notebook.pack(fill="both", expand=True)
+
+        bolla_tab = ttk.Frame(invoice_notebook)
+        invoice_notebook.add(bolla_tab, text="Bolla Med")
         self._build_bolla_tab(bolla_tab)
+
+        elvy_invoice_tab = ttk.Frame(invoice_notebook)
+        invoice_notebook.add(elvy_invoice_tab, text="Invoice Elvy")
         self._build_elvy_invoice_tab(elvy_invoice_tab)
 
+        # ── Situazione: Situazione Generale + Situazione Settimanale ──
         # Situazione tab is a self-contained module (situazione_tab.py) — it
         # manages its own uploads, SQLite state, and UI, so it's built by
         # instantiating it directly rather than through a _build_*_tab method.
-        self._situazione_tab = SituazioneTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
-        notebook.add(self._situazione_tab, text="Situazione")
+        situazione_parent = ttk.Frame(notebook)
+        notebook.add(situazione_parent, text="Situazione")
+        situazione_notebook = ttk.Notebook(situazione_parent)
+        situazione_notebook.pack(fill="both", expand=True)
 
-        self._settimana_tab = SettimanaTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
-        notebook.add(self._settimana_tab, text="Situazione Settimana")
+        self._situazione_tab = SituazioneTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        situazione_notebook.add(self._situazione_tab, text="Situazione Generale")
+
+        self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        situazione_notebook.add(self._settimana_tab, text="Situazione Settimanale")
 
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
-        self._kamal_tab = KamalTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
-        notebook.add(self._kamal_tab, text="Ordine Kamal")
-
-        self._yarn_shortage_tab = YarnShortageTab(notebook, self._situazione_tab)
-        notebook.add(self._yarn_shortage_tab, text="Mancanza Filato")
-        self._situazione_tab.add_table_loaded_callback(self._yarn_shortage_tab.refresh)
-
         self._build_log_area()
-        notebook.bind(
-            "<<NotebookTabChanged>>",
-            lambda _event: self._update_log_visibility(notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab),
-        )
-        self._update_log_visibility(notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab)
+
+        def _on_any_tab_changed(_event=None) -> None:
+            self._update_log_visibility(
+                notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab,
+                ordine_notebook, situazione_notebook,
+            )
+
+        notebook.bind("<<NotebookTabChanged>>", _on_any_tab_changed)
+        ordine_notebook.bind("<<NotebookTabChanged>>", _on_any_tab_changed)
+        situazione_notebook.bind("<<NotebookTabChanged>>", _on_any_tab_changed)
+        _on_any_tab_changed()
         self._restore_saved_paths()
 
     def _on_shared_cache_changed(self) -> None:
@@ -384,14 +405,28 @@ class ConverterApp(tk.Tk):
         )
         abbina_info.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
 
-        # ── Update existing ERP file ─────────────────────────────────
+        # ── Raw yarn (Magazino) matching ────────────────────────────
+        raw_yarn_frame = ttk.LabelFrame(parent, text="Raw Yarn Matching", padding=6)
+        raw_yarn_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
+        raw_yarn_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            raw_yarn_frame, text="📦 Select Magazino File…", command=self._on_po_select_raw_yarn, width=20
+        ).grid(row=0, column=0, padx=4, pady=3, sticky="w")
+
+        self._po_lbl_raw_yarn = ttk.Label(
+            raw_yarn_frame, text="No Magazino file selected", foreground="grey", anchor="w"
+        )
+        self._po_lbl_raw_yarn.grid(row=0, column=1, sticky="ew", padx=4)
+
+        # ── Update existing ERP file (+ Filato x Tinturia transfer) ──
         erp_frame = ttk.LabelFrame(parent, text="Also Update Existing ERP File", padding=6)
-        erp_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
+        erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
             erp_frame,
-            text="After converting, write the Ordini ELVY rows into this existing file "
+            text="After converting, write the Ordine Elvy rows into this existing file "
                  "too — every row below the header is cleared first, then replaced",
             variable=self._po_update_erp_file,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -412,29 +447,15 @@ class ConverterApp(tk.Tk):
         )
         erp_warning.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
-        # ── Raw yarn (Magazino) matching ────────────────────────────
-        raw_yarn_frame = ttk.LabelFrame(parent, text="Match Raw Yarn (optional)", padding=4)
-        raw_yarn_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
-        raw_yarn_frame.columnconfigure(0, weight=1)
-
         ttk.Button(
-            raw_yarn_frame, text="📦 Select Magazino File…", command=self._on_po_select_raw_yarn, width=20
-        ).grid(row=0, column=0, padx=4, pady=(4, 2), sticky="ew")
-
-        self._po_lbl_raw_yarn = ttk.Label(
-            raw_yarn_frame, text="No Magazino file selected", foreground="grey", anchor="w"
-        )
-        self._po_lbl_raw_yarn.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 2))
-
-        ttk.Button(
-            raw_yarn_frame, text="🔄 Transfer Filato x Tinturia…",
-            command=self._on_transfer_filato_tinturia, width=20,
-        ).grid(row=2, column=0, padx=4, pady=(2, 4), sticky="ew")
+            erp_frame, text="🔄 Transfer Filato x Tinturia…",
+            command=self._on_transfer_filato_tinturia, width=24,
+        ).grid(row=3, column=0, padx=(0, 6), pady=(6, 0), sticky="w")
 
         self._po_lbl_filato_file = ttk.Label(
-            raw_yarn_frame, text="No Filato x Tinturia target selected", foreground="grey", anchor="w"
+            erp_frame, text="No Filato x Tinturia target selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_filato_file.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 2))
+        self._po_lbl_filato_file.grid(row=3, column=1, sticky="ew", pady=(6, 0))
 
         # ── Options + Convert ────────────────────────────────────────
         opt_frame = ttk.Frame(parent, padding=(6, 3))
@@ -832,16 +853,24 @@ class ConverterApp(tk.Tk):
 
     def _update_log_visibility(self, notebook: ttk.Notebook, situazione_tab: ttk.Frame,
                                 settimana_tab: ttk.Frame, magazino_tab: ttk.Frame,
-                                kamal_tab: ttk.Frame) -> None:
+                                kamal_tab: ttk.Frame, ordine_notebook: ttk.Notebook,
+                                situazione_notebook: ttk.Notebook) -> None:
         """Hide the shared log where the page has its own full-screen workspace."""
-        selected_tab = notebook.select()
-        situazione_selected = selected_tab == str(situazione_tab)
-        settimana_selected = selected_tab == str(settimana_tab)
-        magazino_selected = selected_tab == str(magazino_tab)
-        kamal_selected = selected_tab == str(kamal_tab)
-        tab_text = notebook.tab(selected_tab, "text")
-        data_elvy_selected = tab_text == "Data Elvy"
-        ordini_selected = tab_text == "Ordini ELVY"
+        selected_top = notebook.select()
+        top_text = notebook.tab(selected_top, "text")
+        data_elvy_selected = top_text == "Data Elvy"
+        magazino_selected = selected_top == str(magazino_tab)
+
+        situazione_selected = settimana_selected = False
+        kamal_selected = ordini_selected = False
+        if top_text == "Situazione":
+            inner = situazione_notebook.select()
+            situazione_selected = inner == str(situazione_tab)
+            settimana_selected = inner == str(settimana_tab)
+        elif top_text == "Ordine":
+            inner_text = ordine_notebook.tab(ordine_notebook.select(), "text")
+            kamal_selected = inner_text == "Ordine Kamal"
+            ordini_selected = inner_text == "Ordine Elvy"
         # Do not trigger heavy shared-file loading while switching tabs.
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
@@ -1158,7 +1187,7 @@ class ConverterApp(tk.Tk):
         # Final export for merged mode
         if not one_per_file and merged_rows:
             try:
-                out_path = output_dir / "merged_purchase_orders.xlsx"
+                out_path = output_dir / "Ordine_Elvy.xlsx"
                 ExcelExporter(merged_rows, out_path, magazino_summary, codes_map).export()
                 last_export_path = out_path
                 logger.info("Merged export saved: %s", out_path.name)
@@ -1356,7 +1385,7 @@ class ConverterApp(tk.Tk):
 
         if not one_per_file and merged_rows:
             try:
-                out_path = output_dir / "merged_bolle.xlsx"
+                out_path = output_dir / "Bolla_Med.xlsx"
                 BollaExporter(merged_rows, merged_totals, out_path).export()
                 logger.info("Merged export saved: %s", out_path.name)
             except Exception as exc:  # noqa: BLE001
@@ -1595,7 +1624,7 @@ class ConverterApp(tk.Tk):
 
         if not one_per_file and merged_rows:
             try:
-                out_path = output_dir / "merged_elvy_invoices.xlsx"
+                out_path = output_dir / "Invoice_Elvy.xlsx"
                 ElvyInvoiceExporter(merged_rows, out_path).export()
                 logger.info("Merged export saved: %s", out_path.name)
             except Exception as exc:  # noqa: BLE001

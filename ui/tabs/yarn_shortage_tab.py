@@ -173,7 +173,7 @@ class YarnShortageTab(ttk.Frame):
             return
         path = filedialog.asksaveasfilename(defaultextension=".xlsx",
                                             filetypes=[("Excel", "*.xlsx")],
-                                            initialfile="Yarn_Shortage_PG-X.xlsx")
+                                            initialfile="Mancanza_Filato.xlsx")
         if not path:
             return
         client = self.client_var.get()
