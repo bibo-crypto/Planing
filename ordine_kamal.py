@@ -54,6 +54,8 @@ class OrdineKamalRow:
     bagno_proposto: str = ""
     macchina: int | None = None
     sender_msg_no: str = ""        # "رقم رسالة الخام" -- used to match Lotto in LOTTI
+    colore_name: str = ""          # "اللون" -- Kamal's own colour label, used as the
+                                    # GRUPPO MACCHINA grouping key when COLOREDFM is blank
 
     @property
     def quantity_cones(self) -> float:
@@ -67,19 +69,41 @@ class OrdineKamalRow:
         return self.peso_kg
 
 
+def _machine_group_key(row: OrdineKamalRow) -> tuple[str, str] | None:
+    """
+    Grouping key used to sum weight and pick a machine for GRUPPO MACCHINA.
+
+    COLOREDFM is the primary key. When a row has no COLOREDFM (blank),
+    fall back to grouping by Colore ("اللون", Kamal's own colour label)
+    instead of skipping the row -- rows sharing the same Colore still get
+    their Peso (kg) summed together and rounded to one machine; a Colore
+    that appears on its own is rounded using just its own weight. Rows
+    with neither COLOREDFM nor Colore have no grouping key and are left
+    unassigned.
+    """
+    color = clean_text(row.coloredfm)
+    if color:
+        return ("coloredfm", color)
+    colore = clean_text(row.colore_name)
+    if colore:
+        return ("colore", colore)
+    return None
+
+
 def assign_ordine_kamal_machines(rows: list[OrdineKamalRow]) -> None:
     """Assign GRUPPO MACCHINA consistently for workbook and ERP exports."""
-    totals: dict[str, float] = {}
+    totals: dict[tuple[str, str], float] = {}
     for row in rows:
-        color = clean_text(row.coloredfm)
-        if color:
-            totals[color] = totals.get(color, 0.0) + (row.peso_kg or 0.0)
+        key = _machine_group_key(row)
+        if key is None:
+            continue
+        totals[key] = totals.get(key, 0.0) + (row.peso_kg or 0.0)
 
     for row in rows:
-        color = clean_text(row.coloredfm)
-        if not color or color not in totals:
+        key = _machine_group_key(row)
+        if key is None:
             continue
-        capacity = _smallest_fitting_machine(totals[color])
+        capacity = _smallest_fitting_machine(totals[key])
         row.macchina = MACHINE_CODES.get(capacity)
         row.abbina = f"Machine {capacity} Cones"
 
@@ -113,6 +137,7 @@ def build_ordine_kamal_rows(rows: list[KamalOrderRow], dfm_c170_entries: list[di
             commento=commento,
             data_riconsegna=data_riconsegna_dt,
             sender_msg_no=clean_text(r.sender_msg_no),
+            colore_name=clean_text(r.colore_name),
         ))
 
     if unmatched:

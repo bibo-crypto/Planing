@@ -290,6 +290,71 @@ def update_existing_filato_file(target_path: Path, matches: list[RawYarnMatch]) 
     return len(matches)
 
 
+def export_ordini_full(target_path: Path, ordini_rows: list) -> int:
+    """
+    Create a brand-new "EXCEL PER ORDINE VENDITA EGITTO" workbook at
+    *target_path*, fully formatted (header styling, column widths, freeze
+    panes/filter) with ordini_rows -- unlike update_existing_ordini_file(),
+    this does not open/edit an existing file, it (re)creates the file from
+    scratch every time it's called, overwriting whatever was there before.
+    Returns the number of rows written.
+    """
+    import openpyxl  # local import: this module doesn't need openpyxl otherwise
+    from excel_exporter import ORDINI_ELVY_COLUMNS, apply_column_widths, freeze_and_filter, write_data, write_header
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ORDINE VENDITA EGITTO"
+    ws.sheet_view.rightToLeft = False
+    write_header(ws, ORDINI_ELVY_COLUMNS)
+    write_data(ws, ORDINI_ELVY_COLUMNS, ordini_rows)
+    apply_column_widths(ws, ORDINI_ELVY_COLUMNS)
+    freeze_and_filter(ws, ORDINI_ELVY_COLUMNS)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target_path)
+    wb.close()
+    return len(ordini_rows)
+
+
+def export_filato_full(target_path: Path, matches: list["RawYarnMatch"]) -> int:
+    """
+    Create a brand-new "Filato x Tinturia" workbook at *target_path*, fully
+    formatted the same way as the sheet embedded in the PO/Kamal export --
+    unlike update_existing_filato_file(), this does not open/edit an
+    existing file, it (re)creates the file from scratch every time it's
+    called, overwriting whatever was there before.
+    Returns the number of rows written.
+    """
+    import openpyxl  # local import: this module doesn't need openpyxl otherwise
+    from openpyxl.styles import Alignment, Font
+    from excel_exporter import FILATO_TINTURIA_COLUMNS, apply_column_widths, freeze_and_filter, write_data, write_header
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Filato x Tinturia"
+    ws.sheet_view.rightToLeft = False
+    write_header(ws, FILATO_TINTURIA_COLUMNS)
+    write_data(ws, FILATO_TINTURIA_COLUMNS, matches)
+    apply_column_widths(ws, FILATO_TINTURIA_COLUMNS)
+    freeze_and_filter(ws, FILATO_TINTURIA_COLUMNS)
+
+    label_col_idx = next(
+        (i + 1 for i, (_, attr, _) in enumerate(FILATO_TINTURIA_COLUMNS) if attr == "label"), None
+    )
+    if label_col_idx:
+        bold_label_font = Font(bold=True, name="Calibri", size=11)
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=label_col_idx, max_col=label_col_idx):
+            for cell in row:
+                cell.font = bold_label_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target_path)
+    wb.close()
+    return len(matches)
+
+
 @dataclass
 class RawYarnMatch:
     """One row assigned for the "Filato x Tinturia" summary sheet."""

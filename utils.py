@@ -35,7 +35,18 @@ def _get_app_data_dir() -> Path:
     """
     if getattr(sys, "frozen", False):
         base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-        return Path(base) / "Delta Dyeing PO Converter"
+        new_dir = Path(base) / "Planing"
+        old_dir = Path(base) / "Delta Dyeing PO Converter"
+        # One-time migration: the app used to be named "Delta Dyeing PO
+        # Converter" -- if a user upgrades to a build named "Planing" and
+        # the new folder doesn't exist yet, carry the old settings/logs/
+        # cache over instead of silently starting fresh.
+        if not new_dir.exists() and old_dir.exists():
+            try:
+                old_dir.rename(new_dir)
+            except OSError:
+                pass
+        return new_dir
     return Path(__file__).resolve().parent
 
 

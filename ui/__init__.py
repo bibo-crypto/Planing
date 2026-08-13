@@ -1,2 +1,2 @@
-"""User-interface package for the Delta Dyeing application."""
+"""User-interface package for Planing (the Delta Dyeing application)."""
 

@@ -1,18 +1,18 @@
 ; ============================================================
-;  Inno Setup 6 Script — Delta Dyeing PO Converter
+;  Inno Setup 6 Script — Planing
 ;  https://jrsoftware.org/isdl.php
 ;
 ;  HOW TO USE:
-;    1. Run build.bat first to generate dist\DeltaDyeingConverter\
+;    1. Run build.bat first to generate dist\Planing\
 ;    2. Open this file in Inno Setup Compiler (Ctrl+F9 to build)
 ;    3. Installer will appear in: installer_output\
 ; ============================================================
 
-#define AppName      "Delta Dyeing PO Converter"
+#define AppName      "Planing"
 #define AppVersion   "1.0.0"
 #define AppPublisher "Delta Dyeing S.A.E."
-#define AppExeName   "DeltaDyeingConverter.exe"
-#define SourceDir    "dist\DeltaDyeingConverter"
+#define AppExeName   "Planing.exe"
+#define SourceDir    "dist\Planing"
 #define OutputDir    "installer_output"
 
 [Setup]
@@ -32,7 +32,7 @@ DefaultGroupName={#AppName}
 
 ; Output
 OutputDir={#OutputDir}
-OutputBaseFilename=DeltaDyeingConverter_Setup_v{#AppVersion}
+OutputBaseFilename=Planing_Setup_v{#AppVersion}
 
 ; Compression
 Compression=lzma2/ultra64
