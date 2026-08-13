@@ -1,5 +1,5 @@
 """
-main.py — Entry point for the Delta Dyeing PDF-to-Excel Converter.
+main.py — Entry point for Planing (the Delta Dyeing PDF-to-Excel Converter).
 
 Run with:
     python main.py

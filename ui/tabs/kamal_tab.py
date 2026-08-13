@@ -22,7 +22,7 @@ from ordine_kamal import (
     build_ordine_kamal_rows,
     match_by_lotto,
 )
-from ordini_elvy import match_raw_yarn, read_filato_tinturia_sheet, update_existing_filato_file, update_existing_ordini_file
+from ordini_elvy import export_filato_full, export_ordini_full, match_raw_yarn, read_filato_tinturia_sheet
 from utils import logger, load_settings, save_settings
 from typing import Callable
 
@@ -39,10 +39,8 @@ class KamalTab(ttk.Frame):
         self._raw_yarn_path: Path | None = None
         self._lotti_path: Path | None = None
         self._output_path: Path | None = None
-        self._kamal_erp_file_path: Path | None = None
-        self._kamal_filato_file_path: Path | None = None
+        self._kamal_erp_export_dir: Path | None = None
         self._kamal_update_erp_file = tk.BooleanVar(value=False)
-        self._kamal_transfer_filato = tk.BooleanVar(value=False)
         self._shared_dfm_path = ""
         self._on_shared_cache_changed = on_shared_cache_changed
         self._prefs = load_settings()
@@ -89,52 +87,31 @@ class KamalTab(ttk.Frame):
         self._lbl_raw_yarn = ttk.Label(lotti_frame, text="No Magazino file selected", foreground="grey", anchor="w")
         self._lbl_raw_yarn.grid(row=1, column=1, sticky="ew", padx=4)
 
-        erp_frame = ttk.LabelFrame(self, text="Also Update Existing ERP File", padding=6)
+        erp_frame = ttk.LabelFrame(self, text="Also Extract ERP Files", padding=6)
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
             erp_frame,
-            text="After converting, write the Ordine Kamal rows into this existing file too — every row below the header is cleared first, then replaced",
+            text="After converting, extract \"EXCEL PER ORDINE VENDITA EGITTO\" and "
+                 "\"Filato x Tinturia\" into the folder below — each file is (re)written "
+                 "fresh, fully formatted, every Convert",
             variable=self._kamal_update_erp_file,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Button(
-            erp_frame, text="📄 Select ERP File…", command=self._on_select_erp_file, width=16
+            erp_frame, text="📁 Select ERP Files Folder…", command=self._on_select_erp_folder, width=22
         ).grid(row=1, column=0, padx=(0, 6), pady=(4, 0), sticky="w")
 
-        self._lbl_erp_file = ttk.Label(
-            erp_frame, text="No file selected", foreground="grey", anchor="w"
+        self._lbl_erp_dir = ttk.Label(
+            erp_frame, text="No folder selected", foreground="grey", anchor="w"
         )
-        self._lbl_erp_file.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        self._lbl_erp_dir.grid(row=1, column=1, sticky="ew", pady=(4, 0))
 
         self._kamal_update_erp_file.trace_add(
             "write",
             lambda *_: self._save_prefs(kamal_update_erp_file=self._kamal_update_erp_file.get()),
         )
-
-        self._kamal_transfer_filato.trace_add(
-            "write",
-            lambda *_: self._save_prefs(kamal_transfer_filato=self._kamal_transfer_filato.get()),
-        )
-
-        # Filato transfer controls: choose target file and optionally
-        # transfer automatically after conversion.
-        ttk.Checkbutton(
-            erp_frame,
-            text="After converting, also transfer Filato x Tinturia into this existing file",
-            variable=self._kamal_transfer_filato,
-        ).grid(row=2, column=0, columnspan=2, sticky="w")
-
-        # Single Transfer button: select the target; Convert performs the transfer.
-        self._lbl_filato_file = ttk.Label(
-            erp_frame, text="No file selected", foreground="grey", anchor="w"
-        )
-        self._lbl_filato_file.grid(row=3, column=1, sticky="ew", pady=(6, 0))
-
-        ttk.Button(
-            erp_frame, text="🔄 Transfer Filato x Tinturia…", command=self._on_transfer_filato_tinturia, width=24
-        ).grid(row=3, column=0, padx=(0, 6), pady=(6, 0), sticky="w")
 
         action_frame = ttk.Frame(self, padding=(6, 4))
         action_frame.grid(row=4, column=0, sticky="ew", padx=4, pady=2)
@@ -193,27 +170,15 @@ class KamalTab(ttk.Frame):
             self._lbl_output.config(text=str(self._output_path), foreground="black")
             self._save_prefs(kamal_output_path=str(self._output_path), kamal_last_dir=str(Path(path).parent))
 
-    def _on_select_erp_file(self):
-        path = filedialog.askopenfilename(
-            title="Select existing ERP import Excel file",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("kamal_last_dir") or None,
+    def _on_select_erp_folder(self):
+        path = filedialog.askdirectory(
+            title="Select the folder for the ERP export files",
+            initialdir=self._prefs.get("kamal_erp_export_dir") or self._prefs.get("kamal_last_dir") or None,
         )
         if path:
-            self._kamal_erp_file_path = Path(path)
-            self._lbl_erp_file.config(text=str(self._kamal_erp_file_path), foreground="black")
-            self._save_prefs(kamal_erp_file_path=str(self._kamal_erp_file_path), kamal_last_dir=str(Path(path).parent))
-
-    def _on_select_filato_file(self):
-        path = filedialog.askopenfilename(
-            title="Select the existing Filato x Tinturia target Excel file",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("kamal_last_dir") or None,
-        )
-        if path:
-            self._kamal_filato_file_path = Path(path)
-            self._lbl_filato_file.config(text=str(self._kamal_filato_file_path), foreground="black")
-            self._save_prefs(kamal_filato_file_path=str(self._kamal_filato_file_path), kamal_last_dir=str(Path(path).parent))
+            self._kamal_erp_export_dir = Path(path)
+            self._lbl_erp_dir.config(text=str(self._kamal_erp_export_dir), foreground="black")
+            self._save_prefs(kamal_erp_export_dir=str(self._kamal_erp_export_dir), kamal_last_dir=str(path))
 
     def _save_prefs(self, **kwargs: object) -> None:
         self._prefs.update(kwargs)
@@ -247,21 +212,10 @@ class KamalTab(ttk.Frame):
             self._output_path = Path(output_str)
             self._lbl_output.config(text=output_str, foreground="black")
 
-        erp_str = self._prefs.get("kamal_erp_file_path")
-        if erp_str and Path(erp_str).is_file():
-            self._kamal_erp_file_path = Path(erp_str)
-            self._lbl_erp_file.config(text=erp_str, foreground="black")
-        filato_str = self._prefs.get("kamal_filato_file_path")
-        if filato_str and Path(filato_str).is_file():
-            self._kamal_filato_file_path = Path(filato_str)
-            # create label if it doesn't exist yet
-            try:
-                self._lbl_filato_file.config(text=filato_str, foreground="black")
-            except Exception:
-                pass
-            self._kamal_transfer_filato.set(True)
-        if self._prefs.get("kamal_transfer_filato"):
-            self._kamal_transfer_filato.set(True)
+        erp_dir_str = self._prefs.get("kamal_erp_export_dir")
+        if erp_dir_str and Path(erp_dir_str).is_dir():
+            self._kamal_erp_export_dir = Path(erp_dir_str)
+            self._lbl_erp_dir.config(text=erp_dir_str, foreground="black")
 
     def sync_shared_dfm(self):
         """Reflect the DFM file uploaded on Data Elvy/Situazione, if any."""
@@ -302,28 +256,6 @@ class KamalTab(ttk.Frame):
         self._lotti_path = Path(source_path)
         self._lbl_lotti.config(text=str(self._lotti_path), foreground="black")
         self._save_prefs(kamal_lotti_path=str(self._lotti_path), kamal_last_dir=str(self._lotti_path.parent))
-
-    def _on_transfer_filato_tinturia(self) -> None:
-        target = filedialog.askopenfilename(
-            title="Select the target file for Filato x Tinturia",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("kamal_last_dir") or None,
-        )
-        if not target:
-            return
-
-        self._kamal_filato_file_path = Path(target)
-        self._kamal_transfer_filato.set(True)
-        self._lbl_filato_file.config(text=str(self._kamal_filato_file_path), foreground="black")
-        self._save_prefs(
-            kamal_filato_file_path=str(self._kamal_filato_file_path),
-            kamal_last_dir=str(self._kamal_filato_file_path.parent),
-        )
-
-        messagebox.showinfo(
-            "Target selected",
-            "The Filato x Tinturia sheet will be transferred to this file after Convert.",
-        )
 
     def _on_convert(self):
         if not self._pdf_paths:
@@ -415,9 +347,11 @@ class KamalTab(ttk.Frame):
                 errors.append(f"Error exporting: {exc}")
 
             if self._kamal_update_erp_file.get():
-                if self._kamal_erp_file_path is None:
-                    errors.append("ERP file update was enabled but no file is selected.")
+                if self._kamal_erp_export_dir is None:
+                    errors.append("ERP file extraction was enabled but no folder is selected.")
                 else:
+                    ordini_path = self._kamal_erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
+                    filato_path = self._kamal_erp_export_dir / "Filato x Tinturia.xlsx"
                     try:
                         ordini_rows = build_ordine_kamal_rows(all_rows, dfm_c170_entries)
                         assign_ordine_kamal_machines(ordini_rows)
@@ -425,22 +359,17 @@ class KamalTab(ttk.Frame):
                             match_by_lotto(ordini_rows, lotti_summary)
                         if magazino_summary is not None and not magazino_summary.empty:
                             match_raw_yarn(ordini_rows, magazino_summary, codes_map, quantity_attr="peso_kg")
-                        n = update_existing_ordini_file(self._kamal_erp_file_path, ordini_rows)
-                        logger.info("Ordine Kamal: updated ERP file %s (%d rows)", self._kamal_erp_file_path.name, n)
+                        n = export_ordini_full(ordini_path, ordini_rows)
+                        logger.info("Ordine Kamal: extracted ERP file %s (%d rows)", ordini_path.name, n)
                     except Exception as exc:  # noqa: BLE001
-                        errors.append(f"Error updating ERP file {self._kamal_erp_file_path.name}: {exc}")
+                        errors.append(f"Error extracting {ordini_path.name}: {exc}")
 
-            # Optionally transfer Filato x Tinturia into a saved target file
-            if self._kamal_transfer_filato.get():
-                if self._kamal_filato_file_path is None:
-                    errors.append("Filato transfer enabled but no target file selected.")
-                else:
                     try:
                         matches = read_filato_tinturia_sheet(self._output_path)
-                        n2 = update_existing_filato_file(self._kamal_filato_file_path, matches)
-                        logger.info("Filato x Tinturia: transferred %d row(s) to %s", n2, self._kamal_filato_file_path.name)
+                        n2 = export_filato_full(filato_path, matches)
+                        logger.info("Filato x Tinturia: extracted %s (%d rows)", filato_path.name, n2)
                     except Exception as exc:  # noqa: BLE001
-                        errors.append(f"Error transferring Filato x Tinturia to {self._kamal_filato_file_path.name}: {exc}")
+                        errors.append(f"Error extracting {filato_path.name}: {exc}")
 
         self.after(0, self._on_conversion_done, errors, len(all_rows))
 

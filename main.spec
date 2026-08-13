@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec file for Delta Dyeing PO Converter
+# PyInstaller spec file for Planing
 # Run via build.bat — do NOT run manually without activating the venv first.
 
 from PyInstaller.utils.hooks import collect_all
@@ -17,7 +17,7 @@ block_cipher = None
 datas = []
 binaries = []
 extra_hiddenimports = []
-for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy"):
+for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy", "matplotlib"):
     _datas, _binaries, _hidden = collect_all(_pkg)
     datas += _datas
     binaries += _binaries
@@ -100,12 +100,14 @@ a = Analysis(
         'collections',
         'charset_normalizer',
         'sqlite3',
+        'matplotlib',
+        'matplotlib.backends.backend_tkagg',
+        'matplotlib.backends.backend_agg',
     ] + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib',
         'scipy',
         'IPython',
         'notebook',
@@ -124,7 +126,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='DeltaDyeingConverter',
+    name='Planing',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -146,5 +148,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='DeltaDyeingConverter',
+    name='Planing',
 )

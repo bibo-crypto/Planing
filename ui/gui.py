@@ -36,10 +36,10 @@ from pdf_parser import PDFParser, OrderRow
 from excel_exporter import ExcelExporter
 from ordini_elvy import (
     build_ordini_elvy_rows,
+    export_filato_full,
+    export_ordini_full,
     match_raw_yarn,
     read_filato_tinturia_sheet,
-    update_existing_filato_file,
-    update_existing_ordini_file,
 )
 from bolla_parser import BollaParser, BollaRow, BollaTotals
 from bolla_exporter import BollaExporter
@@ -69,6 +69,7 @@ from situazione_tab import SituazioneTab
 from situazione_settimana_tab import SettimanaTab
 from magazino_filato_tab import MagazinoFilatoTab
 from kamal_tab import KamalTab
+from ui.tabs.overview_tab import OverviewTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -116,7 +117,7 @@ class ConverterApp(tk.Tk):
     Business logic is dispatched to background threads to keep the UI responsive.
     """
 
-    WINDOW_TITLE = "Delta Dyeing PDF to Excel Converter"
+    WINDOW_TITLE = "Planing"
     WINDOW_MIN_W = 1000
     WINDOW_MIN_H = 760
 
@@ -144,14 +145,13 @@ class ConverterApp(tk.Tk):
         self._po_folder_path: Path | None = None
         self._po_output_dir: Path | None = None
         self._po_last_export_path: Path | None = None
-        self._po_filato_file_path: Path | None = None
+        self._po_erp_export_dir: Path | None = None
         self._po_one_per_file = tk.BooleanVar(value=False)
         self._po_update_erp_file = tk.BooleanVar(value=False)
         self._po_update_erp_file.trace_add(
             "write",
             lambda *_a: self._save_prefs(po_update_erp_file=self._po_update_erp_file.get()),
         )
-        self._po_erp_file_path: Path | None = None
         self._po_raw_yarn_path: Path | None = None
 
         # ── Bolla tab state ────────────────────────────────────────────
@@ -313,6 +313,12 @@ class ConverterApp(tk.Tk):
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
+        # ── نظرة عامة (Overview): built last since it reads from the tabs
+        # above, but inserted first so it's the landing page.
+        self._overview_tab = OverviewTab(notebook, self._situazione_tab, self._magazino_tab)
+        notebook.insert(0, self._overview_tab, text="📊 Overview")
+        notebook.select(0)
+
         self._build_log_area()
 
         def _on_any_tab_changed(_event=None) -> None:
@@ -320,6 +326,11 @@ class ConverterApp(tk.Tk):
                 notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab, self._kamal_tab,
                 ordine_notebook, situazione_notebook,
             )
+            try:
+                if notebook.select() == str(self._overview_tab):
+                    self._overview_tab.on_shown()
+            except tk.TclError:
+                pass
 
         notebook.bind("<<NotebookTabChanged>>", _on_any_tab_changed)
         ordine_notebook.bind("<<NotebookTabChanged>>", _on_any_tab_changed)
@@ -419,43 +430,34 @@ class ConverterApp(tk.Tk):
         )
         self._po_lbl_raw_yarn.grid(row=0, column=1, sticky="ew", padx=4)
 
-        # ── Update existing ERP file (+ Filato x Tinturia transfer) ──
-        erp_frame = ttk.LabelFrame(parent, text="Also Update Existing ERP File", padding=6)
+        # ── Extract "EXCEL PER ORDINE VENDITA EGITTO" + "Filato x Tinturia" ──
+        erp_frame = ttk.LabelFrame(parent, text="Also Extract ERP Files", padding=6)
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
             erp_frame,
-            text="After converting, write the Ordine Elvy rows into this existing file "
-                 "too — every row below the header is cleared first, then replaced",
+            text="After converting, extract \"EXCEL PER ORDINE VENDITA EGITTO\" and "
+                 "\"Filato x Tinturia\" into the folder below — each file is (re)written "
+                 "fresh, fully formatted, every Convert",
             variable=self._po_update_erp_file,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Button(
-            erp_frame, text="📄 Select ERP File…", command=self._on_po_select_erp_file, width=16
+            erp_frame, text="📁 Select ERP Files Folder…", command=self._on_po_select_erp_folder, width=22
         ).grid(row=1, column=0, padx=(0, 6), pady=(3, 0), sticky="w")
 
-        self._po_lbl_erp_file = ttk.Label(
-            erp_frame, text="No file selected", foreground="grey", anchor="w"
+        self._po_lbl_erp_dir = ttk.Label(
+            erp_frame, text="No folder selected", foreground="grey", anchor="w"
         )
-        self._po_lbl_erp_file.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        self._po_lbl_erp_dir.grid(row=1, column=1, sticky="ew", pady=(4, 0))
 
         erp_warning = ttk.Label(
             erp_frame,
-            text="⚠ Close this file in Excel before converting, or saving will fail.",
+            text="⚠ Close these files in Excel before converting, or saving will fail.",
             foreground="#8a6d00", anchor="w",
         )
         erp_warning.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
-
-        ttk.Button(
-            erp_frame, text="🔄 Transfer Filato x Tinturia…",
-            command=self._on_transfer_filato_tinturia, width=24,
-        ).grid(row=3, column=0, padx=(0, 6), pady=(6, 0), sticky="w")
-
-        self._po_lbl_filato_file = ttk.Label(
-            erp_frame, text="No Filato x Tinturia target selected", foreground="grey", anchor="w"
-        )
-        self._po_lbl_filato_file.grid(row=3, column=1, sticky="ew", pady=(6, 0))
 
         # ── Options + Convert ────────────────────────────────────────
         opt_frame = ttk.Frame(parent, padding=(6, 3))
@@ -860,6 +862,7 @@ class ConverterApp(tk.Tk):
         top_text = notebook.tab(selected_top, "text")
         data_elvy_selected = top_text == "Data Elvy"
         magazino_selected = selected_top == str(magazino_tab)
+        overview_selected = selected_top == str(self._overview_tab)
 
         situazione_selected = settimana_selected = False
         kamal_selected = ordini_selected = False
@@ -875,7 +878,7 @@ class ConverterApp(tk.Tk):
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
         self._refresh_dfm_status()
-        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected:
+        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected or overview_selected:
             self._log_frame.grid_remove()
             self.rowconfigure(1, weight=0)
             self.rowconfigure(0, weight=5)
@@ -956,15 +959,10 @@ class ConverterApp(tk.Tk):
         if last_export_str and Path(last_export_str).is_file():
             self._po_last_export_path = Path(last_export_str)
 
-        filato_target_str = self._prefs.get("po_filato_file_path")
-        if filato_target_str and Path(filato_target_str).is_file():
-            self._po_filato_file_path = Path(filato_target_str)
-            self._po_lbl_filato_file.config(text=filato_target_str, foreground="black")
-
-        erp_str = self._prefs.get("po_erp_file_path")
-        if erp_str and Path(erp_str).is_file():
-            self._po_erp_file_path = Path(erp_str)
-            self._po_lbl_erp_file.config(text=erp_str, foreground="black")
+        erp_dir_str = self._prefs.get("po_erp_export_dir")
+        if erp_dir_str and Path(erp_dir_str).is_dir():
+            self._po_erp_export_dir = Path(erp_dir_str)
+            self._po_lbl_erp_dir.config(text=erp_dir_str, foreground="black")
         if self._prefs.get("po_update_erp_file"):
             self._po_update_erp_file.set(True)
 
@@ -1009,16 +1007,15 @@ class ConverterApp(tk.Tk):
             self._po_lbl_output_path.config(text=str(self._po_output_dir), foreground="black")
             self._save_prefs(po_output_dir=str(self._po_output_dir))
 
-    def _on_po_select_erp_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select the existing ERP import Excel file",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("po_erp_file_path") or None,
+    def _on_po_select_erp_folder(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select the folder for the ERP export files",
+            initialdir=self._prefs.get("po_erp_export_dir") or None,
         )
         if path:
-            self._po_erp_file_path = Path(path)
-            self._po_lbl_erp_file.config(text=str(self._po_erp_file_path), foreground="black")
-            self._save_prefs(po_erp_file_path=str(self._po_erp_file_path))
+            self._po_erp_export_dir = Path(path)
+            self._po_lbl_erp_dir.config(text=str(self._po_erp_export_dir), foreground="black")
+            self._save_prefs(po_erp_export_dir=str(self._po_erp_export_dir))
 
     def _on_po_select_raw_yarn(self) -> None:
         path = filedialog.askopenfilename(
@@ -1031,25 +1028,6 @@ class ConverterApp(tk.Tk):
             save_magazino_cache(self._po_raw_yarn_path)
             self._save_prefs(po_raw_yarn_path=str(self._po_raw_yarn_path))
             self._on_shared_cache_changed()
-
-    def _on_transfer_filato_tinturia(self) -> None:
-        target = filedialog.askopenfilename(
-            title="Select the target file for Filato x Tinturia",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-            initialdir=self._prefs.get("po_last_dir") or None,
-        )
-        if not target:
-            return
-        self._po_filato_file_path = Path(target)
-        self._po_lbl_filato_file.config(text=str(self._po_filato_file_path), foreground="black")
-        self._save_prefs(
-            po_filato_file_path=str(self._po_filato_file_path),
-            po_last_dir=str(self._po_filato_file_path.parent),
-        )
-        messagebox.showinfo(
-            "Target selected",
-            "The Filato x Tinturia sheet will be transferred to this file after Convert.",
-        )
 
     # ------------------------------------------------------------------
     # Purchase Orders — convert callback
@@ -1088,9 +1066,8 @@ class ConverterApp(tk.Tk):
                 self._po_output_dir,
                 self._po_one_per_file.get(),
                 self._po_update_erp_file.get(),
-                self._po_erp_file_path,
+                self._po_erp_export_dir,
                 self._po_raw_yarn_path,
-                self._po_filato_file_path,
             ),
             daemon=True,
         )
@@ -1106,9 +1083,8 @@ class ConverterApp(tk.Tk):
         output_dir: Path,
         one_per_file: bool,
         update_erp_file: bool,
-        erp_file_path: Path | None,
+        erp_export_dir: Path | None,
         raw_yarn_path: Path | None = None,
-        filato_target_path: Path | None = None,
     ) -> None:
         """
         Run in a background thread.
@@ -1196,34 +1172,36 @@ class ConverterApp(tk.Tk):
                 logger.error(msg)
                 errors.append(msg)
 
-        if filato_target_path is not None and last_export_path is not None:
-            try:
-                matches = read_filato_tinturia_sheet(last_export_path)
-                n = update_existing_filato_file(filato_target_path, matches)
-                logger.info("Filato x Tinturia: transferred %d row(s) to %s", n, filato_target_path.name)
-            except Exception as exc:  # noqa: BLE001
-                msg = f"Error transferring Filato x Tinturia to {filato_target_path.name}: {exc}"
-                logger.error(msg)
-                errors.append(msg)
-
-        # Also push every row processed in this run into the existing ERP
-        # file, if configured — this clears its old data rows first.
+        # Extract both ERP files fresh into the saved folder, if configured
+        # -- each file is fully rebuilt (not edited in place) every Convert.
         if update_erp_file and all_rows:
-            if erp_file_path is None:
-                msg = "ERP file update was enabled but no file is selected."
+            if erp_export_dir is None:
+                msg = "ERP file extraction was enabled but no folder is selected."
                 logger.error(msg)
                 errors.append(msg)
             else:
+                ordini_path = erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
+                filato_path = erp_export_dir / "Filato x Tinturia.xlsx"
                 try:
                     ordini_rows = build_ordini_elvy_rows(all_rows)
                     if magazino_summary is not None and not magazino_summary.empty:
                         match_raw_yarn(ordini_rows, magazino_summary, codes_map)
-                    n = update_existing_ordini_file(erp_file_path, ordini_rows)
-                    logger.info("Updated ERP file: %s (%d rows)", erp_file_path.name, n)
+                    n = export_ordini_full(ordini_path, ordini_rows)
+                    logger.info("Extracted ERP file: %s (%d rows)", ordini_path.name, n)
                 except Exception as exc:  # noqa: BLE001
-                    msg = f"Error updating ERP file {erp_file_path.name}: {exc}"
+                    msg = f"Error extracting {ordini_path.name}: {exc}"
                     logger.error(msg)
                     errors.append(msg)
+
+                if last_export_path is not None:
+                    try:
+                        matches = read_filato_tinturia_sheet(last_export_path)
+                        n2 = export_filato_full(filato_path, matches)
+                        logger.info("Extracted Filato x Tinturia file: %s (%d rows)", filato_path.name, n2)
+                    except Exception as exc:  # noqa: BLE001
+                        msg = f"Error extracting {filato_path.name}: {exc}"
+                        logger.error(msg)
+                        errors.append(msg)
 
         self._po_last_export_path = last_export_path
         self.after(0, self._on_po_conversion_done, errors, total)

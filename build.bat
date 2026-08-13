@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 echo.
 echo  ================================================
-echo    Delta Dyeing PO Converter  ^|  Build Script
+echo    Planing  ^|  Build Script
 echo  ================================================
 echo.
 
@@ -85,7 +85,7 @@ if errorlevel 1 (
 echo.
 echo  ================================================
 echo    Build Complete!
-echo    Output folder: dist\DeltaDyeingConverter\
+echo    Output folder: dist\Planing\
 echo  ================================================
 echo.
 echo  Next step - create the installer:

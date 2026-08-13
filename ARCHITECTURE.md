@@ -1,4 +1,4 @@
-# Delta Dyeing Converter – Project Structure
+# Planing (Delta Dyeing Converter) – Project Structure
 
 The project is organized by responsibility. The small root-level facade files
 are intentionally kept for backward compatibility with older imports and the
