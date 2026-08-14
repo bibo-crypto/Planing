@@ -42,7 +42,9 @@ class MagazinoFilatoTab(ttk.Frame):
         self._syncing = False
         self._uploading = False
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._data_revision = 0
         self._search_var = tk.StringVar()
+        self.total_available_var = tk.StringVar(value="Totale disponibile: 0 rocche | 0 kg")
         self._sort_column = ""
         self._sort_reverse = False
 
@@ -122,6 +124,8 @@ class MagazinoFilatoTab(ttk.Frame):
                     f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {Path(source_path)}"
                 )
                 self._recompute()
+                if self._on_shared_cache_changed:
+                    self._on_shared_cache_changed()
 
             self.after(0, apply_result)
 
@@ -157,6 +161,11 @@ class MagazinoFilatoTab(ttk.Frame):
         ttk.Button(row3, text="Export Excel", command=self._on_export).pack(side="right")
 
     def _build_treeview(self):
+        summary_bar = ttk.Frame(self)
+        summary_bar.pack(side="top", fill="x", padx=8, pady=(2, 0))
+        ttk.Label(summary_bar, textvariable=self.total_available_var,
+                  foreground="#16324f", font=("Segoe UI", 11, "bold")).pack(side="left")
+
         frame = ttk.Frame(self)
         frame.pack(side="top", fill="both", expand=True, padx=8, pady=6)
 
@@ -186,7 +195,7 @@ class MagazinoFilatoTab(ttk.Frame):
 
         def worker():
             try:
-                df, errors = logic.load_magazino(path)
+                df, errors = logic.load_magazino(path, articolo_prefix=None)
             except Exception as exc:  # noqa: BLE001
                 errors = [f"An error occurred while reading the file: {exc}"]
                 df = None
@@ -206,6 +215,7 @@ class MagazinoFilatoTab(ttk.Frame):
                     self.magazino_summary = df
                 else:
                     self.magazino_summary = logic.summarize_by_partita(df)
+                self._data_revision += 1
                 self._base_df = self.magazino_summary.copy()
                 self._shared_path = str(path)
                 save_magazino_cache(path, self.magazino_summary)
@@ -259,7 +269,7 @@ class MagazinoFilatoTab(ttk.Frame):
 
         def worker():
             try:
-                df, errors = logic.load_magazino(source_path)
+                df, errors = logic.load_magazino(source_path, articolo_prefix=None)
             except Exception as exc:  # noqa: BLE001
                 df, errors = None, [str(exc)]
 
@@ -268,11 +278,14 @@ class MagazinoFilatoTab(ttk.Frame):
                 if errors or df is None or df.empty:
                     return
                 self.magazino_summary = logic.summarize_by_partita(df)
+                self._data_revision += 1
                 self._base_df = self.magazino_summary.copy()
                 self._shared_path = source_path
                 save_magazino_cache(source_path, self.magazino_summary)
                 self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {source_path}")
                 self._recompute()
+                if self._on_shared_cache_changed:
+                    self._on_shared_cache_changed()
 
             self.after(0, apply_result)
 
@@ -291,7 +304,18 @@ class MagazinoFilatoTab(ttk.Frame):
         return df
 
     def _recompute(self):
+        self._update_total_available()
         self._apply_search_and_sort()
+
+    def _update_total_available(self):
+        if self.magazino_summary.empty:
+            self.total_available_var.set("Totale disponibile: 0 rocche | 0 kg")
+            return
+        rocche_values = self.magazino_summary["mag_rocche"] if "mag_rocche" in self.magazino_summary else pd.Series(dtype=float)
+        peso_values = self.magazino_summary["mag_peso"] if "mag_peso" in self.magazino_summary else pd.Series(dtype=float)
+        rocche = pd.to_numeric(rocche_values, errors="coerce").fillna(0).sum()
+        peso = pd.to_numeric(peso_values, errors="coerce").fillna(0).sum()
+        self.total_available_var.set(f"Totale disponibile: {rocche:,.0f} rocche | {peso:,.0f} kg")
 
     def _render(self):
         self.tree.delete(*self.tree.get_children())

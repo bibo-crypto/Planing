@@ -17,6 +17,9 @@ sheet (379 rows, 100% match) before being wired in here.
 """
 import pandas as pd
 from datetime import datetime
+import re
+
+from utils import clean_text
 
 READY_CODES = {"AA", "AC", "AU", "AT"}
 
@@ -220,4 +223,126 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     # "nan" behind -- blank those out too.
     result = result.astype(str).apply(lambda s: s.str.strip())
     result = result.replace(r"(?i)^nan$", "", regex=True)
+    return result
+
+
+# ----------------------------------------------------------------------
+# Raw yarn auto-match for "PG-X" rows (works for every client, not just
+# whichever one was checked by hand before) -- so a shortage row that
+# actually already has raw yarn sitting in Magazino Filato doesn't get
+# missed just because nobody thought to look it up.
+# ----------------------------------------------------------------------
+_LOTTO_IN_COMMENT_RE = re.compile(r"PG-X\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
+
+
+def _finished_articolo_to_raw(articolo) -> str | None:
+    """C1701234 -> G1701234, same C->G rule used by ordini_elvy.match_raw_yarn()."""
+    a = clean_text(articolo).upper()
+    if a.startswith("C") and len(a) > 1:
+        return "G" + a[1:]
+    return None
+
+
+def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
+                              lotti_summary: pd.DataFrame | None = None) -> pd.Series:
+    """
+    For every row whose Comment marks a yarn shortage ("PG-X..."), check
+    whether Magazino Filato already has raw yarn for it. Returns a Series
+    aligned to df.index: "Articolo / Partita" where a batch was found and
+    has enough quantity, "" otherwise. Works across every client in df --
+    the raw-yarn Articolo comes from each row's own Articolo (C -> G), not
+    from a hardcoded client name.
+
+    Priority, per the two ways "PG-X" shows up:
+      1. "PG-X(807346)" -- the number in parens is a Lotto (Kamal's own
+         raw-yarn message number). Look it up directly in the LOTTI
+         reference (lotti_summary, merged with magazino_summary on
+         Partita) for one exact, deterministic batch.
+      2. Plain "PG-X" -- fall back to grouping every row needing the same
+         raw-yarn Articolo and checking whether one batch's available
+         Mag.rocche covers the GROUP's total Rocche, not just this single
+         row's, since several colours often draw from the same batch.
+
+    Either way, a batch's available quantity is decremented as rows get
+    matched to it, so two different colours/groups can't both claim the
+    same physical yarn.
+    """
+    result = pd.Series([""] * len(df), index=df.index, dtype=object)
+    if df.empty or "comment" not in df.columns:
+        return result
+
+    comment = df["comment"].fillna("").astype(str)
+    is_shortage = comment.str.upper().str.startswith("PG-X")
+    if not is_shortage.any():
+        return result
+
+    magazino_summary = magazino_summary if isinstance(magazino_summary, pd.DataFrame) else pd.DataFrame()
+    lotti_summary = lotti_summary if isinstance(lotti_summary, pd.DataFrame) else pd.DataFrame()
+    if magazino_summary.empty:
+        return result
+
+    remaining: dict[tuple[str, str], float] = {
+        (str(r["articolo"]), str(r["partita"])): float(r["mag_rocche"])
+        for _, r in magazino_summary.iterrows()
+    }
+
+    lotto_to_batch: dict[str, tuple[str, str]] = {}
+    if not lotti_summary.empty and "lotto" in lotti_summary.columns:
+        merged = magazino_summary.merge(lotti_summary, on="partita", how="inner")
+        for _, r in merged.iterrows():
+            lotto_key = clean_text(r["lotto"])
+            if lotto_key:
+                lotto_to_batch[lotto_key] = (str(r["articolo"]), str(r["partita"]))
+
+    rocche = pd.to_numeric(df.get("rocche", 0), errors="coerce").fillna(0.0)
+    handled: set = set()
+
+    # 1) explicit Lotto in the comment -- deterministic, one Partita
+    lot_rows: dict[str, list] = {}
+    for idx in df.index[is_shortage]:
+        m = _LOTTO_IN_COMMENT_RE.search(comment.loc[idx])
+        if m:
+            lot_rows.setdefault(clean_text(m.group(1)), []).append(idx)
+
+    for lotto, idxs in lot_rows.items():
+        batch_key = lotto_to_batch.get(lotto)
+        if batch_key is None:
+            continue
+        needed = sum(rocche.loc[i] for i in idxs)
+        if remaining.get(batch_key, 0.0) >= needed:
+            remaining[batch_key] -= needed
+            for i in idxs:
+                result.loc[i] = f"{batch_key[0]} / {batch_key[1]}"
+                handled.add(i)
+
+    # 2) bare "PG-X" -- group by raw-yarn Articolo, cover the group's total
+    if "articolo" in df.columns:
+        groups: dict[str, list] = {}
+        for idx in df.index[is_shortage]:
+            if idx in handled:
+                continue
+            raw = _finished_articolo_to_raw(df.at[idx, "articolo"])
+            if raw:
+                groups.setdefault(raw, []).append(idx)
+
+        for raw_articolo, idxs in groups.items():
+            needed = sum(rocche.loc[i] for i in idxs)
+            batches = [(k, v) for k, v in remaining.items() if k[0] == raw_articolo and v > 0]
+            covering = next((b for b in sorted(batches, key=lambda kv: kv[1]) if b[1] >= needed), None)
+            if covering is not None:
+                remaining[covering[0]] -= needed
+                for i in idxs:
+                    result.loc[i] = f"{covering[0][0]} / {covering[0][1]}"
+                continue
+            # can't cover the whole group in one batch -> cover row by row
+            # with the smallest batch that fits each one individually
+            for i in idxs:
+                need_i = rocche.loc[i]
+                batches = [(k, v) for k, v in remaining.items() if k[0] == raw_articolo and v > 0]
+                fit = next((b for b in sorted(batches, key=lambda kv: kv[1]) if b[1] >= need_i), None)
+                if fit is None:
+                    continue
+                remaining[fit[0]] -= need_i
+                result.loc[i] = f"{fit[0][0]} / {fit[0][1]}"
+
     return result

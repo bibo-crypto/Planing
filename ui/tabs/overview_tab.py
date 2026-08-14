@@ -41,16 +41,27 @@ import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-try:
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    _HAS_MPL = True
-except ImportError:  # pragma: no cover - matplotlib not installed yet
-    _HAS_MPL = False
-
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
 READY_MARK = "pronto da spedire"
 SHORTAGE_MARK = "PG-X"
+HEADERS_IT = {
+    "cliente": "Cliente", "colore": "Colore", "titolo": "Titolo",
+    "articolo": "Articolo", "codice": "Codice", "ordine": "Ordine",
+    "riga": "Riga", "data": "Data", "consegna": "Consegna",
+    "partita": "Partita", "rocche": "Rocche", "mc": "M/C",
+    "comment": "Commento", "raw_yarn_match": "Filato Disponibile",
+    "cq": "C.Q", "tinto": "Tinto", "bagno": "Bagno",
+    "old_comment": "Vecchio commento", "new_comment": "Nuovo commento",
+    "planedate": "PlaneDate", "data_qualita": "Data Qualità",
+    "data_uscita": "Data Uscita", "custom": "Controllo",
+    "days_in_qc": "Giorni in C.Q",
+}
+CHECK_COLUMNS = [
+    "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
+    "data", "consegna", "partita", "rocche", "mc", "comment", "raw_yarn_match",
+    "cq", "tinto", "bagno", "old_comment", "new_comment", "planedate",
+    "data_qualita", "data_uscita", "custom", "days_in_qc",
+]
 
 
 # ----------------------------------------------------------------------
@@ -68,12 +79,12 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
     """Export a Treeview's currently displayed rows/columns to a new .xlsx file."""
     df = treeview_to_dataframe(tree)
     if df.empty:
-        messagebox.showinfo("No data", "There's nothing to export.", parent=parent)
+        messagebox.showinfo("Nessun dato", "Non ci sono dati da esportare.", parent=parent)
         return
     path = filedialog.asksaveasfilename(
-        title="Export to Excel",
+        title="Esporta in Excel",
         defaultextension=".xlsx",
-        filetypes=[("Excel files", "*.xlsx")],
+        filetypes=[("File Excel", "*.xlsx")],
         initialfile=default_filename,
     )
     if not path:
@@ -91,16 +102,16 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
         wb.save(path)
         wb.close()
     except Exception as exc:  # noqa: BLE001
-        messagebox.showerror("Export failed", str(exc), parent=parent)
+        messagebox.showerror("Esportazione non riuscita", str(exc), parent=parent)
         return
-    messagebox.showinfo("Done", f"Exported to:\n{path}", parent=parent)
+    messagebox.showinfo("Completato", f"Esportato in:\n{path}", parent=parent)
 
 
 def attach_excel_export(tree: ttk.Treeview, default_filename: str) -> None:
     """Right-click on any row of *tree* -> "Export to Excel"."""
     menu = tk.Menu(tree, tearoff=0)
     menu.add_command(
-        label="📤 Export to Excel",
+        label="📤 Esporta in Excel",
         command=lambda: export_treeview_to_excel(tree, default_filename, parent=tree),
     )
 
@@ -116,20 +127,34 @@ def attach_excel_export(tree: ttk.Treeview, default_filename: str) -> None:
 class OverviewTab(ttk.Frame):
     """Dashboard: KPI cards + charts + detail lists, all read-only."""
 
+    AUTO_REFRESH_MS = 5000
+
     def __init__(self, master, situazione_tab, magazino_tab):
         super().__init__(master)
         self.situazione_tab = situazione_tab
         self.magazino_tab = magazino_tab
+        self._data_signature = None
+        self._auto_refresh_id = None
         self._build_ui()
-        self.refresh()
+        self.refresh(force=True)
+        self._schedule_auto_refresh()
 
     # ------------------------------------------------------------------
     # UI scaffolding
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
+        style = ttk.Style(self)
+        style.configure("Overview.Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#667085",
+                        font=("Segoe UI", 9))
+        style.configure("Overview.CardValue.TLabel", background="#ffffff", foreground="#16324f",
+                        font=("Segoe UI", 19, "bold"))
+
         toolbar = ttk.Frame(self)
         toolbar.pack(side="top", fill="x", padx=8, pady=(8, 4))
         ttk.Button(toolbar, text="🔄 Refresh", command=self.refresh).pack(side="left")
+        ttk.Label(toolbar, text="Riepilogo operativo", foreground="#16324f",
+                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=(14, 0))
         self._lbl_updated = ttk.Label(toolbar, text="", foreground="#667085")
         self._lbl_updated.pack(side="right")
 
@@ -162,38 +187,65 @@ class OverviewTab(ttk.Frame):
         self._cards_frame = ttk.Frame(self._body)
         self._cards_frame.pack(side="top", fill="x", padx=8, pady=(4, 10))
 
-        self._charts_frame = ttk.Frame(self._body)
-        self._charts_frame.pack(side="top", fill="x", padx=8, pady=(0, 10))
-
         self._tables_frame = ttk.Frame(self._body)
         self._tables_frame.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 10))
+        self._table_count = 0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def on_shown(self) -> None:
         """Call this when the tab becomes visible — keeps it auto-fresh."""
-        self.refresh()
+        self._schedule_auto_refresh()
+        if self._data_signature != self._current_data_signature():
+            self.refresh()
 
-    def refresh(self) -> None:
+    def _schedule_auto_refresh(self) -> None:
+        if self._auto_refresh_id is None and self.winfo_exists():
+            self._auto_refresh_id = self.after(self.AUTO_REFRESH_MS, self._auto_refresh_tick)
+
+    def _auto_refresh_tick(self) -> None:
+        self._auto_refresh_id = None
+        if not self.winfo_exists():
+            return
+        # Do not touch the Treeviews while the user is on another page.
+        if self.winfo_ismapped() and self._data_signature != self._current_data_signature():
+            self.refresh()
+        self._schedule_auto_refresh()
+
+    def _current_data_signature(self):
+        """Return cheap revision counters maintained by the source tabs."""
+        return (
+            getattr(self.situazione_tab, "_data_revision", 0),
+            getattr(self.magazino_tab, "_data_revision", 0),
+        )
+
+    def refresh(self, force: bool = False) -> None:
+        signature = self._current_data_signature()
+        if not force and self._data_signature == signature:
+            return
         df = getattr(self.situazione_tab, "current_df", None)
         magazino = getattr(self.magazino_tab, "magazino_summary", None)
         df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
         magazino = magazino.copy() if isinstance(magazino, pd.DataFrame) else pd.DataFrame()
         self._render(df, magazino)
-        self._lbl_updated.config(text=f"Last updated: {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
+        self._data_signature = signature
+        self._lbl_updated.config(text=f"Ultimo aggiornamento: {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
     def _render(self, df: pd.DataFrame, magazino: pd.DataFrame) -> None:
-        for frame in (self._cards_frame, self._charts_frame, self._tables_frame):
+        for frame in (self._cards_frame, self._tables_frame):
             for widget in frame.winfo_children():
                 widget.destroy()
+        self._has_rendered = True
+        self._table_count = 0
 
         if not df.empty:
-            for col in ("cliente", "colore", "titolo", "comment", "new_comment"):
-                df[col] = df.get(col, "").fillna("").astype(str).str.strip()
+            for col in ("cliente", "colore", "titolo", "comment", "new_comment", "custom"):
+                values = df[col] if col in df.columns else pd.Series("", index=df.index)
+                df[col] = values.fillna("").astype(str).str.strip()
 
         shortage_df = (
             df[df["comment"].str.upper().str.startswith(SHORTAGE_MARK)]
@@ -203,6 +255,10 @@ class OverviewTab(ttk.Frame):
             df[df["new_comment"].str.lower().str.contains(READY_MARK)]
             if not df.empty else df
         )
+        check_df = (
+            df[df["custom"].str.casefold().eq("check")]
+            if not df.empty else df
+        )
 
         n_shortage_colors = shortage_df["colore"].nunique() if not shortage_df.empty else 0
         n_ready_colors = ready_df["colore"].nunique() if not ready_df.empty else 0
@@ -210,119 +266,83 @@ class OverviewTab(ttk.Frame):
             magazino["mag_peso"].sum() if not magazino.empty and "mag_peso" in magazino else 0.0
         )
 
-        self._add_card(0, "🧵 Raw yarn in warehouse", f"{total_yarn_kg:,.0f} kg")
-        self._add_card(1, "📦 Colors ready to ship, no exit invoice", str(n_ready_colors))
-        self._add_card(2, "⚠️ Colors needing yarn", str(n_shortage_colors))
-
-        if _HAS_MPL:
-            self._draw_yarn_by_client_chart(magazino)
-            self._draw_grouped_chart(ready_df, "Ready-to-ship colors per client")
-            self._draw_grouped_chart(shortage_df, "Colors needing yarn per client")
-        else:
-            ttk.Label(
-                self._charts_frame,
-                text="To enable charts: pip install -r requirements.txt (matplotlib)",
-                foreground="#b42318",
-            ).pack(pady=10)
+        self._add_card(0, "📋 Totale partite", f"{len(df):,}")
+        self._add_card(1, "🧵 Filato disponibile", f"{total_yarn_kg:,.0f} kg")
+        self._add_card(2, "📦 Pronte da spedire", str(n_ready_colors))
+        self._add_card(3, "⚠️ In attesa di filato", str(n_shortage_colors))
 
         self._add_table(
-            "Colors ready to ship (no exit invoice yet)",
+            "Colori pronti da spedire (senza uscita)",
             ready_df, ["cliente", "colore", "titolo", "partita", "rocche"],
-            "ready_to_ship.xlsx",
+            "colori_pronti.xlsx",
         )
         self._add_table(
-            "Colors needing yarn",
+            "Colori in attesa di filato",
             shortage_df, ["cliente", "colore", "titolo", "rocche"],
-            "yarn_needed.xlsx",
+            "colori_filato_mancante.xlsx",
         )
-        self._add_yarn_table(magazino)
+        self._add_table(
+            "Colori da controllare (Custom = Check)",
+            check_df, CHECK_COLUMNS,
+            "colori_check.xlsx",
+        )
 
     def _add_card(self, col: int, title: str, value: str) -> None:
         self._cards_frame.columnconfigure(col, weight=1)
-        card = ttk.Frame(self._cards_frame, relief="solid", borderwidth=1, padding=12)
+        card = ttk.Frame(self._cards_frame, style="Overview.Card.TFrame", padding=12)
         card.grid(row=0, column=col, padx=6, sticky="nsew")
-        ttk.Label(card, text=title, foreground="#667085", wraplength=200).pack(anchor="w")
-        ttk.Label(card, text=value, font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(4, 0))
-
-    def _bar_chart(self, title: str, series: pd.Series) -> None:
-        fig = Figure(figsize=(4.0, 2.8), dpi=90)
-        ax = fig.add_subplot(111)
-        if series.empty:
-            ax.text(0.5, 0.5, "No data", ha="center", va="center")
-            ax.set_xticks([])
-            ax.set_yticks([])
-        else:
-            series.plot(kind="bar", ax=ax, color="#1976D2")
-            ax.tick_params(axis="x", rotation=0)
-        ax.set_title(title, fontsize=10)
-        fig.tight_layout()
-        canvas = FigureCanvasTkAgg(fig, master=self._charts_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(side="left", padx=8, pady=4)
-
-    def _draw_yarn_by_client_chart(self, magazino: pd.DataFrame) -> None:
-        if magazino.empty or "articolo" not in magazino or "mag_peso" not in magazino:
-            series = pd.Series(dtype=float)
-        else:
-            m = magazino.copy()
-            m["client"] = (
-                m["articolo"].astype(str).str[:4].map(ARTICOLO_CLIENT_LABELS)
-                .fillna(m["articolo"])
-            )
-            series = m.groupby("client")["mag_peso"].sum()
-        self._bar_chart("Raw yarn per client (kg)", series)
-
-    def _draw_grouped_chart(self, source_df: pd.DataFrame, title: str) -> None:
-        if source_df.empty or "cliente" not in source_df or "colore" not in source_df:
-            series = pd.Series(dtype=float)
-        else:
-            series = source_df.groupby("cliente")["colore"].nunique()
-        self._bar_chart(title, series)
+        ttk.Label(card, text=title, style="Overview.CardTitle.TLabel", wraplength=200).pack(anchor="w")
+        ttk.Label(card, text=value, style="Overview.CardValue.TLabel").pack(anchor="w", pady=(4, 0))
 
     def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str) -> None:
         frame = ttk.LabelFrame(self._tables_frame, text=title, padding=6)
-        frame.pack(side="top", fill="both", expand=True, pady=6)
+        col = self._table_count % 2
+        row = self._table_count // 2
+        self._tables_frame.columnconfigure(col, weight=1)
+        frame.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+        self._table_count += 1
 
         header = ttk.Frame(frame)
         header.pack(side="top", fill="x", pady=(0, 4))
 
         available_cols = [c for c in cols if df.empty or c in df.columns] or cols
-        tree = ttk.Treeview(frame, columns=available_cols, show="headings", height=6)
+        search_var = tk.StringVar()
+        ttk.Label(header, text="Cerca:").pack(side="left", padx=(2, 5))
+        search_entry = ttk.Entry(header, textvariable=search_var, width=28)
+        search_entry.pack(side="left", padx=(0, 8))
+
+        table_area = ttk.Frame(frame)
+        table_area.pack(fill="both", expand=True)
+        tree = ttk.Treeview(table_area, columns=available_cols, show="headings", height=7)
         for c in available_cols:
-            tree.heading(c, text=c.capitalize())
+            tree.heading(c, text=HEADERS_IT.get(c, c.capitalize()))
             tree.column(c, width=120, anchor="center")
-        tree.pack(fill="both", expand=True)
-        if not df.empty:
-            for _, row in df.iterrows():
+        vsb = ttk.Scrollbar(table_area, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(table_area, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        table_area.rowconfigure(0, weight=1)
+        table_area.columnconfigure(0, weight=1)
+
+        def render_filtered_rows(*_args):
+            tree.delete(*tree.get_children())
+            visible = df
+            query = search_var.get().strip()
+            if query and not df.empty:
+                mask = df[available_cols].astype(str).apply(
+                    lambda column: column.str.contains(query, case=False, regex=False, na=False)
+                ).any(axis=1)
+                visible = df.loc[mask]
+            for _, row in visible.iterrows():
                 tree.insert("", "end", values=[row.get(c, "") for c in available_cols])
 
+        search_var.trace_add("write", render_filtered_rows)
+        render_filtered_rows()
+
         ttk.Button(
-            header, text="📤 Export to Excel",
+            header, text="📤 Esporta in Excel",
             command=lambda: export_treeview_to_excel(tree, export_filename, parent=self),
         ).pack(side="right")
         attach_excel_export(tree, export_filename)
-
-    def _add_yarn_table(self, magazino: pd.DataFrame) -> None:
-        frame = ttk.LabelFrame(self._tables_frame, text="Raw yarn in warehouse, per client/partita", padding=6)
-        frame.pack(side="top", fill="both", expand=True, pady=6)
-
-        header = ttk.Frame(frame)
-        header.pack(side="top", fill="x", pady=(0, 4))
-
-        cols = ["client", "articolo", "partita", "mag_rocche", "mag_peso"]
-        tree = ttk.Treeview(frame, columns=cols, show="headings", height=6)
-        for c in cols:
-            tree.heading(c, text=c.capitalize())
-            tree.column(c, width=120, anchor="center")
-        tree.pack(fill="both", expand=True)
-        if not magazino.empty:
-            m = magazino.copy()
-            m["client"] = m["articolo"].astype(str).str[:4].map(ARTICOLO_CLIENT_LABELS).fillna(m["articolo"])
-            for _, row in m.iterrows():
-                tree.insert("", "end", values=[row.get(c, "") for c in cols])
-
-        ttk.Button(
-            header, text="📤 Export to Excel",
-            command=lambda: export_treeview_to_excel(tree, "raw_yarn_by_client.xlsx", parent=self),
-        ).pack(side="right")
-        attach_excel_export(tree, "raw_yarn_by_client.xlsx")

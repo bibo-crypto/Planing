@@ -41,7 +41,6 @@ CompressionThreads=auto
 
 ; Appearance
 WizardStyle=modern
-WizardResizable=no
 DisableProgramGroupPage=yes
 
 ; Privileges — installs per-user (no admin required)

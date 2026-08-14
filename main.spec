@@ -17,7 +17,7 @@ block_cipher = None
 datas = []
 binaries = []
 extra_hiddenimports = []
-for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy", "matplotlib"):
+for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy"):
     _datas, _binaries, _hidden = collect_all(_pkg)
     datas += _datas
     binaries += _binaries
@@ -86,6 +86,16 @@ a = Analysis(
         'openpyxl.worksheet',
         'openpyxl.worksheet.worksheet',
         'et_xmlfile',
+        # pandas C-extension modules are imported dynamically by pandas on
+        # some Python/Windows combinations and need explicit registration in
+        # the frozen application.
+        'pandas._libs.pandas_parser',
+        'pandas._libs.pandas_datetime',
+        'pandas._libs.tslibs.base',
+        'pandas._libs.tslibs.np_datetime',
+        'pandas._libs.tslibs.nattype',
+        'pandas._libs.tslibs.timedeltas',
+        'pandas._libs.tslibs.timestamps',
         # tkinter
         'tkinter',
         'tkinter.ttk',
@@ -100,13 +110,10 @@ a = Analysis(
         'collections',
         'charset_normalizer',
         'sqlite3',
-        'matplotlib',
-        'matplotlib.backends.backend_tkagg',
-        'matplotlib.backends.backend_agg',
     ] + extra_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['runtime_hook.py'],
     excludes=[
         'scipy',
         'IPython',
