@@ -313,8 +313,13 @@ class ConverterApp(tk.Tk):
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
-        # ── نظرة عامة (Overview): built last since it reads from the tabs
-        # above, but inserted first so it's the landing page.
+        # Now that Magazino Filato exists, let Situazione auto-fill its
+        # "Filato Disponibile" column from it.
+        self._situazione_tab.magazino_tab = self._magazino_tab
+        self._situazione_tab.refresh_raw_yarn_match()
+
+        # ── Overview: built last since it reads from the tabs above, but
+        # inserted first so it's the landing page.
         self._overview_tab = OverviewTab(notebook, self._situazione_tab, self._magazino_tab)
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
@@ -353,6 +358,11 @@ class ConverterApp(tk.Tk):
         if getattr(self, "_magazino_tab", None):
             self._magazino_tab.sync_shared_async()
             self._magazino_tab.sync_shared_lotti_async()
+        if getattr(self, "_situazione_tab", None):
+            # Best-effort: Magazino/LOTTI syncs above run in worker threads,
+            # so this may still see slightly-stale data the first time --
+            # it'll catch up on the next Situazione refresh regardless.
+            self.after(500, self._situazione_tab.refresh_raw_yarn_match)
 
     def _refresh_magazino_status(self) -> None:
         cache = load_magazino_cache()

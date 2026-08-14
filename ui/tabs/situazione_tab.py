@@ -73,6 +73,7 @@ COLUMN_SPEC = [
     ("rocche", "Rocche", "number"),
     ("mc", "M/C", "number"),
     ("comment", "Comment", "text"),
+    ("raw_yarn_match", "Filato Disponibile", "text"),
     ("cq", "C.Q", "text"),
     ("tinto", "Tinto", "date"),
     ("bagno", "Bagno", "text"),
@@ -137,6 +138,11 @@ class SituazioneTab(ttk.Frame):
         self._configure_styles()
 
         self._on_shared_cache_changed = on_shared_cache_changed
+        # Set post-construction from gui.py once MagazinoFilatoTab exists
+        # (it's built after this tab). Used only to auto-fill the "Filato
+        # Disponibile" column -- read lazily, so it's fine if it's not set
+        # yet the first time _load_table_from_db() runs.
+        self.magazino_tab = None
 
         db.init_db()
 
@@ -148,6 +154,9 @@ class SituazioneTab(ttk.Frame):
         self._startup_restore_in_progress = False
         self._startup_snapshot_current = False
         self._table_loaded_callbacks = []
+        self._data_revision = 0
+        self._tree_render_generation = 0
+        self._tree_render_after_id = None
         self._shared_dfm_path = ""
         self._shared_prod_path = ""
 
@@ -697,14 +706,44 @@ class SituazioneTab(ttk.Frame):
         )
         self._load_table_from_db()
 
+    def _recompute_raw_yarn_match(self) -> None:
+        """Fill "Filato Disponibile" for PG-X rows from Magazino Filato's
+        current stock -- best-effort, never blocks: if Magazino hasn't been
+        loaded yet this just leaves the column blank."""
+        if self.current_df.empty:
+            return
+        if "comment" not in self.current_df.columns:
+            self.current_df["raw_yarn_match"] = ""
+            return
+        magazino_tab = self.magazino_tab
+        magazino_summary = getattr(magazino_tab, "magazino_summary", None) if magazino_tab else None
+        lotti_summary = getattr(magazino_tab, "lotti_summary", None) if magazino_tab else None
+        try:
+            self.current_df["raw_yarn_match"] = business_logic.compute_raw_yarn_matches(
+                self.current_df, magazino_summary, lotti_summary
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Situazione: raw yarn auto-match failed: %s", exc)
+            self.current_df["raw_yarn_match"] = ""
+
+    def refresh_raw_yarn_match(self) -> None:
+        """Public hook: re-run the Filato Disponibile match against whatever
+        Magazino Filato/LOTTI data is loaded right now, and re-render."""
+        if self.current_df.empty:
+            return
+        self._recompute_raw_yarn_match()
+        self._render_tree(self.current_df)
+
     def _load_table_from_db(self):
         states = db.get_all_states()
         self.current_df = pd.DataFrame(states.values())
+        self._data_revision += 1
         if not self.current_df.empty and "bagno" in self.current_df.columns:
             self.current_df = self.current_df.sort_values(
                 by="bagno", ascending=True, key=lambda s: s.astype(str)
             )
             self.sort_state["bagno"] = False  # next click on Bagno heading reverses to Z-A
+        self._recompute_raw_yarn_match()
         self._render_tree(self.current_df)
         for callback in tuple(self._table_loaded_callbacks):
             try:
@@ -719,19 +758,41 @@ class SituazioneTab(ttk.Frame):
 
     # -------------------------------------------------------------- display
     def _render_tree(self, df, autosize=True):
+        """Render rows in small UI batches so large snapshots do not freeze Tk."""
+        self._tree_render_generation += 1
+        generation = self._tree_render_generation
+        if self._tree_render_after_id is not None:
+            try:
+                self.after_cancel(self._tree_render_after_id)
+            except tk.TclError:
+                pass
+            self._tree_render_after_id = None
+
         self.tree.delete(*self.tree.get_children())
         if autosize:
             self._autosize_columns(df)
         if df.empty:
             return
         display_df = df.reindex(columns=self.columns, fill_value="")
-        status_values = display_df["new_comment"].tolist()
-        for index, values in enumerate(display_df.itertuples(index=False, name=None)):
-            status = status_values[index]
-            tag = "Ritinta" if str(status).startswith("Ritinta") else status
-            if not tag:
-                tag = "stripe" if index % 2 else ""
-            self.tree.insert("", "end", values=values, tags=((tag,) if tag else ()))
+        rows = list(display_df.itertuples(index=False, name=None))
+
+        def insert_chunk(start=0):
+            if generation != self._tree_render_generation:
+                return
+            end = min(start + 150, len(rows))
+            for index in range(start, end):
+                values = rows[index]
+                status = values[self.columns.index("new_comment")]
+                tag = "Ritinta" if str(status).startswith("Ritinta") else status
+                if not tag:
+                    tag = "stripe" if index % 2 else ""
+                self.tree.insert("", "end", values=values, tags=((tag,) if tag else ()))
+            if end < len(rows):
+                self._tree_render_after_id = self.after(1, insert_chunk, end)
+            else:
+                self._tree_render_after_id = None
+
+        insert_chunk()
 
     def _on_search_changed(self, *_args):
         """Debounce typing so the whole table is not redrawn per keystroke."""

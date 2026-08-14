@@ -50,7 +50,8 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
     Reads the raw Magazino export and applies filter rules 1-4.
     *articolo_prefix* selects which client's raw-yarn family/families to
     keep (rule 2) -- default keeps both Elvy (G130) and Kamal (G170) in
-    one pass; pass a single string (e.g. "G170") to narrow it to one.
+    one pass; pass a single string (e.g. "G170") to narrow it to one, or
+    None to skip rule 2 entirely and keep every client's raw yarn.
     Returns (DataFrame with columns [articolo, partita, ordine, esistenza,
     colli, magazzino], errors:list).
     """
@@ -74,15 +75,15 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
         summary = summary.rename(columns=columns)
         required_summary = {"articolo", "partita", "mag_rocche", "mag_peso"}
         if required_summary.issubset(summary.columns):
-            prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
             summary["articolo"] = summary["articolo"].astype(str).str.strip()
             summary["partita"] = summary["partita"].astype(str).str.strip()
             summary["mag_rocche"] = _to_number(summary["mag_rocche"])
             summary["mag_peso"] = _to_number(summary["mag_peso"])
-            summary = summary[
-                summary["articolo"].str.startswith(prefixes)
-                & summary["partita"].ne("")
-            ]
+            mask = summary["partita"].ne("")
+            if articolo_prefix is not None:
+                prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+                mask &= summary["articolo"].str.startswith(prefixes)
+            summary = summary[mask]
             return summary[["articolo", "partita", "mag_rocche", "mag_peso"]].reset_index(drop=True), []
 
     raw = summary_raw
@@ -110,9 +111,12 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
 
     # rule 1: only these two warehouses
     df = df[df["MAGAZZINO"].isin(KEEP_MAGAZZINI)]
-    # rule 2: only the raw-yarn article family
-    prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
-    df = df[df["ARTICOLO"].str.startswith(prefixes)]
+    # rule 2: only the raw-yarn article family (skipped entirely when
+    # articolo_prefix is None, e.g. the Magazino Filato tab's own view,
+    # which wants every client's raw yarn visible, not just Elvy/Kamal)
+    if articolo_prefix is not None:
+        prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+        df = df[df["ARTICOLO"].str.startswith(prefixes)]
     # rule 3: 900160 with ORDINE==0 means used up -> drop; 900910/ORDINE==0 is normal, keep
     used_up = (df["MAGAZZINO"] == 900160) & (df["ORDINE"] == 0)
     df = df[~used_up]

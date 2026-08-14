@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
 echo.
 echo  ================================================
@@ -11,8 +12,14 @@ echo.
 python --version >nul 2>&1
 if errorlevel 1 (
     echo  [ERROR] Python is not installed.
-    echo          Install Python 3.9 or newer from: https://python.org
-    pause
+    echo          Install Python 3.10 or newer from: https://python.org
+    if not defined PLANING_NO_PAUSE pause
+    exit /b 1
+)
+python -c "import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)"
+if errorlevel 1 (
+    echo  [ERROR] Python 3.10 or newer is required.
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo  [OK] %%v detected
@@ -27,7 +34,7 @@ if exist venv (
 python -m venv venv
 if errorlevel 1 (
     echo  [ERROR] Failed to create venv.
-    pause
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
 echo         Done.
@@ -38,7 +45,7 @@ echo  [2/5]  Activating virtual environment...
 call venv\Scripts\activate.bat
 if errorlevel 1 (
     echo  [ERROR] Could not activate venv.
-    pause
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
 echo         Done.
@@ -47,17 +54,15 @@ echo.
 :: -- Install dependencies ---------------------------------------------------
 echo  [3/5]  Installing dependencies from requirements.txt...
 python -m pip install --upgrade pip --quiet
-pip install -r requirements.txt --quiet
 if errorlevel 1 (
-    echo  [ERROR] pip install requirements.txt failed.
-    pause
+    echo  [ERROR] Could not upgrade pip.
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
-echo         Installing PyInstaller...
-pip install pyinstaller --quiet
+python -m pip install -r requirements.txt --quiet
 if errorlevel 1 (
-    echo  [ERROR] pip install pyinstaller failed.
-    pause
+    echo  [ERROR] pip install requirements.txt failed.
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
 echo         Done.
@@ -73,12 +78,12 @@ echo.
 :: -- Build with PyInstaller ---------------------------------------------------
 echo  [5/5]  Building executable with PyInstaller...
 echo.
-pyinstaller main.spec --noconfirm --clean
+python -m PyInstaller main.spec --noconfirm --clean
 if errorlevel 1 (
     echo.
     echo  [ERROR] PyInstaller build FAILED.
     echo          Check the output above for details.
-    pause
+    if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
 
@@ -94,4 +99,4 @@ echo    2. Open installer.iss with Inno Setup Compiler
 echo    3. Press Ctrl+F9 to compile
 echo    4. The setup file will appear in: installer_output\
 echo.
-pause
+if not defined PLANING_NO_PAUSE pause

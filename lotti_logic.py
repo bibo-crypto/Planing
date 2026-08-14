@@ -11,8 +11,8 @@ Rules (as specified):
   1. Keep rows where (MAGAZZINO == 900910 and ORDINE == 0)
      OR (MAGAZZINO == 900160 and ORDINE != 0).
   2. Keep only QESI > 0.
-  3. Keep only ARTICOLO starting with the raw-yarn prefix (default "G170",
-     Kamal's family).
+  3. Keep all raw-yarn ARTICOLO values. The LOTTI file is shared by all
+     customers, so client-specific prefixes must not discard valid batches.
   4. Group by PARTITA, taking the Lotto (one Lotto per Partita in practice).
 
 Verified against a real LOTTI.xlsx export: 6 Partita/Lotto pairs came out,
@@ -21,7 +21,7 @@ the Lotto values matched Kamal's own message numbers exactly.
 """
 import pandas as pd
 
-RAW_ARTICOLO_PREFIXES = ("G130", "G170")
+RAW_ARTICOLO_PREFIXES = None
 
 
 def _header_key(value):
@@ -37,7 +37,7 @@ def _find_header_row(raw, required_cols, search_rows=20):
     return None
 
 
-def load_lotti(path, articolo_prefix: str | tuple[str, ...] = RAW_ARTICOLO_PREFIXES):
+def load_lotti(path, articolo_prefix: str | tuple[str, ...] | None = RAW_ARTICOLO_PREFIXES):
     """
     Reads the raw LOTTI export and applies filter rules 1-3.
     Returns (DataFrame with columns [articolo, partita, ordine, qesi, lotto,
@@ -80,13 +80,11 @@ def load_lotti(path, articolo_prefix: str | tuple[str, ...] = RAW_ARTICOLO_PREFI
     # rule 2
     df = df[df["QESI"] > 0]
 
-    if isinstance(articolo_prefix, str):
-        prefixes = (articolo_prefix,)
-    else:
-        prefixes = tuple(articolo_prefix)
-
-    # rule 3
-    df = df[df["ARTICOLO"].str.startswith(prefixes)]
+    # rule 3: LOTTI is shared by every customer. A prefix remains available
+    # as an explicit opt-in filter, but the application default keeps all.
+    if articolo_prefix is not None:
+        prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+        df = df[df["ARTICOLO"].str.startswith(prefixes)]
 
     out = pd.DataFrame({
         "articolo": df["ARTICOLO"],
