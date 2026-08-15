@@ -50,8 +50,36 @@ class MagazinoFilatoTab(ttk.Frame):
 
         self._build_upload_panel()
         self._build_treeview()
+        # Use the last normalized summary immediately; the source workbook is
+        # still re-read asynchronously below so the cache never blocks startup.
+        self._restore_summary_from_cache()
         self.after_idle(self.sync_shared_lotti_async)
         self.after_idle(self.sync_shared_async)
+
+    def _restore_summary_from_cache(self):
+        """Restore the last Magazino summary without opening the workbook."""
+        cache = load_magazino_cache()
+        rows = cache.get("summary_rows")
+        source_path = str(cache.get("source_path", ""))
+        if not isinstance(rows, list) or not rows:
+            return
+        try:
+            summary = pd.DataFrame(rows)
+            required = {"articolo", "partita", "mag_rocche", "mag_peso"}
+            if not required.issubset(summary.columns):
+                return
+            self.magazino_summary = summary
+            self._base_df = summary.copy()
+            # Leave _shared_path empty so sync_shared_async still validates the
+            # current workbook in the background after showing this cache.
+            self.status_var.set(
+                f"✅ Cached: {len(summary)} batches" +
+                (f" - {Path(source_path).name}" if source_path else "")
+            )
+            self._data_revision += 1
+            self._recompute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not restore Magazino summary cache: %s", exc)
 
     def _restore_shared_lotti(self):
         cache = load_lotti_cache()

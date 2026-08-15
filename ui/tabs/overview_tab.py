@@ -44,6 +44,7 @@ from openpyxl.utils import get_column_letter
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
 READY_MARK = "pronto da spedire"
 SHORTAGE_MARK = "PG-X"
+DELIVERY_ALERT_DAYS = 3
 HEADERS_IT = {
     "cliente": "Cliente", "colore": "Colore", "titolo": "Titolo",
     "articolo": "Articolo", "codice": "Codice", "ordine": "Ordine",
@@ -55,6 +56,7 @@ HEADERS_IT = {
     "planedate": "PlaneDate", "data_qualita": "Data Qualità",
     "data_uscita": "Data Uscita", "custom": "Controllo",
     "days_in_qc": "Giorni in C.Q",
+    "days_to_delivery": "Giorni alla consegna",
 }
 CHECK_COLUMNS = [
     "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
@@ -148,6 +150,11 @@ class OverviewTab(ttk.Frame):
         style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#667085",
                         font=("Segoe UI", 9))
         style.configure("Overview.CardValue.TLabel", background="#ffffff", foreground="#16324f",
+                        font=("Segoe UI", 19, "bold"))
+        style.configure("Overview.AlertCard.TFrame", background="#fff7ed", relief="solid", borderwidth=1)
+        style.configure("Overview.AlertCardTitle.TLabel", background="#fff7ed", foreground="#c2410c",
+                        font=("Segoe UI", 9, "bold"))
+        style.configure("Overview.AlertCardValue.TLabel", background="#fff7ed", foreground="#9a3412",
                         font=("Segoe UI", 19, "bold"))
 
         toolbar = ttk.Frame(self)
@@ -247,18 +254,48 @@ class OverviewTab(ttk.Frame):
                 values = df[col] if col in df.columns else pd.Series("", index=df.index)
                 df[col] = values.fillna("").astype(str).str.strip()
 
-        shortage_df = (
-            df[df["comment"].str.upper().str.startswith(SHORTAGE_MARK)]
-            if not df.empty else df
-        )
+        # Keep every shortage row whose Commento contains PG-X.  The raw-yarn
+        # match is only an informational column; it must never filter out a
+        # shortage that has no available yarn match.
+        shortage_df = df.iloc[0:0].copy()
+        if not df.empty and "comment" in df.columns:
+            shortage_mask = df["comment"].astype(str).str.contains(
+                SHORTAGE_MARK, case=False, regex=False, na=False
+            )
+            shortage_df = df.loc[shortage_mask].copy()
+            if "raw_yarn_match" not in shortage_df.columns:
+                shortage_df["raw_yarn_match"] = ""
         ready_df = (
             df[df["new_comment"].str.lower().str.contains(READY_MARK)]
             if not df.empty else df
         )
-        check_df = (
-            df[df["custom"].str.casefold().eq("check")]
-            if not df.empty else df
-        )
+        # Quality-delay alert is intentionally based on the three visible
+        # report fields, so stale Custom values cannot leak old rows into it.
+        check_df = df.iloc[0:0].copy()
+        if not df.empty:
+            cq_oo = df.get("cq", pd.Series("", index=df.index)).astype(str).str.strip().str.upper().eq("OO")
+            new_comment_cq = df.get("new_comment", pd.Series("", index=df.index)).astype(str).str.strip().str.casefold().eq("c.q")
+            days_in_qc = pd.to_numeric(df.get("days_in_qc", pd.Series(index=df.index)), errors="coerce")
+            check_df = df.loc[cq_oo & new_comment_cq & days_in_qc.gt(4)].copy()
+
+        # Delivery alert: include overdue orders and orders due within the
+        # next DELIVERY_ALERT_DAYS days, while excluding already shipped rows.
+        # The current situation data stores dates as ISO strings, so parse them
+        # explicitly instead of comparing display text.
+        delivery_df = df.iloc[0:0].copy()
+        if not df.empty and "consegna" in df.columns:
+            due_dates = pd.to_datetime(df["consegna"], errors="coerce")
+            today = pd.Timestamp.now().normalize()
+            deadline = today + pd.Timedelta(days=DELIVERY_ALERT_DAYS)
+            # Delivery risk is limited to batches still queued in quality
+            # (C.Q = OO), as requested. Include overdue and due-within-window
+            # rows, but never rows already shipped.
+            not_shipped = ~df.get("new_comment", pd.Series("", index=df.index)).str.casefold().eq("spedita")
+            still_in_quality = df.get("cq", pd.Series("", index=df.index)).astype(str).str.strip().eq("OO")
+            due_mask = due_dates.notna() & due_dates.le(deadline) & not_shipped & still_in_quality
+            delivery_df = df.loc[due_mask].copy()
+            delivery_df["days_to_delivery"] = (due_dates.loc[due_mask] - today).dt.days
+            delivery_df = delivery_df.sort_values("days_to_delivery")
 
         n_shortage_colors = shortage_df["colore"].nunique() if not shortage_df.empty else 0
         n_ready_colors = ready_df["colore"].nunique() if not ready_df.empty else 0
@@ -270,29 +307,43 @@ class OverviewTab(ttk.Frame):
         self._add_card(1, "🧵 Filato disponibile", f"{total_yarn_kg:,.0f} kg")
         self._add_card(2, "📦 Pronte da spedire", str(n_ready_colors))
         self._add_card(3, "⚠️ In attesa di filato", str(n_shortage_colors))
+        self._add_card(4, "⚠️ Ritardo in Q.C", f"{len(check_df):,}", alert=True)
+        self._add_card(5, "📅 Ritardo Consegna", f"{len(delivery_df):,}", alert=True)
 
         self._add_table(
             "Colori pronti da spedire (senza uscita)",
-            ready_df, ["cliente", "colore", "titolo", "partita", "rocche"],
+            ready_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche"],
             "colori_pronti.xlsx",
         )
         self._add_table(
             "Colori in attesa di filato",
-            shortage_df, ["cliente", "colore", "titolo", "rocche"],
+            shortage_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche",
+                          "comment", "raw_yarn_match"],
             "colori_filato_mancante.xlsx",
         )
         self._add_table(
-            "Colori da controllare (Custom = Check)",
-            check_df, CHECK_COLUMNS,
-            "colori_check.xlsx",
+            "Ritardo in Q.C (C.Q = OO, oltre 4 giorni)",
+            check_df,
+            ["cliente", "codice", "colore", "titolo", "partita", "rocche",
+             "days_in_qc", "new_comment"],
+            "ritardo_in_qc.xlsx",
+        )
+        self._add_table(
+            f"📅 Ritardo consegna / entro {DELIVERY_ALERT_DAYS} giorni (C.Q = OO)",
+            delivery_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche",
+                          "consegna", "days_to_delivery", "new_comment"],
+            "ordini_urgenti_consegna.xlsx",
         )
 
-    def _add_card(self, col: int, title: str, value: str) -> None:
+    def _add_card(self, col: int, title: str, value: str, alert: bool = False) -> None:
         self._cards_frame.columnconfigure(col, weight=1)
-        card = ttk.Frame(self._cards_frame, style="Overview.Card.TFrame", padding=12)
-        card.grid(row=0, column=col, padx=6, sticky="nsew")
-        ttk.Label(card, text=title, style="Overview.CardTitle.TLabel", wraplength=200).pack(anchor="w")
-        ttk.Label(card, text=value, style="Overview.CardValue.TLabel").pack(anchor="w", pady=(4, 0))
+        card_style = "Overview.AlertCard.TFrame" if alert else "Overview.Card.TFrame"
+        title_style = "Overview.AlertCardTitle.TLabel" if alert else "Overview.CardTitle.TLabel"
+        value_style = "Overview.AlertCardValue.TLabel" if alert else "Overview.CardValue.TLabel"
+        card = ttk.Frame(self._cards_frame, style=card_style, padding=12)
+        card.grid(row=col // 3, column=col % 3, padx=6, pady=4, sticky="nsew")
+        ttk.Label(card, text=title, style=title_style, wraplength=180).pack(anchor="w")
+        ttk.Label(card, text=value, style=value_style).pack(anchor="w", pady=(4, 0))
 
     def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str) -> None:
         frame = ttk.LabelFrame(self._tables_frame, text=title, padding=6)

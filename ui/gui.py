@@ -53,6 +53,7 @@ from elvy_mapping import (
 )
 from dfm_lookup import (
     build_dfm_lookup,
+    is_first_time_dyeing,
     load_dfm_cache,
     lookup_dfm_color,
     save_dfm_cache,
@@ -1151,6 +1152,8 @@ class ConverterApp(tk.Tk):
                         row.articolo_delta, row.colour, row.ne, row.dye_type, row.yarn,
                         dfm_entries,
                     )
+                    if is_first_time_dyeing(row.articolo_delta, row.coloredfm, dfm_entries):
+                        row.check_articolo = "prima volta tint."
 
                 calculator.calculate(rows, only_if_missing=True)
                 all_rows.extend(rows)

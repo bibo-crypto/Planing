@@ -185,15 +185,16 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
 
     df["new_comment"] = df.apply(_row_new_comment, axis=1)
 
-    # Custom flag column: "Check" when a batch has already gone through
-    # quality (C.Q is something other than "OO"), more than 3 days have
-    # passed since Data Qualita, and it still hasn't shipped (no Data Uscita).
+    # Custom flag column: "Check" when the visible report fields identify a
+    # genuine quality delay: C.Q == OO, New Comment == C.Q, and more than
+    # 4 days have passed in Q.C without shipment.
     def _custom_flag(r):
         cq = r.get("cq")
-        dq = r["data_qualita"] if pd.notna(r["data_qualita"]) else None
+        tinto = r["tinto"] if pd.notna(r["tinto"]) else None
         du = r["data_uscita"] if pd.notna(r["data_uscita"]) else None
-        if cq != "OO" and dq is not None and du is None:
-            if (today - dq).days > 3:
+        new_comment = str(r.get("new_comment") or "").strip().casefold()
+        if cq == "OO" and new_comment == "c.q" and tinto is not None and du is None:
+            if (today - tinto).days > 4:
                 return "Check"
         return ""
 

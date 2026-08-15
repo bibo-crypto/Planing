@@ -61,6 +61,7 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("Price in $",          "price_usd",           "number"),
     ("Value in USD",        "value_usd",           "number"),
     ("Ship Date",           "ship_date",           "date"),
+    ("Check Articolo",      "check_articolo",      "text"),
 ]
 
 # "Ordini ELVY" sheet — derived columns, see ordini_elvy.py.
