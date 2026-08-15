@@ -44,6 +44,7 @@ class MagazinoFilatoTab(ttk.Frame):
         self._on_shared_cache_changed = on_shared_cache_changed
         self._data_revision = 0
         self._search_var = tk.StringVar()
+        self._filter_after_id = None
         self.total_available_var = tk.StringVar(value="Totale disponibile: 0 rocche | 0 kg")
         self._sort_column = ""
         self._sort_reverse = False
@@ -181,7 +182,6 @@ class MagazinoFilatoTab(ttk.Frame):
         ttk.Label(row_search, text="Search:").pack(side="left", padx=(0, 8))
         search_entry = ttk.Entry(row_search, textvariable=self._search_var, width=36)
         search_entry.pack(side="left", padx=(0, 8))
-        search_entry.bind("<KeyRelease>", lambda _e: self._on_search_changed())
         self._search_var.trace_add("write", lambda *_: self._on_search_changed())
 
         row3 = ttk.Frame(panel)
@@ -355,6 +355,7 @@ class MagazinoFilatoTab(ttk.Frame):
             ), tags=(tag,))
 
     def _apply_search_and_sort(self):
+        self._filter_after_id = None
         df = self._get_unfiltered_df()
         if df.empty:
             self.summary_df = pd.DataFrame()
@@ -363,7 +364,10 @@ class MagazinoFilatoTab(ttk.Frame):
 
         q = self._search_var.get().strip().lower()
         if q:
-            mask = df.apply(lambda row: row.astype(str).str.lower().str.contains(q).any(), axis=1)
+            searchable = df.astype(str)
+            mask = searchable.apply(
+                lambda column: column.str.lower().str.contains(q, regex=False)
+            ).any(axis=1)
             df = df[mask]
 
         if self._sort_column:
@@ -382,7 +386,13 @@ class MagazinoFilatoTab(ttk.Frame):
         self._apply_search_and_sort()
 
     def _on_search_changed(self):
-        self._apply_search_and_sort()
+        # Avoid rebuilding the dataframe and Treeview once per keystroke.
+        if self._filter_after_id is not None:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except tk.TclError:
+                pass
+        self._filter_after_id = self.after(180, self._apply_search_and_sort)
 
     def _on_export(self):
         if self.summary_df.empty:

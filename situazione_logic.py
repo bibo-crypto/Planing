@@ -18,8 +18,9 @@ sheet (379 rows, 100% match) before being wired in here.
 import pandas as pd
 from datetime import datetime
 import re
+from itertools import combinations
 
-from utils import clean_text
+from utils import clean_text, parse_number
 
 READY_CODES = {"AA", "AC", "AU", "AT"}
 
@@ -260,9 +261,9 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
          reference (lotti_summary, merged with magazino_summary on
          Partita) for one exact, deterministic batch.
       2. Plain "PG-X" -- fall back to grouping every row needing the same
-         raw-yarn Articolo and checking whether one batch's available
-         Mag.rocche covers the GROUP's total Rocche, not just this single
-         row's, since several colours often draw from the same batch.
+         raw-yarn Articolo and consuming stock colour by colour.  A colour
+         may use several Partitas when necessary, while a later colour is
+         left unmatched if the article's remaining total is insufficient.
 
     Either way, a batch's available quantity is decremented as rows get
     matched to it, so two different colours/groups can't both claim the
@@ -282,23 +283,77 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
     if magazino_summary.empty:
         return result
 
+    # Keep stock per article/partita.  A single colour may be supplied by
+    # more than one partita, so matching must be allowed to consume several
+    # stock rows instead of requiring one partita to cover the whole colour.
+    stock = magazino_summary.copy()
+    stock["articolo"] = stock["articolo"].map(clean_text)
+    stock["partita"] = stock["partita"].map(clean_text)
+    stock["mag_rocche"] = stock["mag_rocche"].map(parse_number).fillna(0.0)
+    stock = stock.groupby(["articolo", "partita"], as_index=False)["mag_rocche"].sum()
     remaining: dict[tuple[str, str], float] = {
         (str(r["articolo"]), str(r["partita"])): float(r["mag_rocche"])
-        for _, r in magazino_summary.iterrows()
+        for _, r in stock.iterrows()
     }
 
-    lotto_to_batch: dict[str, tuple[str, str]] = {}
+    lotto_to_batches: dict[str, list[tuple[str, str]]] = {}
     if not lotti_summary.empty and "lotto" in lotti_summary.columns:
-        merged = magazino_summary.merge(lotti_summary, on="partita", how="inner")
+        merged = stock.merge(lotti_summary, on="partita", how="inner")
         for _, r in merged.iterrows():
             lotto_key = clean_text(r["lotto"])
             if lotto_key:
-                lotto_to_batch[lotto_key] = (str(r["articolo"]), str(r["partita"]))
+                batch_key = (str(r["articolo"]), str(r["partita"]))
+                if batch_key not in lotto_to_batches.setdefault(lotto_key, []):
+                    lotto_to_batches[lotto_key].append(batch_key)
 
-    rocche = pd.to_numeric(df.get("rocche", 0), errors="coerce").fillna(0.0)
+    # Wincoint values are commonly formatted as Italian decimals (e.g.
+    # "6,00").  pd.to_numeric would turn those into NaN/0 and make one
+    # one-cone partita appear sufficient for every machine.
+    rocche = df.get("rocche", pd.Series(0.0, index=df.index)).map(parse_number).fillna(0.0)
     handled: set = set()
 
-    # 1) explicit Lotto in the comment -- deterministic, one Partita
+    def consume(batch_keys, needed: float):
+        """Consume *needed* rocche and return every partita used, or None."""
+        candidates = [key for key in batch_keys if remaining.get(key, 0.0) > 0]
+        # Prefer one partita when it is enough.  Split across partitas only
+        # when the colour itself needs a combined quantity.
+        fitting = [key for key in candidates if remaining[key] >= needed]
+        if fitting:
+            key = min(fitting, key=lambda item: (remaining[item], item[1]))
+            remaining[key] -= needed
+            return [key[1]]
+        # A split match may use two Partitas, never three or more.  Choose
+        # the smallest pair that covers the colour so excess stock is not
+        # consumed unnecessarily.
+        pairs = [
+            pair for pair in combinations(candidates, 2)
+            if remaining[pair[0]] + remaining[pair[1]] >= needed
+        ]
+        if not pairs:
+            return None
+        selected = min(
+            pairs,
+            key=lambda pair: (remaining[pair[0]] + remaining[pair[1]], pair),
+        )
+        used = []
+        for key in sorted(selected, key=lambda item: (remaining[item], item[1])):
+            amount = min(remaining[key], needed)
+            if amount <= 0:
+                continue
+            remaining[key] -= amount
+            needed -= amount
+            used.append(key[1])
+            if needed <= 1e-9:
+                break
+        return used
+
+    def match_text(article: str, partitas: list[str]) -> str:
+        # Keep the existing display format while making a split stock match
+        # obvious in the Filato Disponibile cell.
+        return f"{article} / {' + '.join(partitas)}"
+
+    # 1) explicit Lotto in the comment -- deterministic lot, possibly many
+    # Partitas when the same Lotto appears on multiple warehouse rows.
     lot_rows: dict[str, list] = {}
     for idx in df.index[is_shortage]:
         m = _LOTTO_IN_COMMENT_RE.search(comment.loc[idx])
@@ -306,17 +361,26 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
             lot_rows.setdefault(clean_text(m.group(1)), []).append(idx)
 
     for lotto, idxs in lot_rows.items():
-        batch_key = lotto_to_batch.get(lotto)
-        if batch_key is None:
-            continue
-        needed = sum(rocche.loc[i] for i in idxs)
-        if remaining.get(batch_key, 0.0) >= needed:
-            remaining[batch_key] -= needed
-            for i in idxs:
-                result.loc[i] = f"{batch_key[0]} / {batch_key[1]}"
-                handled.add(i)
+        for i in sorted(idxs, key=lambda row_idx: (rocche.loc[row_idx], str(row_idx))):
+            # Explicit Lotto rows are handled only by the Lotto-specific
+            # stock below, even when that Lotto is absent from the warehouse.
+            handled.add(i)
+            raw_article = _finished_articolo_to_raw(df.at[i, "articolo"]) if "articolo" in df.columns else None
+            batch_keys = [
+                key for key in lotto_to_batches.get(lotto, [])
+                if raw_article is None or key[0] == raw_article
+            ]
+            if not batch_keys:
+                continue
+            # A row with an explicit Lotto must never fall through to the
+            # generic article match: that could attach an unrelated Partita
+            # after the requested Lotto runs out of stock.
+            used_partitas = consume(batch_keys, rocche.loc[i])
+            if used_partitas is None:
+                continue
+            result.loc[i] = match_text(batch_keys[0][0], used_partitas)
 
-    # 2) bare "PG-X" -- group by raw-yarn Articolo, cover the group's total
+    # 2) bare "PG-X" -- group by raw-yarn Articolo and consume by colour
     if "articolo" in df.columns:
         groups: dict[str, list] = {}
         for idx in df.index[is_shortage]:
@@ -327,23 +391,19 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
                 groups.setdefault(raw, []).append(idx)
 
         for raw_articolo, idxs in groups.items():
-            needed = sum(rocche.loc[i] for i in idxs)
-            batches = [(k, v) for k, v in remaining.items() if k[0] == raw_articolo and v > 0]
-            covering = next((b for b in sorted(batches, key=lambda kv: kv[1]) if b[1] >= needed), None)
-            if covering is not None:
-                remaining[covering[0]] -= needed
-                for i in idxs:
-                    result.loc[i] = f"{covering[0][0]} / {covering[0][1]}"
-                continue
-            # can't cover the whole group in one batch -> cover row by row
-            # with the smallest batch that fits each one individually
-            for i in idxs:
+            # Match colours one by one and allow each colour to draw from
+            # many partitas (e.g. 32 + 24 covers a 56-rocche colour).  This
+            # also leaves a later colour blank when the remaining stock is
+            # insufficient, instead of assigning an unusable partita.
+            # Allocate the smallest machines first.  This ensures that a
+            # stock of 56 rocche serves 32 + 24 before a 128-rocche colour,
+            # regardless of the visual/database row order.
+            for i in sorted(idxs, key=lambda row_idx: (rocche.loc[row_idx], str(row_idx))):
                 need_i = rocche.loc[i]
-                batches = [(k, v) for k, v in remaining.items() if k[0] == raw_articolo and v > 0]
-                fit = next((b for b in sorted(batches, key=lambda kv: kv[1]) if b[1] >= need_i), None)
-                if fit is None:
+                batches = [k for k in remaining if k[0] == raw_articolo]
+                used_partitas = consume(batches, need_i)
+                if used_partitas is None:
                     continue
-                remaining[fit[0]] -= need_i
-                result.loc[i] = f"{fit[0][0]} / {fit[0][1]}"
+                result.loc[i] = match_text(raw_articolo, used_partitas)
 
     return result
