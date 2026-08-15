@@ -164,10 +164,12 @@ class SituazioneTab(ttk.Frame):
         self._build_toolbar()
         self._build_treeview()
         self._refresh_source_labels_from_db()
-        # Load the saved table after all widgets have completed initialization.
-        self.after_idle(self._auto_restore_saved_files)
-        self.after_idle(self._load_table_from_db)
-        self.after_idle(self.sync_shared_async)
+        # Show the last SQLite snapshot immediately.  Excel files are restored
+        # later in a worker, so the application opens against the cache first
+        # and refreshes when the latest source files have finished loading.
+        self._load_table_from_db()
+        self.after(700, self._auto_restore_saved_files)
+        self.after(1000, self.sync_shared_async)
 
     # ------------------------------------------------------------------ UI
     def _configure_styles(self):
@@ -732,6 +734,7 @@ class SituazioneTab(ttk.Frame):
         if self.current_df.empty:
             return
         self._recompute_raw_yarn_match()
+        self._data_revision += 1
         self._render_tree(self.current_df)
 
     def _load_table_from_db(self):

@@ -444,6 +444,34 @@ def lookup_dfm_color(
     return _guess_new_colour(colour_code, colour_name, yarn)
 
 
+def is_first_time_dyeing(
+    articolo_delta: str, coloredfm: str, entries: list[dict[str, str]]
+) -> bool:
+    """
+    True when this exact Articolo Delta + COLOREDFM pair has no prior entry
+    at all in the DFM reference -- i.e. this article has genuinely never
+    been dyed in this colour before, so it's worth flagging for a manual
+    double-check ("prima volta tint.") rather than trusting the automatic
+    match, which may have come from lookup_dfm_color()'s broadened fallback
+    (a different, related article) or its last-resort guess.
+
+    A blank COLOREDFM (no DFM match found at all, not even via fallback or
+    the Kaschmir guess) also counts as first-time -- there's clearly no
+    history for it either way. An unresolved Articolo Delta means there's
+    nothing reliable to check against, so it's treated as first-time too
+    rather than silently passing.
+    """
+    coloredfm = clean_text(coloredfm)
+    articolo_delta = clean_text(articolo_delta)
+    if not coloredfm or not articolo_delta.upper().startswith("G"):
+        return True
+    articolo_c = "C" + articolo_delta[1:]
+    return not any(
+        e["articolo"] == articolo_c and e["coloredfm"] == coloredfm
+        for e in entries
+    )
+
+
 def load_dfm_entries_by_prefix(prefix: str) -> list[dict[str, str]]:
     """
     Filtered to a different article prefix -- e.g. "C170" for Kamal,

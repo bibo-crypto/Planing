@@ -143,6 +143,10 @@ class OrderRow:
     value_usd: float | None = None
     ship_date: str = ""
     abbina: str = ""
+    # "prima volta tint." when this exact Articolo Delta + COLOREDFM pair
+    # has no prior entry at all in the DFM reference (see dfm_lookup.py's
+    # is_first_time_dyeing) -- left "" otherwise.
+    check_articolo: str = ""
 
 
 class ColumnSlot(NamedTuple):
