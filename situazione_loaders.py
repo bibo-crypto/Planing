@@ -173,6 +173,10 @@ def load_schedulato(path):
     out = pd.DataFrame({
         "bagno": df["N. Bagno"],
         "planedate": df["PlaneDate"],
+        # Keep the scheduling fields as well: the Copertura dashboard uses
+        # them to group the current colours by physical machine.
+        "machine": df["Machine"],
+        "batch_start": df["BatchDT"],
     })
     return out, []
 

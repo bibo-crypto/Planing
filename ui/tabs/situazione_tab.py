@@ -9,12 +9,13 @@ sheets.
 """
 import os
 import json
+import re
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 import pandas as pd
 
@@ -159,6 +160,8 @@ class SituazioneTab(ttk.Frame):
         self._tree_render_after_id = None
         self._shared_dfm_path = ""
         self._shared_prod_path = ""
+        self._copertura_revision = 0
+        self._child_windows = {}
 
         self._build_upload_panel()
         self._build_toolbar()
@@ -241,6 +244,9 @@ class SituazioneTab(ttk.Frame):
         self.yarn_shortage_btn = ttk.Button(bar, text="Mancanza Filato", command=self._open_yarn_shortage)
         self.yarn_shortage_btn.pack(side="left", padx=4)
 
+        self.copertura_btn = ttk.Button(bar, text="Copertura", command=self._open_copertura)
+        self.copertura_btn.pack(side="left", padx=4)
+
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
         ttk.Label(bar, text="Search:").pack(side="left", padx=(18, 4))
@@ -248,6 +254,205 @@ class SituazioneTab(ttk.Frame):
 
         self.summary_lbl = ttk.Label(bar, text="")
         self.summary_lbl.pack(side="right", padx=8)
+
+    def _open_copertura(self):
+        """Show and export the dyeing coverage summary for machines 3–12."""
+        if self._focus_child_window("copertura"):
+            return
+        copertura = self.loaded_frames.get("copertura")
+        if not isinstance(copertura, pd.DataFrame) or copertura.empty:
+            messagebox.showinfo("Copertura", "Upload the Copertura file first.", parent=self)
+            return
+        if "machine" not in copertura.columns or self.current_df.empty:
+            messagebox.showinfo("Copertura", "Refresh Situazione data first.", parent=self)
+            return
+
+        situation = self.current_df.copy()
+
+        def bagno_key(value):
+            digits = re.sub(r"\D", "", str(value or "")).lstrip("0")
+            return digits or str(value or "").strip().casefold()
+
+        for frame in (situation, copertura):
+            frame["bagno"] = frame["bagno"].fillna("").astype(str).str.strip()
+            frame["bagno_key"] = frame["bagno"].map(bagno_key)
+        merged = situation.merge(
+            copertura[["bagno_key", "machine"]].drop_duplicates("bagno_key"),
+            on="bagno_key", how="inner",
+        )
+
+        def machine_number(value):
+            text = str(value).strip()
+            digits = re.sub(r"\D", "", text)
+            if digits and 3300 <= int(digits) <= 3399:
+                return int(digits) - 3300
+            match = re.search(r"(?<!\d)0*(1[0-2]|[3-9])(?:\.0+)?(?!\d)", text)
+            return int(match.group(1)) if match else None
+
+        merged["machine_number"] = merged["machine"].map(machine_number)
+        merged = merged[merged["machine_number"].between(3, 12, inclusive="both")]
+        if merged.empty:
+            messagebox.showinfo("Copertura", "No Situazione colours match machines 3–12.", parent=self)
+            return
+
+        def coverage_until(count):
+            if not count:
+                return "-"
+            target_days = (int(count) + 1) // 2
+            day, done = datetime.now().date(), 0
+            while done < target_days:
+                if day.weekday() != 4:
+                    done += 1
+                if done < target_days:
+                    day += timedelta(days=1)
+            return day.strftime("%Y-%m-%d")
+
+        def build_summary(view):
+            columns = ["machine_number", "cliente", "total_colors", "pgx", "available", "covered_until"]
+            if view.empty:
+                return pd.DataFrame(columns=columns)
+            work = view.copy()
+            work["is_pgx"] = work["comment"].fillna("").astype(str).str.upper().str.startswith("PG-X")
+            summary = work.groupby(["machine_number", "cliente"], dropna=False).agg(
+                total_colors=("colore", "size"), pgx=("is_pgx", "sum"),
+            ).reset_index()
+            summary["available"] = summary["total_colors"] - summary["pgx"]
+            totals = summary.groupby("machine_number")["total_colors"].sum().to_dict()
+            summary["covered_until"] = summary["machine_number"].map(lambda x: coverage_until(totals.get(x, 0)))
+            return summary
+
+        window = tk.Toplevel(self)
+        self._child_windows["copertura"] = window
+        window.title("Copertura — macchine 3–12")
+        window.geometry("1050x600")
+        window.minsize(800, 450)
+        # Keep the normal Windows title bar so the native minimize, maximize,
+        # restore, and close buttons remain available beside X.
+        window.resizable(True, True)
+        ttk.Label(window, text="Copertura: 2 colori al giorno per macchina — venerdì escluso", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+        search_row = ttk.Frame(window)
+        search_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(search_row, text="Filtra per:").pack(side="left", padx=(0, 6))
+        filter_kind = tk.StringVar(value="Tutti")
+        filter_value = tk.StringVar(value="Tutti")
+        kind_combo = ttk.Combobox(
+            search_row, textvariable=filter_kind, state="readonly", width=14,
+            values=("Tutti", "Macchina", "Cliente"),
+        )
+        kind_combo.pack(side="left", padx=(0, 6))
+        value_combo = ttk.Combobox(search_row, textvariable=filter_value, state="readonly", width=24)
+        value_combo.pack(side="left")
+        status = ttk.Label(search_row, text="")
+        status.pack(side="right")
+
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("machine", "cliente", "colors", "pgx", "available", "covered_until")
+        labels = {"machine": "Macchina", "cliente": "Cliente", "colors": "Totale colori", "pgx": "Manca Filato (PG-X)", "available": "Disponibile", "covered_until": "Coperta fino al"}
+        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        widths = [85, 130, 110, 140, 105, 150]
+        for column, width in zip(columns, widths):
+            tree.heading(column, text=labels[column])
+            tree.column(column, width=width, anchor="center")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.tag_configure("total", background="#e8f1fb", font=("Segoe UI", 9, "bold"))
+
+        def current_view():
+            selected_kind = filter_kind.get()
+            selected_value = filter_value.get()
+            if selected_kind == "Tutti" or selected_value == "Tutti":
+                return merged
+            if selected_kind == "Macchina":
+                return merged.loc[merged["machine_number"].astype(str).eq(selected_value)]
+            return merged.loc[merged["cliente"].astype(str).eq(selected_value)]
+
+        def refresh_filter_values(*_args):
+            selected_kind = filter_kind.get()
+            if selected_kind == "Macchina":
+                values = ["Tutti"] + [str(n) for n in sorted(merged["machine_number"].dropna().unique())]
+            elif selected_kind == "Cliente":
+                values = ["Tutti"] + sorted(merged["cliente"].dropna().astype(str).unique())
+            else:
+                values = ["Tutti"]
+            value_combo.configure(values=values)
+            filter_value.set("Tutti")
+            render()
+
+        def render():
+            view = current_view()
+            summary = build_summary(view)
+            tree.delete(*tree.get_children())
+            machines = range(3, 13)
+            if filter_kind.get() == "Macchina" and filter_value.get() != "Tutti":
+                machines = [int(filter_value.get())]
+            for machine in machines:
+                rows = summary[summary["machine_number"] == machine]
+                total = int(rows["total_colors"].sum()) if not rows.empty else 0
+                until = coverage_until(total)
+                if rows.empty:
+                    tree.insert("", "end", values=(machine, "-", 0, 0, 0, "-"))
+                else:
+                    for _, row in rows.sort_values("cliente").iterrows():
+                        tree.insert("", "end", values=(machine, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]))
+                    tree.insert("", "end", values=(machine, "TOTALE", total, int(rows["pgx"].sum()), total - int(rows["pgx"].sum()), until), tags=("total",))
+            status.config(text=f"{len(view):,} colori")
+
+        def export_summary():
+            path = filedialog.asksaveasfilename(parent=window, title="Esporta Copertura", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")], initialfile="copertura.xlsx")
+            if not path:
+                return
+            view = current_view()
+            summary = build_summary(view)
+            rows = []
+            machines = range(3, 13)
+            if filter_kind.get() == "Macchina" and filter_value.get() != "Tutti":
+                machines = [int(filter_value.get())]
+            for machine in machines:
+                part = summary[summary["machine_number"] == machine]
+                total = int(part["total_colors"].sum()) if not part.empty else 0
+                if part.empty:
+                        rows.append([machine, "-", 0, 0, 0, "-"])
+                else:
+                    for _, row in part.sort_values("cliente").iterrows():
+                        rows.append([machine, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]])
+                    pgx_total = int(part["pgx"].sum())
+                    rows.append([machine, "TOTALE", total, pgx_total, total - pgx_total, coverage_until(total)])
+            try:
+                pd.DataFrame(rows, columns=[labels[c] for c in columns]).to_excel(path, index=False, sheet_name="Copertura")
+                messagebox.showinfo("Copertura", f"Export completato:\n{path}", parent=window)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Copertura", str(exc), parent=window)
+
+        kind_combo.bind("<<ComboboxSelected>>", refresh_filter_values)
+        value_combo.bind("<<ComboboxSelected>>", lambda _event: render())
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Estrai Excel", command=export_summary).pack(side="right", padx=3)
+        refresh_filter_values()
+        render()
+
+    def _focus_child_window(self, key):
+        """Focus an already-open child window instead of opening a duplicate."""
+        window = self._child_windows.get(key)
+        if window is None:
+            return False
+        try:
+            if not window.winfo_exists():
+                self._child_windows.pop(key, None)
+                return False
+            if window.state() == "iconic":
+                window.deiconify()
+            window.lift()
+            window.focus_force()
+            return True
+        except tk.TclError:
+            self._child_windows.pop(key, None)
+            return False
 
     def _build_treeview(self):
         cols = [key for key, _, _ in COLUMN_SPEC]
@@ -350,6 +555,9 @@ class SituazioneTab(ttk.Frame):
         # The user can still use Upload Data when a fresh rebuild is needed.
         if self._saved_snapshot_is_current(uploads):
             self._startup_snapshot_current = True
+            # The SQLite snapshot is enough for the main grid, but the
+            # Copertura dashboard also needs the physical machine column.
+            self._restore_saved_copertura(uploads)
             logger.info("Situazione: startup snapshot is current; skipped Excel restore")
             return
 
@@ -421,6 +629,31 @@ class SituazioneTab(ttk.Frame):
                 else:
                     logger.warning("Situazione: automatic restore skipped refresh; missing/invalid files: %s",
                                    ", ".join(errors))
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _restore_saved_copertura(self, uploads):
+        """Restore Copertura even when the main Situazione snapshot is current."""
+        info = uploads.get("copertura", {}) if isinstance(uploads, dict) else {}
+        path = str(info.get("file_path", ""))
+        if not path or not os.path.isfile(path) or "copertura" in self.loaded_frames:
+            return
+
+        def worker():
+            try:
+                df, errors = data_loaders.load_schedulato(path)
+            except Exception as exc:  # noqa: BLE001
+                df, errors = None, [str(exc)]
+
+            def apply_result():
+                if errors or df is None or df.empty:
+                    logger.warning("Situazione: saved Copertura restore failed: %s", errors)
+                    return
+                self.loaded_frames["copertura"] = df
+                self._copertura_revision += 1
+                self.source_rows["copertura"].set_status(True, f"✅ {len(df)} rows")
 
             self.after(0, apply_result)
 
@@ -583,6 +816,8 @@ class SituazioneTab(ttk.Frame):
             return
 
         self.loaded_frames[key] = df
+        if key == "copertura":
+            self._copertura_revision += 1
         msg = f"✅ {len(df)} rows - {os.path.basename(path)}"
         self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
         db.save_upload(key, os.path.basename(path), len(df), "ok", msg, file_path=str(path))
@@ -824,8 +1059,11 @@ class SituazioneTab(ttk.Frame):
         self._apply_filter()
 
     def _open_abbina(self):
+        if self._focus_child_window("abbina"):
+            return
         suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
         window = tk.Toplevel(self)
+        self._child_windows["abbina"] = window
         window.title("Da abbinare")
         window.geometry("1250x600")
         window.minsize(850, 350)
@@ -962,7 +1200,10 @@ class SituazioneTab(ttk.Frame):
 
     def _open_yarn_shortage(self):
         """Opens Mancanza Filato as a popup window (same pattern as Da abbinare)."""
+        if self._focus_child_window("yarn_shortage"):
+            return
         window = tk.Toplevel(self)
+        self._child_windows["yarn_shortage"] = window
         window.title("Mancanza Filato")
         window.geometry("1100x650")
         window.minsize(750, 350)
@@ -977,6 +1218,7 @@ class SituazioneTab(ttk.Frame):
                 self._table_loaded_callbacks.remove(shortage_view.refresh)
             except ValueError:
                 pass
+            self._child_windows.pop("yarn_shortage", None)
             window.destroy()
 
         window.protocol("WM_DELETE_WINDOW", on_close)
