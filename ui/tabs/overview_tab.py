@@ -36,15 +36,20 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from datetime import datetime, timedelta
 
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+from utils import parse_number
 
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
 READY_MARK = "pronto da spedire"
 SHORTAGE_MARK = "PG-X"
 DELIVERY_ALERT_DAYS = 3
+QUALITY_READY_CODES = {"AA", "AC", "AU", "AT"}
 HEADERS_IT = {
     "cliente": "Cliente", "colore": "Colore", "titolo": "Titolo",
     "articolo": "Articolo", "codice": "Codice", "ordine": "Ordine",
@@ -94,12 +99,8 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
     try:
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.append(list(df.columns))
-        for row in df.itertuples(index=False):
-            ws.append(list(row))
-        for i, col in enumerate(df.columns, start=1):
-            max_len = max([len(str(col))] + [len(str(v)) for v in df[col]])
-            ws.column_dimensions[get_column_letter(i)].width = max(10, min(45, max_len + 2))
+        ws.title = "Overview"
+        _write_typed_excel_table(ws, df)
         ws.freeze_panes = "A2"
         wb.save(path)
         wb.close()
@@ -107,6 +108,82 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
         messagebox.showerror("Esportazione non riuscita", str(exc), parent=parent)
         return
     messagebox.showinfo("Completato", f"Esportato in:\n{path}", parent=parent)
+
+
+def _write_typed_excel_table(ws, df: pd.DataFrame) -> None:
+    """Write an Overview export with typed cells, styling and Excel filters."""
+    ws.append(list(df.columns))
+
+    date_headers = {"data", "consegna", "data qualità", "data uscita", "planedate"}
+    number_headers = {
+        "ordine", "riga", "rocche", "m/c",
+        "giorni in c.q", "giorni alla consegna", "extra %",
+    }
+    general_headers = {"cliente", "codice", "partita", "titolo", "colore"}
+    header_fills = {
+        "date": "70AD47",    # green
+        "number": "5B9BD5",  # blue
+        "general": "A5A5A5",  # gray
+        "text": "ED7D31",    # orange
+    }
+
+    column_types = []
+    for col in df.columns:
+        header = str(col).strip().casefold()
+        if header in date_headers or "data" in header or "date" in header:
+            column_types.append("date")
+        elif header in general_headers:
+            column_types.append("general")
+        elif header in number_headers or "giorni" in header:
+            column_types.append("number")
+        else:
+            column_types.append("text")
+
+    for row in df.itertuples(index=False, name=None):
+        values = []
+        for value, kind in zip(row, column_types):
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                values.append(None)
+            elif kind == "date":
+                parsed = pd.to_datetime(value, errors="coerce")
+                values.append(None if pd.isna(parsed) else parsed.to_pydatetime())
+            elif kind == "number":
+                parsed = parse_number(value)
+                values.append(parsed if parsed is not None else str(value))
+            else:
+                values.append(str(value))
+        ws.append(values)
+
+    for index, (col, kind) in enumerate(zip(df.columns, column_types), start=1):
+        letter = get_column_letter(index)
+        header_cell = ws.cell(row=1, column=index)
+        header_cell.font = openpyxl.styles.Font(color="FFFFFF", bold=True)
+        header_cell.fill = openpyxl.styles.PatternFill(
+            "solid", fgColor=header_fills[kind]
+        )
+        header_cell.alignment = openpyxl.styles.Alignment(horizontal="center")
+        if kind == "date":
+            for cell in ws[letter][1:]:
+                cell.number_format = "yyyy-mm-dd"
+        elif kind == "number":
+            for cell in ws[letter][1:]:
+                # Overview quantities and identifiers are whole numbers:
+                # show 6, not 6.00, while keeping the cells numeric.
+                cell.number_format = "#,##0"
+        max_len = max(
+            [len(str(col))]
+            + [len(str(ws.cell(row=row, column=index).value or "")) for row in range(2, ws.max_row + 1)]
+        )
+        ws.column_dimensions[letter].width = max(10, min(45, max_len + 2))
+
+    last_col = get_column_letter(ws.max_column)
+    last_row = ws.max_row
+    table = Table(displayName="OverviewExport", ref=f"A1:{last_col}{last_row}")
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
+        showRowStripes=True, showColumnStripes=False,
+    )
+    ws.add_table(table)
 
 
 def attach_excel_export(tree: ttk.Treeview, default_filename: str) -> None:
@@ -224,6 +301,7 @@ class OverviewTab(ttk.Frame):
         """Return cheap revision counters maintained by the source tabs."""
         return (
             getattr(self.situazione_tab, "_data_revision", 0),
+            getattr(self.situazione_tab, "_copertura_revision", 0),
             getattr(self.magazino_tab, "_data_revision", 0),
         )
 
@@ -265,10 +343,25 @@ class OverviewTab(ttk.Frame):
             shortage_df = df.loc[shortage_mask].copy()
             if "raw_yarn_match" not in shortage_df.columns:
                 shortage_df["raw_yarn_match"] = ""
-        ready_df = (
-            df[df["new_comment"].str.lower().str.contains(READY_MARK)]
-            if not df.empty else df
-        )
+        # "Colori pronti" means: quality is completed with a ready code,
+        # more than three days have passed since the quality date, and no
+        # warehouse exit/invoice has been recorded yet.  Do not rely only on
+        # New Comment, because that status can be carried from old history.
+        ready_df = df.iloc[0:0].copy()
+        if not df.empty:
+            cq_ready = df.get(
+                "cq", pd.Series("", index=df.index)
+            ).astype(str).str.strip().str.upper().isin(QUALITY_READY_CODES)
+            quality_dates = pd.to_datetime(
+                df.get("data_qualita", pd.Series(index=df.index)), errors="coerce"
+            )
+            quality_older_than_3_days = quality_dates.notna() & (
+                (pd.Timestamp.now().normalize() - quality_dates.dt.normalize()).dt.days > 3
+            )
+            no_invoice = pd.to_datetime(
+                df.get("data_uscita", pd.Series(index=df.index)), errors="coerce"
+            ).isna()
+            ready_df = df.loc[cq_ready & quality_older_than_3_days & no_invoice].copy()
         # Quality-delay alert is intentionally based on the three visible
         # report fields, so stale Custom values cannot leak old rows into it.
         check_df = df.iloc[0:0].copy()
@@ -310,14 +403,16 @@ class OverviewTab(ttk.Frame):
         self._add_card(4, "⚠️ Ritardo in Q.C", f"{len(check_df):,}", alert=True)
         self._add_card(5, "📅 Ritardo Consegna", f"{len(delivery_df):,}", alert=True)
 
+        self._add_machine_summary(df)
+
         self._add_table(
             "Colori pronti da spedire (senza uscita)",
-            ready_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche"],
+            ready_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche", "mc", "bagno"],
             "colori_pronti.xlsx",
         )
         self._add_table(
             "Colori in attesa di filato",
-            shortage_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche",
+            shortage_df, ["cliente", "codice", "colore", "titolo", "ordine", "riga", "partita", "rocche",
                           "comment", "raw_yarn_match"],
             "colori_filato_mancante.xlsx",
         )
@@ -334,6 +429,73 @@ class OverviewTab(ttk.Frame):
                           "consegna", "days_to_delivery", "new_comment"],
             "ordini_urgenti_consegna.xlsx",
         )
+
+    def _add_machine_summary(self, situation_df: pd.DataFrame) -> None:
+        """Render Copertura machine totals as compact Overview cards."""
+        copertura = getattr(self.situazione_tab, "loaded_frames", {}).get("copertura")
+        counts = {machine: 0 for machine in range(3, 13)}
+        if isinstance(copertura, pd.DataFrame) and not copertura.empty and not situation_df.empty:
+            if {"bagno", "machine"}.issubset(copertura.columns) and "bagno" in situation_df.columns:
+                def key(value):
+                    digits = "".join(ch for ch in str(value or "") if ch.isdigit()).lstrip("0")
+                    return digits or str(value or "").strip().casefold()
+
+                left = situation_df.copy()
+                right = copertura.copy()
+                left["_bagno_key"] = left["bagno"].map(key)
+                right["_bagno_key"] = right["bagno"].map(key)
+                joined = left.merge(right[["_bagno_key", "machine"]].drop_duplicates("_bagno_key"), on="_bagno_key", how="inner")
+
+                def machine_number(value):
+                    digits = "".join(ch for ch in str(value) if ch.isdigit())
+                    if digits and 3300 <= int(digits) <= 3399:
+                        return int(digits) - 3300
+                    return None
+
+                joined["_machine_number"] = joined["machine"].map(machine_number)
+                valid = joined[joined["_machine_number"].between(3, 12, inclusive="both")]
+                counts.update(valid["_machine_number"].value_counts().to_dict())
+
+        frame = tk.LabelFrame(
+            self._cards_frame, text="Copertura macchine", bg="#f8fafc", fg="#16324f",
+            font=("Segoe UI", 10, "bold"), padx=8, pady=6,
+        )
+        frame.grid(row=2, column=0, columnspan=3, padx=6, pady=(0, 10), sticky="ew")
+        self._cards_frame.columnconfigure(0, weight=1)
+        self._cards_frame.columnconfigure(1, weight=1)
+        self._cards_frame.columnconfigure(2, weight=1)
+
+        def covered_until(color_count):
+            if not color_count:
+                return "-"
+            required_days = (int(color_count) + 1) // 2
+            day = datetime.now().date()
+            completed = 0
+            while completed < required_days:
+                if day.weekday() != 4:  # Friday holiday
+                    completed += 1
+                if completed < required_days:
+                    day += timedelta(days=1)
+            return day.strftime("%Y-%m-%d")
+
+        for index, machine in enumerate(range(3, 13)):
+            count = int(counts[machine])
+            empty = count == 0
+            card = tk.Frame(
+                frame, bg="#fee2e2" if empty else "#eaf2f8",
+                highlightbackground="#ef4444" if empty else "#cbd5e1",
+                highlightthickness=1, width=106, height=76,
+            )
+            card.grid(row=0, column=index, padx=3, pady=3, sticky="ew")
+            card.grid_propagate(False)
+            frame.columnconfigure(index, weight=1, minsize=106)
+            tk.Label(card, text=f"M{machine}", bg=card["bg"], fg="#991b1b" if empty else "#16324f",
+                     font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x")
+            tk.Label(card, text=f"{count} colori", bg=card["bg"], fg="#991b1b" if empty else "#344054",
+                     font=("Segoe UI", 11, "bold"), anchor="center").pack(fill="x")
+            tk.Label(card, text=f"Fino al: {covered_until(count)}", bg=card["bg"],
+                     fg="#991b1b" if empty else "#667085",
+                     font=("Segoe UI", 8, "bold"), anchor="center").pack(fill="x", pady=(2, 0))
 
     def _add_card(self, col: int, title: str, value: str, alert: bool = False) -> None:
         self._cards_frame.columnconfigure(col, weight=1)
