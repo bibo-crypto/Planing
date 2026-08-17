@@ -52,8 +52,8 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
     keep (rule 2) -- default keeps both Elvy (G130) and Kamal (G170) in
     one pass; pass a single string (e.g. "G170") to narrow it to one, or
     None to skip rule 2 entirely and keep every client's raw yarn.
-    Returns (DataFrame with columns [articolo, partita, ordine, esistenza,
-    colli, magazzino], errors:list).
+    Returns (DataFrame with columns [articolo, titolo, partita, ordine,
+    esistenza, colli, magazzino], errors:list).
     """
     required = ["MAGAZZINO", "ARTICOLO", "PARTITA", "ORDINE", "ESISTENZA", "COLLI"]
     # The app can also consume its own exported summary (Articolo, Partita,
@@ -68,7 +68,8 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
         summary = summary_raw.iloc[summary_header_row + 1:].copy()
         summary.columns = header
         aliases = {
-            "ARTICOLO": "articolo", "PARTITA": "partita",
+            "ARTICOLO": "articolo", "TITOLO": "titolo",
+            "DESCRIZIONE ART": "titolo", "PARTITA": "partita",
             "MAG.ROCCHE": "mag_rocche", "MAG.PESO": "mag_peso",
         }
         columns = {name: aliases.get(name, name) for name in summary.columns}
@@ -79,12 +80,15 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
             summary["partita"] = summary["partita"].astype(str).str.strip()
             summary["mag_rocche"] = _to_number(summary["mag_rocche"])
             summary["mag_peso"] = _to_number(summary["mag_peso"])
+            if "titolo" not in summary.columns:
+                summary["titolo"] = ""
+            summary["titolo"] = summary["titolo"].fillna("").astype(str).str.strip()
             mask = summary["partita"].ne("")
             if articolo_prefix is not None:
                 prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
                 mask &= summary["articolo"].str.startswith(prefixes)
             summary = summary[mask]
-            return summary[["articolo", "partita", "mag_rocche", "mag_peso"]].reset_index(drop=True), []
+            return summary[["articolo", "titolo", "partita", "mag_rocche", "mag_peso"]].reset_index(drop=True), []
 
     raw = summary_raw
     header_row = _find_header_row(raw, required)
@@ -107,6 +111,15 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
     df["ESISTENZA"] = _to_number(df["ESISTENZA"])
     df["COLLI"] = _to_number(df["COLLI"])
     df["ARTICOLO"] = df["ARTICOLO"].astype(str).str.strip()
+    title_column = next(
+        (column for column in ("TITOLO", "DESCRIZIONE ART") if column in df.columns),
+        None,
+    )
+    if title_column is None:
+        df["TITOLO"] = ""
+    else:
+        df["TITOLO"] = df[title_column]
+    df["TITOLO"] = df["TITOLO"].fillna("").astype(str).str.strip()
     df["PARTITA"] = df["PARTITA"].astype(str).str.strip()
 
     # rule 1: only these two warehouses
@@ -125,6 +138,7 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
 
     out = pd.DataFrame({
         "articolo": df["ARTICOLO"],
+        "titolo": df["TITOLO"],
         "partita": df["PARTITA"],
         "ordine": df["ORDINE"],
         "esistenza": df["ESISTENZA"],
@@ -137,14 +151,20 @@ def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
 def summarize_by_partita(magazino_df):
     """
     Rule 5: group by Partita, summing Colli (-> mag_rocche) and Esistenza
-    (-> mag_peso). Returns columns: articolo, partita, mag_rocche, mag_peso.
+    (-> mag_peso). Returns columns: articolo, titolo, partita, mag_rocche,
+    mag_peso.
     """
     if magazino_df is None or magazino_df.empty:
-        return pd.DataFrame(columns=["articolo", "partita", "mag_rocche", "mag_peso"])
+        return pd.DataFrame(columns=["articolo", "titolo", "partita", "mag_rocche", "mag_peso"])
+
+    if "titolo" not in magazino_df.columns:
+        magazino_df = magazino_df.copy()
+        magazino_df["titolo"] = ""
 
     grouped = magazino_df.groupby("partita", as_index=False).agg(
         articolo=("articolo", "first"),
+        titolo=("titolo", "first"),
         mag_rocche=("colli", "sum"),
         mag_peso=("esistenza", "sum"),
     )
-    return grouped[["articolo", "partita", "mag_rocche", "mag_peso"]].sort_values(["articolo", "partita"])
+    return grouped[["articolo", "titolo", "partita", "mag_rocche", "mag_peso"]].sort_values(["articolo", "partita"])

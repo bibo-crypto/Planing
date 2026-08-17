@@ -15,7 +15,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable
 import pandas as pd
 
@@ -281,31 +281,13 @@ class SituazioneTab(ttk.Frame):
             on="bagno_key", how="inner",
         )
 
-        def machine_number(value):
-            text = str(value).strip()
-            digits = re.sub(r"\D", "", text)
-            if digits and 3300 <= int(digits) <= 3399:
-                return int(digits) - 3300
-            match = re.search(r"(?<!\d)0*(1[0-2]|[3-9])(?:\.0+)?(?!\d)", text)
-            return int(match.group(1)) if match else None
-
-        merged["machine_number"] = merged["machine"].map(machine_number)
+        merged["machine_number"] = merged["machine"].map(business_logic.machine_number_from_label)
         merged = merged[merged["machine_number"].between(3, 12, inclusive="both")]
         if merged.empty:
             messagebox.showinfo("Copertura", "No Situazione colours match machines 3–12.", parent=self)
             return
 
-        def coverage_until(count):
-            if not count:
-                return "-"
-            target_days = (int(count) + 1) // 2
-            day, done = datetime.now().date(), 0
-            while done < target_days:
-                if day.weekday() != 4:
-                    done += 1
-                if done < target_days:
-                    day += timedelta(days=1)
-            return day.strftime("%Y-%m-%d")
+        coverage_until = business_logic.machine_coverage_until
 
         def build_summary(view):
             columns = ["machine_number", "cliente", "total_colors", "pgx", "available", "covered_until"]
@@ -971,6 +953,44 @@ class SituazioneTab(ttk.Frame):
         self._recompute_raw_yarn_match()
         self._data_revision += 1
         self._render_tree(self.current_df)
+
+    def refresh_raw_yarn_match_async(self) -> None:
+        """Refresh raw-yarn suggestions after the cached UI is visible."""
+        if self.current_df.empty or getattr(self, "_raw_match_syncing", False):
+            return
+
+        snapshot = self.current_df.copy()
+        magazino_tab = self.magazino_tab
+        magazino_summary = getattr(magazino_tab, "magazino_summary", None)
+        lotti_summary = getattr(magazino_tab, "lotti_summary", None)
+        magazino_snapshot = magazino_summary.copy() if isinstance(magazino_summary, pd.DataFrame) else magazino_summary
+        lotti_snapshot = lotti_summary.copy() if isinstance(lotti_summary, pd.DataFrame) else lotti_summary
+        self._raw_match_syncing = True
+
+        def worker():
+            try:
+                matches = business_logic.compute_raw_yarn_matches(
+                    snapshot, magazino_snapshot, lotti_snapshot
+                )
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                matches = [""] * len(snapshot)
+                error = exc
+
+            def apply_result():
+                self._raw_match_syncing = False
+                if error:
+                    logger.error("Situazione: async raw yarn match failed: %s", error)
+                    return
+                if not self.winfo_exists() or len(self.current_df) != len(snapshot):
+                    return
+                self.current_df["raw_yarn_match"] = matches
+                self._data_revision += 1
+                self._render_tree(self.current_df)
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _load_table_from_db(self):
         states = db.get_all_states()

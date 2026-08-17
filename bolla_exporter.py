@@ -60,6 +60,9 @@ CELL_BORDER = Border(
 )
 
 NUMBER_FORMAT = "#,##0.00"
+# General keeps KgNetto numeric while showing only meaningful decimals:
+# 2119, 866.2 — never a thousands separator, trailing .00, or a lone dot.
+KG_NETTO_FORMAT = "General"
 INTEGER_FORMAT = "0"
 TEXT_FORMAT = "@"
 MAX_COL_WIDTH = 60
@@ -89,7 +92,9 @@ def _write_sheet(
 
             if dtype == "number":
                 cell.value = float(raw_value) if raw_value is not None else None
-                cell.number_format = NUMBER_FORMAT
+                cell.number_format = (
+                    KG_NETTO_FORMAT if attr == "kg_netto" else NUMBER_FORMAT
+                )
                 cell.alignment = Alignment(horizontal="right", vertical="center")
             elif dtype == "integer":
                 # Stored as a real number (not text), so a value like the

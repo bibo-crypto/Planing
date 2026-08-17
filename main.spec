@@ -85,6 +85,7 @@ a = Analysis(
         'openpyxl.workbook',
         'openpyxl.worksheet',
         'openpyxl.worksheet.worksheet',
+        'xlrd',
         'et_xmlfile',
         # pandas C-extension modules are imported dynamically by pandas on
         # some Python/Windows combinations and need explicit registration in

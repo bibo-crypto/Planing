@@ -56,8 +56,10 @@ from dfm_lookup import (
     is_first_time_dyeing,
     load_dfm_cache,
     lookup_dfm_color,
+    raw_to_finished_articolo,
     save_dfm_cache,
 )
+import prezzi_logic
 from magazino_cache import load_magazino_cache, save_magazino_cache
 from utils import find_pdfs, load_settings, logger, make_output_path, save_settings
 from modern_widgets import RoundedButton
@@ -71,6 +73,7 @@ from situazione_settimana_tab import SettimanaTab
 from magazino_filato_tab import MagazinoFilatoTab
 from kamal_tab import KamalTab
 from ui.tabs.overview_tab import OverviewTab
+from ui.tabs.prezzi_tab import PrezziTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -136,6 +139,13 @@ class ConverterApp(tk.Tk):
         initial_w = min(1400, max(self.WINDOW_MIN_W, int(screen_w * 0.90)))
         initial_h = min(900, max(self.WINDOW_MIN_H, int(screen_h * 0.90)))
         self.geometry(f"{initial_w}x{initial_h}")
+        # Start maximized while keeping the normal Windows title bar and its
+        # minimize/restore/close buttons available.
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            # Some non-Windows window managers do not support the zoomed state.
+            pass
         self._set_window_icon()
 
         # ── Persisted state ───────────────────────────────────────────
@@ -314,10 +324,15 @@ class ConverterApp(tk.Tk):
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
+        self._prezzi_tab = PrezziTab(notebook)
+        notebook.add(self._prezzi_tab, text="Prezzi")
+
         # Now that Magazino Filato exists, let Situazione auto-fill its
         # "Filato Disponibile" column from it.
         self._situazione_tab.magazino_tab = self._magazino_tab
-        self._situazione_tab.refresh_raw_yarn_match()
+        # The cached table is already visible.  Recalculate the potentially
+        # expensive yarn suggestions only after the first paint, in a worker.
+        self.after(1200, self._situazione_tab.refresh_raw_yarn_match_async)
 
         # ── Overview: built last since it reads from the tabs above, but
         # inserted first so it's the landing page.
@@ -363,7 +378,7 @@ class ConverterApp(tk.Tk):
             # Best-effort: Magazino/LOTTI syncs above run in worker threads,
             # so this may still see slightly-stale data the first time --
             # it'll catch up on the next Situazione refresh regardless.
-            self.after(500, self._situazione_tab.refresh_raw_yarn_match)
+            self.after(500, self._situazione_tab.refresh_raw_yarn_match_async)
 
     def _refresh_magazino_status(self) -> None:
         cache = load_magazino_cache()
@@ -874,6 +889,7 @@ class ConverterApp(tk.Tk):
         data_elvy_selected = top_text == "Data Elvy"
         magazino_selected = selected_top == str(magazino_tab)
         overview_selected = selected_top == str(self._overview_tab)
+        prezzi_selected = selected_top == str(self._prezzi_tab)
 
         situazione_selected = settimana_selected = False
         kamal_selected = ordini_selected = False
@@ -889,7 +905,7 @@ class ConverterApp(tk.Tk):
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
         self._refresh_dfm_status()
-        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected or overview_selected:
+        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected or overview_selected or prezzi_selected:
             self._log_frame.grid_remove()
             self.rowconfigure(1, weight=0)
             self.rowconfigure(0, weight=5)
@@ -1113,6 +1129,8 @@ class ConverterApp(tk.Tk):
         calculator = AbbinaCalculator()
         elvy_mapping = load_elvy_mapping()
         dfm_entries = load_dfm_cache().get("entries", [])
+        prezzi_df = getattr(self._prezzi_tab, "prezzi_df", None)
+        price_lookup = prezzi_logic.build_price_lookup(prezzi_df)
 
         magazino_summary = None
         codes_map = None
@@ -1154,6 +1172,11 @@ class ConverterApp(tk.Tk):
                     )
                     if is_first_time_dyeing(row.articolo_delta, row.coloredfm, dfm_entries):
                         row.check_articolo = "prima volta tint."
+                    finished_articolo = raw_to_finished_articolo(row.articolo_delta)
+                    if finished_articolo:
+                        row.livello, row.prezzo = price_lookup.get(
+                            (finished_articolo, row.coloredfm), (None, None)
+                        )
 
                 calculator.calculate(rows, only_if_missing=True)
                 all_rows.extend(rows)

@@ -147,6 +147,10 @@ class OrderRow:
     # has no prior entry at all in the DFM reference (see dfm_lookup.py's
     # is_first_time_dyeing) -- left "" otherwise.
     check_articolo: str = ""
+    # Livello/Prezzo -- looked up from the Prezzi tab's Listini data by
+    # (finished Articolo, COLOREDFM). None when there's no price match.
+    livello: float | None = None
+    prezzo: float | None = None
 
 
 class ColumnSlot(NamedTuple):

@@ -20,9 +20,9 @@ from lotti_cache import load_lotti_cache, save_lotti_cache
 from magazino_cache import load_magazino_cache, save_magazino_cache
 from utils import logger
 
-COLUMNS = ["articolo", "partita", "mag_rocche", "mag_peso", "lotto"]
+COLUMNS = ["articolo", "titolo", "partita", "mag_rocche", "mag_peso", "lotto"]
 HEADERS = {
-    "articolo": "Articolo", "partita": "Partita", "mag_rocche": "Mag.rocche",
+    "articolo": "Articolo", "titolo": "Titolo", "partita": "Partita", "mag_rocche": "Mag.rocche",
     "mag_peso": "Mag.peso", "lotto": "Lotto",
 }
 
@@ -328,7 +328,13 @@ class MagazinoFilatoTab(ttk.Frame):
         else:
             df = self._base_df.copy()
             df["lotto"] = ""
+        if "titolo" not in df.columns:
+            df["titolo"] = ""
 
+        # A missing Lotto from the left merge must stay visually empty; do
+        # not let pandas' NaN leak into the Treeview, search, or export.
+        if "lotto" in df.columns:
+            df["lotto"] = df["lotto"].fillna("").astype(str).replace({"nan": "", "NaT": ""})
         return df
 
     def _recompute(self):
@@ -350,7 +356,8 @@ class MagazinoFilatoTab(ttk.Frame):
         for idx, r in self.summary_df.iterrows():
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.tree.insert("", "end", values=(
-                r["articolo"], r["partita"], f"{r['mag_rocche']:g}", f"{r['mag_peso']:g}",
+                r["articolo"], r.get("titolo", ""), r["partita"],
+                f"{r['mag_rocche']:g}", f"{r['mag_peso']:g}",
                 r.get("lotto", "") if pd.notna(r.get("lotto", "")) else "",
             ), tags=(tag,))
 
@@ -426,7 +433,10 @@ class MagazinoFilatoTab(ttk.Frame):
         for _, r in self.summary_df.iterrows():
             lotto_val = r.get("lotto", "")
             lotto_val = "" if pd.isna(lotto_val) else lotto_val
-            ws.append([r["articolo"], r["partita"], r["mag_rocche"], r["mag_peso"], lotto_val])
+            ws.append([
+                r["articolo"], r.get("titolo", ""), r["partita"],
+                r["mag_rocche"], r["mag_peso"], lotto_val,
+            ])
             for cell in ws[ws.max_row]:
                 cell.font = Font(name="Arial")
                 cell.alignment = center

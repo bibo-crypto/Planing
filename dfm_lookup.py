@@ -444,6 +444,16 @@ def lookup_dfm_color(
     return _guess_new_colour(colour_code, colour_name, yarn)
 
 
+def raw_to_finished_articolo(articolo_delta) -> str | None:
+    """G170xxxx (raw yarn Articolo Delta) -> C170xxxx (finished Articolo) --
+    the same C<->G swap used throughout (DFM, Listini/Prezzi, raw yarn
+    matching). Returns None when articolo_delta isn't G-prefixed."""
+    a = clean_text(articolo_delta).upper()
+    if a.startswith("G") and len(a) > 1:
+        return "C" + a[1:]
+    return None
+
+
 def is_first_time_dyeing(
     articolo_delta: str, coloredfm: str, entries: list[dict[str, str]]
 ) -> bool:
@@ -462,10 +472,9 @@ def is_first_time_dyeing(
     rather than silently passing.
     """
     coloredfm = clean_text(coloredfm)
-    articolo_delta = clean_text(articolo_delta)
-    if not coloredfm or not articolo_delta.upper().startswith("G"):
+    articolo_c = raw_to_finished_articolo(articolo_delta)
+    if not coloredfm or not articolo_c:
         return True
-    articolo_c = "C" + articolo_delta[1:]
     return not any(
         e["articolo"] == articolo_c and e["coloredfm"] == coloredfm
         for e in entries
