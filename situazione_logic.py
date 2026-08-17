@@ -16,7 +16,7 @@ Verified: this cascade was checked row-by-row against a real "New Situazione"
 sheet (379 rows, 100% match) before being wired in here.
 """
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 from itertools import combinations
 
@@ -129,14 +129,40 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     """
     df = orders_df.copy()
 
+    def _partita_key(series):
+        return series.fillna("").astype(str).str.strip()
+
+    def _bagno_key(series):
+        text = series.fillna("").astype(str).str.strip()
+        digits = text.str.replace(r"\D", "", regex=True).str.lstrip("0")
+        return digits.where(digits.ne(""), text.str.casefold())
+
+    # Keep the left-side row count stable.  ERP exports can contain repeated
+    # references, and merging them blindly would duplicate one colour/order.
+    df["_partita_join"] = _partita_key(df["partita"])
+
     if dfm_df is not None and not dfm_df.empty:
-        df = df.merge(dfm_df[["partita", "mc", "bagno"]], on="partita", how="left")
+        right = dfm_df[["partita", "mc", "bagno"]].copy()
+        right["_partita_join"] = _partita_key(right["partita"])
+        right = right.drop_duplicates("_partita_join", keep="first")
+        df = df.merge(
+            right[["_partita_join", "mc", "bagno"]],
+            on="_partita_join", how="left",
+        ).drop(columns=["_partita_join"])
     else:
+        df = df.drop(columns=["_partita_join"])
         df["mc"] = None
         df["bagno"] = None
 
     if data_prod_df is not None and not data_prod_df.empty:
-        df = df.merge(data_prod_df[["partita", "end_prod"]], on="partita", how="left")
+        right = data_prod_df[["partita", "end_prod"]].copy()
+        right["_partita_join"] = _partita_key(right["partita"])
+        right = right.drop_duplicates("_partita_join", keep="first")
+        df["_partita_join"] = _partita_key(df["partita"])
+        df = df.merge(
+            right[["_partita_join", "end_prod"]],
+            on="_partita_join", how="left",
+        ).drop(columns=["_partita_join"])
     else:
         df["end_prod"] = None
 
@@ -144,17 +170,38 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     df["tinto"] = pd.to_datetime(df["end_prod"], errors="coerce", dayfirst=True)
 
     if copertura_df is not None and not copertura_df.empty:
-        df = df.merge(copertura_df[["bagno", "planedate"]], on="bagno", how="left")
+        right = copertura_df[["bagno", "planedate"]].copy()
+        right["_bagno_join"] = _bagno_key(right["bagno"])
+        right = right.drop_duplicates("_bagno_join", keep="first")
+        df["_bagno_join"] = _bagno_key(df["bagno"])
+        df = df.merge(
+            right[["_bagno_join", "planedate"]],
+            on="_bagno_join", how="left",
+        ).drop(columns=["_bagno_join"])
     else:
         df["planedate"] = None
 
     if qualita_df is not None and not qualita_df.empty:
-        df = df.merge(qualita_df[["partita", "data_qualita"]], on="partita", how="left")
+        right = qualita_df[["partita", "data_qualita"]].copy()
+        right["_partita_join"] = _partita_key(right["partita"])
+        right = right.drop_duplicates("_partita_join", keep="first")
+        df["_partita_join"] = _partita_key(df["partita"])
+        df = df.merge(
+            right[["_partita_join", "data_qualita"]],
+            on="_partita_join", how="left",
+        ).drop(columns=["_partita_join"])
     else:
         df["data_qualita"] = pd.NaT
 
     if uscita_df is not None and not uscita_df.empty:
-        df = df.merge(uscita_df[["partita", "data_uscita"]], on="partita", how="left")
+        right = uscita_df[["partita", "data_uscita"]].copy()
+        right["_partita_join"] = _partita_key(right["partita"])
+        right = right.drop_duplicates("_partita_join", keep="first")
+        df["_partita_join"] = _partita_key(df["partita"])
+        df = df.merge(
+            right[["_partita_join", "data_uscita"]],
+            on="_partita_join", how="left",
+        ).drop(columns=["_partita_join"])
     else:
         df["data_uscita"] = pd.NaT
 
@@ -407,3 +454,49 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
                 result.loc[i] = match_text(raw_articolo, used_partitas)
 
     return result
+
+
+# ----------------------------------------------------------------------
+# Copertura (physical machine coverage) helpers, shared between the
+# Copertura popup window (situazione_tab.py) and the compact machine
+# summary cards on the Overview tab (overview_tab.py) -- kept here as one
+# definition so the two views can never silently drift out of sync.
+# ----------------------------------------------------------------------
+_MACHINE_CODE_RANGE = (3300, 3399)
+_BARE_MACHINE_RE = re.compile(r"(?<!\d)0*(1[0-2]|[3-9])(?:\.0+)?(?!\d)")
+
+
+def machine_number_from_label(value) -> int | None:
+    """
+    Parse a Copertura "Machine" label into a plain machine number (3-12).
+    Accepts either the 3300-series code Delta uses internally (e.g.
+    "3305" -> 5) or a bare number as it might appear in a hand-edited
+    sheet (e.g. "5", "05", "12.0", "M5" -> 5 / 12). Returns None when
+    nothing recognizable is found.
+    """
+    text = clean_text(value)
+    digits = re.sub(r"\D", "", text)
+    if digits and _MACHINE_CODE_RANGE[0] <= int(digits) <= _MACHINE_CODE_RANGE[1]:
+        return int(digits) - _MACHINE_CODE_RANGE[0]
+    match = _BARE_MACHINE_RE.search(text)
+    return int(match.group(1)) if match else None
+
+
+def machine_coverage_until(color_count, today=None) -> str:
+    """
+    "2 colours per day per machine, Friday excluded" -- the date by which
+    *color_count* colours queued on one machine will have been produced,
+    starting from *today* (defaults to the real today). Returns "-" for a
+    falsy/zero count.
+    """
+    if not color_count:
+        return "-"
+    required_days = (int(color_count) + 1) // 2
+    day = today or datetime.now().date()
+    completed = 0
+    while completed < required_days:
+        if day.weekday() != 4:  # Friday
+            completed += 1
+        if completed < required_days:
+            day += timedelta(days=1)
+    return day.strftime("%Y-%m-%d")

@@ -48,6 +48,8 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("Articolo Delta",      "articolo_delta",      "text"),
     ("COLOREDFM",           "coloredfm",           "text"),
     ("CLDESCR",             "cldescr",             "text"),
+    ("Livello",             "livello",              "number"),
+    ("Prezzo",              "prezzo",               "number"),
     ("Article Description", "article_description", "text"),
     ("Yarn",                "yarn",                "text"),
     ("Nm",                  "nm",                  "text"),
@@ -87,8 +89,8 @@ FILATO_TINTURIA_COLUMNS: list[tuple[str, str, str]] = [
     ("Articolo", "articolo", "text"),
     ("Titolo",   "titolo",   "text"),
     ("Partita",  "partita",  "text"),
-    ("Rocce",    "rocce",    "number"),
-    ("Peso",     "peso",     "number"),
+    ("Rocche",   "rocce",    "general"),
+    ("Peso",     "peso",     "general"),
     ("تحضير خام", "label",   "text"),
 ]
 
@@ -105,6 +107,7 @@ CELL_BORDER = Border(
 )
 
 NUMBER_FORMAT = "#,##0.00"
+GENERAL_FORMAT = "General"
 INTEGER_FORMAT = "0"
 DATE_FORMAT = "DD/MM/YYYY"
 TEXT_FORMAT = "@"   # force Excel to treat cell as text
@@ -180,6 +183,13 @@ def write_data(
             elif dtype == "number":
                 cell.value = float(raw_value) if raw_value is not None else None
                 cell.number_format = NUMBER_FORMAT
+                cell.alignment = Alignment(
+                    horizontal="right", vertical="center"
+                )
+
+            elif dtype == "general":
+                cell.value = float(raw_value) if raw_value not in (None, "") else None
+                cell.number_format = GENERAL_FORMAT
                 cell.alignment = Alignment(
                     horizontal="right", vertical="center"
                 )
@@ -333,4 +343,3 @@ class ExcelExporter(_LegacyMethodShims):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-

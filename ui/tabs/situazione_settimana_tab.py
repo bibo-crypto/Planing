@@ -37,6 +37,7 @@ class SettimanaTab(ttk.Frame):
         self._shared_prod_path = ""
         self.batch_weights = pd.DataFrame()
         self._shared_syncing = False
+        self._weekly_calculating = False
 
         self._build_upload_panel()
         self._build_toolbar()
@@ -227,9 +228,54 @@ class SettimanaTab(ttk.Frame):
             logger.warning("Could not update shared Produzione reference: %s", exc)
 
     def _auto_calculate_if_ready(self):
-        """Recalculate and refresh the weekly tree once both files are ready."""
+        """Recalculate automatically without blocking startup or the UI."""
         if "dfm" in self.loaded_frames and "data_prod" in self.loaded_frames:
-            self._on_refresh()
+            self._on_refresh_async()
+
+    def _on_refresh_async(self):
+        if self._weekly_calculating:
+            return
+
+        dfm_df = self.loaded_frames.get("dfm")
+        prod_df = self.loaded_frames.get("data_prod")
+        if dfm_df is None or prod_df is None:
+            return
+
+        dfm_snapshot = dfm_df.copy()
+        prod_snapshot = prod_df.copy()
+        self._weekly_calculating = True
+        self.summary_lbl.config(text="Calculating in background…")
+
+        def worker():
+            try:
+                result = logic.compute_batch_weights(prod_snapshot, dfm_snapshot)
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                result = pd.DataFrame()
+                error = exc
+
+            def apply_result():
+                self._weekly_calculating = False
+                if error:
+                    logger.error("Situazione Settimana: background calculation failed: %s", error)
+                    self.summary_lbl.config(text="Calculation failed")
+                    return
+                if not self.winfo_exists():
+                    return
+                self.batch_weights = result
+                weeks = logic.available_weeks(self.batch_weights)
+                self.week_combo["values"] = ["All"] + [str(w) for w in weeks]
+                if self.week_var.get() not in self.week_combo["values"]:
+                    self.week_var.set("All")
+                logger.info(
+                    "Situazione Settimana: calculated — %d batches across %d week(s)",
+                    len(self.batch_weights), len(weeks),
+                )
+                self._render()
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # -------------------------------------------------------------- refresh
     def _on_refresh(self):

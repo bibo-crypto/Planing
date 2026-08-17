@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from datetime import datetime, timedelta
 
 import pandas as pd
 import openpyxl
@@ -44,6 +43,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from utils import parse_number
+import situazione_logic as business_logic
 
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
 READY_MARK = "pronto da spedire"
@@ -446,13 +446,11 @@ class OverviewTab(ttk.Frame):
                 right["_bagno_key"] = right["bagno"].map(key)
                 joined = left.merge(right[["_bagno_key", "machine"]].drop_duplicates("_bagno_key"), on="_bagno_key", how="inner")
 
-                def machine_number(value):
-                    digits = "".join(ch for ch in str(value) if ch.isdigit())
-                    if digits and 3300 <= int(digits) <= 3399:
-                        return int(digits) - 3300
-                    return None
-
-                joined["_machine_number"] = joined["machine"].map(machine_number)
+                # Same parser the Copertura popup uses (business_logic.
+                # machine_number_from_label) -- kept in one place so a
+                # "5" vs "3305" style label is read identically in both
+                # views instead of silently under-counting here.
+                joined["_machine_number"] = joined["machine"].map(business_logic.machine_number_from_label)
                 valid = joined[joined["_machine_number"].between(3, 12, inclusive="both")]
                 counts.update(valid["_machine_number"].value_counts().to_dict())
 
@@ -465,18 +463,7 @@ class OverviewTab(ttk.Frame):
         self._cards_frame.columnconfigure(1, weight=1)
         self._cards_frame.columnconfigure(2, weight=1)
 
-        def covered_until(color_count):
-            if not color_count:
-                return "-"
-            required_days = (int(color_count) + 1) // 2
-            day = datetime.now().date()
-            completed = 0
-            while completed < required_days:
-                if day.weekday() != 4:  # Friday holiday
-                    completed += 1
-                if completed < required_days:
-                    day += timedelta(days=1)
-            return day.strftime("%Y-%m-%d")
+        covered_until = business_logic.machine_coverage_until
 
         for index, machine in enumerate(range(3, 13)):
             count = int(counts[machine])

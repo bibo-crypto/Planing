@@ -3,3 +3,4 @@ openpyxl==3.1.5
 pypdfium2>=4.30,<5
 pandas>=2.0,<3
 pyinstaller>=6,<7
+xlrd>=2.0.1
