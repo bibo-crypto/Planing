@@ -74,6 +74,7 @@ from magazino_filato_tab import MagazinoFilatoTab
 from kamal_tab import KamalTab
 from ui.tabs.overview_tab import OverviewTab
 from ui.tabs.prezzi_tab import PrezziTab
+from biglietti_tab import BigliettiTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -278,6 +279,10 @@ class ConverterApp(tk.Tk):
         elvy_tab = ttk.Frame(notebook)
         notebook.add(elvy_tab, text="Data Elvy")
         self._build_elvy_tab(elvy_tab)
+
+        # ── Biglietti: ERP order -> ELVY/MED workbook + Word tickets ──
+        self._biglietti_tab = BigliettiTab(notebook, self._prefs, self._save_prefs, logger)
+        notebook.add(self._biglietti_tab, text="Estrazione Ordine")
 
         # ── Ordine: Ordine Elvy + Ordine Kamal, grouped under one parent tab ──
         ordine_parent = ttk.Frame(notebook)
