@@ -87,6 +87,12 @@ a = Analysis(
         'openpyxl.worksheet.worksheet',
         'xlrd',
         'et_xmlfile',
+        # python-docx (Biglietti Word export)
+        'docx',
+        'docx.oxml',
+        'docx.oxml.ns',
+        'lxml',
+        'lxml.etree',
         # pandas C-extension modules are imported dynamically by pandas on
         # some Python/Windows combinations and need explicit registration in
         # the frozen application.
