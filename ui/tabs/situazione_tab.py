@@ -27,6 +27,8 @@ from yarn_shortage_tab import YarnShortageTab
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
+import biglietti_exporter
+from densita_cache import load_densita_cache
 
 STATUS_COLORS = {
     "Filato": "#e0e0e0",
@@ -66,6 +68,8 @@ COLUMN_SPEC = [
     ("titolo", "Titolo", "text"),
     ("codice", "Codice", "number"),
     ("colore", "Colore", "text"),
+    ("prezzo", "Prezzo", "text"),
+    ("densita", "Densita` (360-390)", "number"),
     ("ordine", "Ordine", "text"),
     ("riga", "Riga", "number"),
     ("data", "Data", "date"),
@@ -954,6 +958,16 @@ class SituazioneTab(ttk.Frame):
         self._data_revision += 1
         self._render_tree(self.current_df)
 
+    def refresh_prezzo_densita(self) -> None:
+        """Public hook: re-run the Prezzo/Densita lookup (e.g. after the
+        Densita' Query workbook is uploaded from the Biglietti tab) and
+        re-render, without a full WINCOINT refresh."""
+        if self.current_df.empty:
+            return
+        self._recompute_prezzo_densita()
+        self._data_revision += 1
+        self._render_tree(self.current_df)
+
     def refresh_raw_yarn_match_async(self) -> None:
         """Refresh raw-yarn suggestions after the cached UI is visible."""
         if self.current_df.empty or getattr(self, "_raw_match_syncing", False):
@@ -992,6 +1006,45 @@ class SituazioneTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _recompute_prezzo_densita(self) -> None:
+        """Fill Prezzo (by Articolo+Codice, from the same Listini used by
+        the Biglietti tab's Prezzi source) and Densita`(360-390) (by
+        Partita, from the Densita' Query workbook uploaded on either the
+        Biglietti or Situazione tab -- best-effort, never blocks: blank if
+        the relevant source has not been uploaded yet."""
+        if self.current_df.empty:
+            self.current_df["prezzo"] = ""
+            self.current_df["densita"] = ""
+            return
+        try:
+            price_lookup, _source = biglietti_exporter.load_prezzo_lookup()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Situazione: Prezzo lookup failed: %s", exc)
+            price_lookup = {}
+        densita_map: dict[int, dict] = {}
+        try:
+            cache = load_densita_cache()
+            path = cache.get("source_path")
+            if path and Path(path).is_file():
+                densita_map, _errors = biglietti_exporter.load_densita_query(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Situazione: Densita' Query lookup failed: %s", exc)
+
+        def _prezzo_row(row):
+            return biglietti_exporter.prezzo_for(row.get("articolo", ""), row.get("codice", ""), price_lookup)
+
+        def _densita_row(row):
+            if not densita_map:
+                return ""
+            try:
+                key = int(float(str(row.get("partita", "")).replace(",", ".")))
+            except (TypeError, ValueError):
+                return ""
+            return densita_map.get(key, {}).get("densita", "")
+
+        self.current_df["prezzo"] = self.current_df.apply(_prezzo_row, axis=1)
+        self.current_df["densita"] = self.current_df.apply(_densita_row, axis=1)
+
     def _load_table_from_db(self):
         states = db.get_all_states()
         self.current_df = pd.DataFrame(states.values())
@@ -1002,6 +1055,7 @@ class SituazioneTab(ttk.Frame):
             )
             self.sort_state["bagno"] = False  # next click on Bagno heading reverses to Z-A
         self._recompute_raw_yarn_match()
+        self._recompute_prezzo_densita()
         self._render_tree(self.current_df)
         for callback in tuple(self._table_loaded_callbacks):
             try:
@@ -1367,6 +1421,12 @@ class SituazioneTab(ttk.Frame):
             # Consegna before today (overdue) -> red
             rng = f"{col_letter['consegna']}2:{col_letter['consegna']}{last_row}"
             ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["TODAY()"], fill=red_fill))
+
+            # Densita`(360-390) outside its expected range -> red
+            rng = f"{col_letter['densita']}2:{col_letter['densita']}{last_row}"
+            first = f"{col_letter['densita']}2"
+            formula = f'AND({first}<>"",OR({first}<360,{first}>390))'
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[formula], fill=red_fill))
 
         for key, header, _ctype in COLUMN_SPEC:
             letter = col_letter[key]
