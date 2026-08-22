@@ -58,6 +58,7 @@ SOURCE_BUTTON_NAMES = {
     "uscita": "Uscita",
     "qualita": "Qualita",
     "codes": "Articoli",
+    "listini": "Listini",
 }
 
 # (internal_key, header shown in the app / exported file, cell type)
@@ -111,8 +112,8 @@ class SourceRow(ttk.Frame):
             self,
             text=f"Upload {button_name}",
             command=self._browse,
-            width=15,
-            font=("Segoe UI", 9, "bold"),
+            width=13,
+            font=("Segoe UI", 8, "bold"),
             height=30,
         )
         self.button.grid(row=0, column=0, columnspan=2, padx=4, pady=(3, 2), sticky="ew")
@@ -228,6 +229,11 @@ class SituazioneTab(ttk.Frame):
                                self._handle_codes_upload)
         codes_row.grid(row=0, column=0, padx=3, pady=1, sticky="nw")
         self.codes_row = codes_row
+
+        listini_row = SourceRow(codes_panel, "listini", "Listini (Prezzi) - optional",
+                                 self._handle_listini_upload)
+        listini_row.grid(row=1, column=0, padx=3, pady=1, sticky="nw")
+        self.listini_row = listini_row
 
     def _build_toolbar(self):
         bar = ttk.Frame(self)
@@ -515,6 +521,16 @@ class SituazioneTab(ttk.Frame):
             self._handle_codes_upload("codes", codes_path)
             reloaded.append("Articoli")
 
+        listini_info = uploads.get("listini", {})
+        listini_path = listini_info.get("file_path", "")
+        if not listini_path:
+            missing.append("Listini (not uploaded yet)")
+        elif not os.path.isfile(listini_path):
+            missing.append(f"Listini ({listini_path})")
+        else:
+            self._handle_listini_upload("listini", listini_path)
+            reloaded.append("Listini")
+
         summary = []
         if reloaded:
             summary.append("Reloaded: " + ", ".join(reloaded))
@@ -786,7 +802,11 @@ class SituazioneTab(ttk.Frame):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared Produzione reference: %s", exc)
 
-    def _handle_upload(self, key, path):
+    def _handle_upload(self, key, path, cache_path=None):
+        """cache_path, if given, is what gets persisted/shown instead of
+        path -- used by the Overview 'import everything' button, which
+        loads from a temp extract of the real (master) file."""
+        display_path = cache_path or path
         label, loader_fn = data_loaders.LOADERS[key]
         try:
             df, errors = loader_fn(path)
@@ -797,23 +817,24 @@ class SituazioneTab(ttk.Frame):
         if errors or df is None or df.empty:
             msg = "; ".join(errors) if errors else "The file is empty after filtering"
             self.source_rows[key].set_status(False, f"❌ {msg}")
-            db.save_upload(key, os.path.basename(path), 0, "error", msg, file_path=str(path))
+            db.save_upload(key, os.path.basename(display_path), 0, "error", msg, file_path=str(display_path))
             self.loaded_frames.pop(key, None)
             return
 
         self.loaded_frames[key] = df
         if key == "copertura":
             self._copertura_revision += 1
-        msg = f"✅ {len(df)} rows - {os.path.basename(path)}"
+        msg = f"✅ {len(df)} rows - {os.path.basename(display_path)}"
         self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-        db.save_upload(key, os.path.basename(path), len(df), "ok", msg, file_path=str(path))
+        db.save_upload(key, os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
         if key == "dfm":
-            self._save_shared_dfm(path)
+            self._save_shared_dfm(display_path)
         if key == "data_prod":
-            self._save_shared_prod(path)
-        logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(path))
+            self._save_shared_prod(display_path)
+        logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(display_path))
 
-    def _handle_codes_upload(self, _key, path):
+    def _handle_codes_upload(self, _key, path, cache_path=None):
+        display_path = cache_path or path
         try:
             df, errors = data_loaders.load_codes(path)
         except Exception as exc:  # noqa: BLE001
@@ -826,10 +847,44 @@ class SituazioneTab(ttk.Frame):
             return
 
         db.save_codes(df)
-        msg = f"✅ Saved ({len(df)} codes) - {os.path.basename(path)}"
+        msg = f"✅ Saved ({len(df)} codes) - {os.path.basename(display_path)}"
         self.codes_row.set_status(True, msg)
-        db.save_upload("codes", os.path.basename(path), len(df), "ok", msg, file_path=str(path))
-        logger.info("Situazione: yarn codes reference updated — %d codes (%s)", len(df), os.path.basename(path))
+        db.save_upload("codes", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
+        logger.info("Situazione: yarn codes reference updated — %d codes (%s)", len(df), os.path.basename(display_path))
+
+        # Also feed Biglietti's Marca-based Titolo cache, so uploading
+        # Articoli from either tab benefits both -- best-effort, never
+        # blocks the TITOLO-based save above if this file's Marca column
+        # isn't found.
+        try:
+            import articoli_cache
+            marca_map, _errors = biglietti_exporter.load_articoli_marca_map(Path(path))
+            if marca_map:
+                articoli_cache.save_articoli_cache(display_path)
+        except Exception:
+            pass
+
+    def _handle_listini_upload(self, _key, path, cache_path=None):
+        display_path = cache_path or path
+        try:
+            import prezzi_cache
+            import prezzi_logic
+            df, errors = prezzi_logic.load_prezzi(path)
+        except Exception as exc:  # noqa: BLE001
+            errors = [f"An error occurred while reading the file: {exc}"]
+            df = None
+
+        if errors or df is None or df.empty:
+            msg = "; ".join(errors) if errors else "The file is empty"
+            self.listini_row.set_status(False, f"❌ {msg}")
+            return
+
+        prezzi_cache.save_prezzi_cache(display_path)
+        msg = f"✅ Saved ({len(df)} rows) - {os.path.basename(display_path)}"
+        self.listini_row.set_status(True, msg)
+        db.save_upload("listini", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
+        logger.info("Situazione: Listini (Prezzi) updated — %d rows (%s)", len(df), os.path.basename(display_path))
+        self.refresh_prezzo_densita()
 
     def _refresh_source_labels_from_db(self):
         uploads = db.get_all_uploads()
@@ -853,6 +908,13 @@ class SituazioneTab(ttk.Frame):
             else:
                 self.codes_row.set_status(codes_info["status"] == "ok",
                                            f"✅ Saved ({codes_info.get('row_count', '')} codes)")
+        listini_info = uploads.get("listini")
+        if listini_info:
+            if listini_info["status"] == "ok" and not listini_info.get("file_path"):
+                self.listini_row.set_status(False, "⚠ Saved status only (select once to save path)")
+            else:
+                self.listini_row.set_status(listini_info["status"] == "ok",
+                                             f"✅ Saved ({listini_info.get('row_count', '')} rows)")
 
     # -------------------------------------------------------------- refresh
     def _on_refresh(self, preserve_comment_history=False):

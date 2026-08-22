@@ -341,7 +341,15 @@ class ConverterApp(tk.Tk):
 
         # ── Overview: built last since it reads from the tabs above, but
         # inserted first so it's the landing page.
-        self._overview_tab = OverviewTab(notebook, self._situazione_tab, self._magazino_tab)
+        self._overview_tab = OverviewTab(
+            notebook,
+            self._situazione_tab,
+            self._magazino_tab,
+            biglietti_tab=self._biglietti_tab,
+            prezzi_tab=self._prezzi_tab,
+            save_prefs=self._save_prefs,
+            prefs=self._prefs,
+        )
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
 
@@ -895,6 +903,7 @@ class ConverterApp(tk.Tk):
         magazino_selected = selected_top == str(magazino_tab)
         overview_selected = selected_top == str(self._overview_tab)
         prezzi_selected = selected_top == str(self._prezzi_tab)
+        biglietti_selected = top_text == "Estrazione Ordine" or selected_top == str(self._biglietti_tab)
 
         situazione_selected = settimana_selected = False
         kamal_selected = ordini_selected = False
@@ -910,7 +919,17 @@ class ConverterApp(tk.Tk):
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
         self._refresh_dfm_status()
-        if situazione_selected or settimana_selected or magazino_selected or kamal_selected or data_elvy_selected or ordini_selected or overview_selected or prezzi_selected:
+        if (
+            situazione_selected
+            or settimana_selected
+            or magazino_selected
+            or kamal_selected
+            or data_elvy_selected
+            or ordini_selected
+            or overview_selected
+            or prezzi_selected
+            or biglietti_selected
+        ):
             self._log_frame.grid_remove()
             self.rowconfigure(1, weight=0)
             self.rowconfigure(0, weight=5)

@@ -319,6 +319,9 @@ def load_densita_query(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]
                     continue
                 peso_net = (peso_lord - 45) / 1000 if peso_lord is not None else None
                 out.setdefault(int(partita), {})["peso_net"] = peso_net
+                color_tube = _clean(_get(row, "Colore Tube", "Color Tube"))
+                if color_tube:
+                    out[int(partita)]["color_tube"] = color_tube
         else:
             errors.append('Nel file Densita\' Query.xlsx manca il foglio "Entry" (serve per KG).')
         if "Densita" in wb.sheetnames:
@@ -342,27 +345,34 @@ def load_densita_query(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]
 # different file from the raw-yarn Magazino used elsewhere in the app.
 # ---------------------------------------------------------------------------
 
-def load_color_tube_magazino(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]]:
+def load_vmm22_ratio_from_magazino(path: Path) -> tuple[dict[int, float], list[str]]:
+    """{PARTITA: kg-per-cone} for VMM22, from the same raw Magazino Filato
+    export already uploaded elsewhere in the app (Magazino Filato /
+    Ordine Kamal tabs, cached path in magazino_cache.py) -- no separate
+    upload needed. Per Partita: sum ESISTENZA (kg) and COLLI (cones)
+    across MAGAZZINO 900910, 900160 and 900923, ratio = kg per cone.
+    VMM22 for an order line = that ratio * the line's own Rocche."""
     errors: list[str] = []
-    out: dict[int, dict[str, Any]] = {}
+    totals: dict[int, list[float]] = {}  # partita -> [esistenza_sum, colli_sum]
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
-        ws = wb.active
-        for row in _read_sheet_rows(ws):
-            partita = _number(_get(row, "Partita"))
+        for row in _read_sheet_rows(wb.active):
+            magazzino = _number(_get(row, "MAGAZZINO"))
+            if magazzino not in (900910, 900160, 900923):
+                continue
+            partita = _number(_get(row, "PARTITA"))
             if partita is None:
                 continue
-            qty = _number(_get(row, "Quantita'", "Quantita", "Quantità"))
-            rocche = _number(_get(row, "Rocche"))
-            kg = (qty / rocche) if qty is not None and rocche else None
-            out[int(partita)] = {
-                "color_tube": _clean(_get(row, "Color Tube")),
-                "kg": kg,
-            }
+            esistenza = _number(_get(row, "ESISTENZA")) or 0
+            colli = _number(_get(row, "COLLI")) or 0
+            bucket = totals.setdefault(int(partita), [0.0, 0.0])
+            bucket[0] += esistenza
+            bucket[1] += colli
     finally:
         wb.close()
+    out = {p: (e / c) for p, (e, c) in totals.items() if c}
     if not out:
-        errors.append("Nessuna riga valida trovata nel file Magazino (Color Tube).")
+        errors.append("Nessuna riga valida trovata nel file Magazino Filato per VMM22.")
     return out, errors
 
 
@@ -439,6 +449,45 @@ def _get(row: dict[str, Any], *names: str) -> Any:
     return ""
 
 
+def detect_order_format(data_path: Path) -> str:
+    """'ELVY_MED' or 'EL_KAMAL', by peeking at Sheet1's own header row --
+    lets a single Data Ordine picker serve every customer instead of a
+    separate one per source shape. EL KAMAL's Sheet1 already carries
+    computed columns (CODICE/TITOLO/M-C/Clienti) that ELVY/MED's raw
+    export never has; ELVY/MED's Sheet1 has 'Descrizione aggiuntiva
+    ordine' and a numeric 'Cliente' code that EL KAMAL's never has.
+    Defaults to 'ELVY_MED' if neither signature is conclusive."""
+    wb = openpyxl.load_workbook(data_path, read_only=True)
+    try:
+        if "Sheet1" not in wb.sheetnames:
+            return "ELVY_MED"
+        rows = list(wb["Sheet1"].iter_rows(values_only=True, max_row=1))
+    finally:
+        wb.close()
+    if not rows:
+        return "ELVY_MED"
+    headers = {_key(v) for v in rows[0] if v}
+    el_kamal_signature = {_key("CODICE"), _key("Clienti"), _key("M/C")}
+    elvy_med_signature = {_key("Descrizione aggiuntiva ordine"), _key("Cliente")}
+    if el_kamal_signature.issubset(headers):
+        return "EL_KAMAL"
+    if elvy_med_signature.issubset(headers):
+        return "ELVY_MED"
+    return "EL_KAMAL" if "Doispo-Bagno" not in wb.sheetnames else "ELVY_MED"
+
+
+def load_dispo_bagno_rows(path: Path) -> list[dict[str, Any]]:
+    """Reads a Dispo-Bagno source regardless of shape: a .csv (EL KAMAL's
+    own export), or an .xlsx with the data on its first sheet."""
+    if path.suffix.lower() == ".csv":
+        return _read_dispo_csv(path)
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        return _read_sheet_rows(wb.active)
+    finally:
+        wb.close()
+
+
 def load_order(input_path: Path, dispo_path: Path | None = None) -> tuple[list[OrderRecord], list[dict[str, Any]]]:
     wb = openpyxl.load_workbook(input_path, data_only=True, read_only=True)
     if "Sheet1" not in wb.sheetnames:
@@ -446,9 +495,7 @@ def load_order(input_path: Path, dispo_path: Path | None = None) -> tuple[list[O
     data = _read_sheet_rows(wb["Sheet1"])
     dispo_rows = _read_sheet_rows(wb["Doispo-Bagno"]) if "Doispo-Bagno" in wb.sheetnames else []
     if dispo_path and dispo_path != input_path:
-        dwb = openpyxl.load_workbook(dispo_path, data_only=True, read_only=True)
-        dispo_rows = _read_sheet_rows(dwb.active)
-        dwb.close()
+        dispo_rows = load_dispo_bagno_rows(dispo_path)
     raw_rows = _read_sheet_rows(wb["تحضير خيط خام"]) if "تحضير خيط خام" in wb.sheetnames else []
     if not data:
         raise ValueError("Sheet1 non contiene righe d'ordine.")
@@ -543,7 +590,7 @@ def load_el_kamal_order(data_path: Path, dispo_path: Path | None = None) -> tupl
 
     dispo_by_riga: dict[str, dict[str, Any]] = {}
     if dispo_path and dispo_path.is_file():
-        dispo_rows = _read_dispo_csv(dispo_path) if dispo_path.suffix.lower() == ".csv" else _read_sheet_rows(openpyxl.load_workbook(dispo_path, data_only=True, read_only=True).active)
+        dispo_rows = load_dispo_bagno_rows(dispo_path)
         dispo_by_riga = {
             _dispo_suffix(_get(r, "Dispo")): r
             for r in dispo_rows if _clean(_get(r, "Dispo"))
@@ -595,7 +642,7 @@ def enrich_records(
     customer: str,
     codes_map: dict[str, str] | None = None,
     densita_map: dict[int, dict[str, Any]] | None = None,
-    vmm_map: dict[int, dict[str, Any]] | None = None,
+    vmm_ratio_map: dict[int, float] | None = None,
     price_lookup: dict[tuple, tuple] | None = None,
 ) -> None:
     """Fills in Titolo, Commento, M/C, KG, Densita, Color Tube, VMM22,
@@ -605,7 +652,7 @@ def enrich_records(
     """
     codes_map = codes_map or {}
     densita_map = densita_map or {}
-    vmm_map = vmm_map or {}
+    vmm_ratio_map = vmm_ratio_map or {}
     price_lookup = price_lookup or {}
 
     # --- M/C: group by Bagno, sum Rocche (+ MED Polmoni bonus). EL KAMAL's
@@ -647,14 +694,13 @@ def enrich_records(
             peso_net = entry.get("peso_net")
             r.kg = int(round(peso_net * (_number(r.quantity_cones) or 0))) if peso_net is not None else r.raw_weight
             r.densita = entry.get("densita", "")
+            r.color_tube = entry.get("color_tube", "")
         else:
             r.kg = r.raw_weight
 
-        if batch_key is not None and batch_key in vmm_map:
-            entry = vmm_map[batch_key]
-            r.color_tube = entry.get("color_tube", "")
-            kg_per_cone = entry.get("kg")
-            r.vmm22 = round(kg_per_cone * (_number(r.quantity_cones) or 0), 2) if kg_per_cone is not None else None
+        if batch_key is not None and batch_key in vmm_ratio_map:
+            kg_per_cone = vmm_ratio_map[batch_key]
+            r.vmm22 = round(kg_per_cone * (_number(r.quantity_cones) or 0), 2)
 
         r.prezzo = _prezzo_for(r.article, r.color_code, price_lookup)
 

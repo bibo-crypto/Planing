@@ -500,3 +500,37 @@ def machine_coverage_until(color_count, today=None) -> str:
         if completed < required_days:
             day += timedelta(days=1)
     return day.strftime("%Y-%m-%d")
+
+
+def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
+    """{machine_number (3-12): total_colors_currently_queued}, the same
+    join/aggregation the Copertura window itself uses -- factored out here
+    so a new order's own machine-queue scheduling (Ordine MED) can use the
+    exact same baseline instead of recomputing it separately.
+    Returns {} if either input is missing/empty or nothing matches."""
+    import re as _re
+
+    if situation_df is None or situation_df.empty or copertura_df is None or copertura_df.empty:
+        return {}
+    if "machine" not in copertura_df.columns:
+        return {}
+
+    situation = situation_df.copy()
+    copertura = copertura_df.copy()
+
+    def bagno_key(value):
+        digits = _re.sub(r"\D", "", str(value or "")).lstrip("0")
+        return digits or str(value or "").strip().casefold()
+
+    for frame in (situation, copertura):
+        frame["bagno"] = frame["bagno"].fillna("").astype(str).str.strip()
+        frame["bagno_key"] = frame["bagno"].map(bagno_key)
+    merged = situation.merge(
+        copertura[["bagno_key", "machine"]].drop_duplicates("bagno_key"),
+        on="bagno_key", how="inner",
+    )
+    merged["machine_number"] = merged["machine"].map(machine_number_from_label)
+    merged = merged[merged["machine_number"].between(3, 12, inclusive="both")]
+    if merged.empty:
+        return {}
+    return merged.groupby("machine_number").size().to_dict()
