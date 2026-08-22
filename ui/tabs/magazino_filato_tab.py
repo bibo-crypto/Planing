@@ -211,12 +211,17 @@ class MagazinoFilatoTab(ttk.Frame):
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-    def _on_upload_magazino(self):
+    def _on_upload_magazino(self, path=None, cache_path=None):
+        """cache_path, if given, is what gets persisted/shown instead of
+        path -- used by the Overview 'import everything' button, which
+        loads from a temp extract of the real (master) file."""
         if self._uploading:
             return
-        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+        if path is None:
+            path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if not path:
             return
+        display_path = cache_path or path
         self._uploading = True
         self._btn_magazino.config(state="disabled")
         self.status_var.set("Loading Magazino file…")
@@ -234,7 +239,8 @@ class MagazinoFilatoTab(ttk.Frame):
                 if errors or df is None or df.empty:
                     msg = "; ".join(errors) if errors else "The file is empty after filtering"
                     self.status_var.set(f"❌ {msg}")
-                    messagebox.showerror("Error", msg)
+                    if cache_path is None:
+                        messagebox.showerror("Error", msg)
                     return
 
                 # Raw files need aggregation; app-generated summary files are
@@ -245,23 +251,25 @@ class MagazinoFilatoTab(ttk.Frame):
                     self.magazino_summary = logic.summarize_by_partita(df)
                 self._data_revision += 1
                 self._base_df = self.magazino_summary.copy()
-                self._shared_path = str(path)
-                save_magazino_cache(path, self.magazino_summary)
+                self._shared_path = display_path
+                save_magazino_cache(display_path, self.magazino_summary)
                 if self._on_shared_cache_changed:
                     self._on_shared_cache_changed()
-                self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {os.path.basename(path)}")
+                self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {os.path.basename(display_path)}")
                 logger.info("Magazino Filato: loaded %d batches from %s",
-                            len(self.magazino_summary), os.path.basename(path))
+                            len(self.magazino_summary), os.path.basename(display_path))
                 self._recompute()
 
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_upload_lotti(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+    def _on_upload_lotti(self, path=None, cache_path=None):
+        if path is None:
+            path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if not path:
             return
+        display_path = cache_path or path
         try:
             df, errors = lotti_logic.load_lotti(path)
         except Exception as exc:  # noqa: BLE001
@@ -271,15 +279,16 @@ class MagazinoFilatoTab(ttk.Frame):
         if errors or df is None or df.empty:
             msg = "; ".join(errors) if errors else "The file is empty after filtering"
             self.lotti_status_var.set(f"❌ {msg}")
-            messagebox.showerror("Error", msg)
+            if cache_path is None:
+                messagebox.showerror("Error", msg)
             return
 
         self.lotti_summary = lotti_logic.summarize_by_partita(df)
-        self._shared_lotti_path = str(path)
-        save_lotti_cache(path)
+        self._shared_lotti_path = display_path
+        save_lotti_cache(display_path)
         if self._on_shared_cache_changed:
             self._on_shared_cache_changed()
-        self.lotti_status_var.set(f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {path}")
+        self.lotti_status_var.set(f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {display_path}")
         logger.info("Magazino Filato: loaded %d Lotto entries from %s",
                     len(self.lotti_summary), os.path.basename(path))
         self._recompute()

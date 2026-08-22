@@ -208,10 +208,17 @@ class OverviewTab(ttk.Frame):
 
     AUTO_REFRESH_MS = 5000
 
-    def __init__(self, master, situazione_tab, magazino_tab):
+    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None):
         super().__init__(master)
         self.situazione_tab = situazione_tab
         self.magazino_tab = magazino_tab
+        self.biglietti_tab = biglietti_tab
+        self.prezzi_tab = prezzi_tab
+        self._save_prefs = save_prefs
+        self._prefs = prefs or {}
+        p_dir = self._prefs.get("master_data_dir")
+        self._data_folder = Path(p_dir) if p_dir and Path(p_dir).is_dir() else None
+
         self._data_signature = None
         self._auto_refresh_id = None
         self._build_ui()
@@ -236,10 +243,9 @@ class OverviewTab(ttk.Frame):
 
         toolbar = ttk.Frame(self)
         toolbar.pack(side="top", fill="x", padx=8, pady=(8, 4))
-        ttk.Button(toolbar, text="🔄 Refresh", command=self.refresh).pack(side="left")
-        ttk.Label(toolbar, text="Riepilogo operativo", foreground="#16324f",
-                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=(14, 0))
-        self._lbl_updated = ttk.Label(toolbar, text="", foreground="#667085")
+        ttk.Label(toolbar, text="📊  Operations Overview", foreground="#16324f",
+                  font=("Segoe UI", 14, "bold")).pack(side="left")
+        self._lbl_updated = ttk.Label(toolbar, text="", foreground="#667085", font=("Segoe UI", 9))
         self._lbl_updated.pack(side="right")
 
         outer = ttk.Frame(self)
@@ -267,6 +273,30 @@ class OverviewTab(ttk.Frame):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+
+        # ── Master Data Synchronization Card ──
+        sync_frame = ttk.LabelFrame(self._body, text=" 📂 Master Data Synchronization (Update All Data) ", padding=10)
+        sync_frame.pack(side="top", fill="x", padx=8, pady=(4, 10))
+        sync_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(sync_frame, text="📂  Choose Data Folder...", command=self._on_choose_data_folder, width=24).grid(row=0, column=0, sticky="w", pady=2)
+
+        folder_text = str(self._data_folder) if self._data_folder else "No data folder selected"
+        folder_color = "#111827" if self._data_folder else "grey"
+        self._lbl_folder = ttk.Label(sync_frame, text=folder_text, foreground=folder_color, anchor="w")
+        self._lbl_folder.grid(row=0, column=1, sticky="ew", padx=(10, 10), pady=2)
+
+        self._btn_sync = ttk.Button(sync_frame, text="🔄  Update All Data", command=self._on_sync_all_data, width=20)
+        self._btn_sync.grid(row=0, column=2, sticky="e", pady=2)
+
+        sec_row = ttk.Frame(sync_frame)
+        sec_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        sec_row.columnconfigure(1, weight=1)
+
+        ttk.Button(sec_row, text="📄  Import Master Excel File...", command=self._on_import_master, width=28).grid(row=0, column=0, sticky="w")
+
+        self._lbl_sync_status = ttk.Label(sec_row, text="● Ready to sync", foreground="#2E7D32", font=("Segoe UI", 9))
+        self._lbl_sync_status.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
         self._cards_frame = ttk.Frame(self._body)
         self._cards_frame.pack(side="top", fill="x", padx=8, pady=(4, 10))
@@ -304,6 +334,114 @@ class OverviewTab(ttk.Frame):
             getattr(self.situazione_tab, "_copertura_revision", 0),
             getattr(self.magazino_tab, "_data_revision", 0),
         )
+
+    def _on_choose_data_folder(self) -> None:
+        from tkinter import filedialog, messagebox
+        initial = str(self._data_folder) if self._data_folder else None
+        path = filedialog.askdirectory(
+            title="Select Data Folder containing factory files (Articoli, DFM, WINCOINT, etc.)",
+            initialdir=initial,
+        )
+        if not path:
+            return
+        self._data_folder = Path(path)
+        self._lbl_folder.config(text=str(path), foreground="#111827")
+        if self._save_prefs:
+            self._save_prefs(master_data_dir=str(path))
+        if messagebox.askyesno("Sync Now?", f"Data folder selected:\n{path}\n\nDo you want to update and distribute all data files now?"):
+            self._on_sync_all_data()
+
+    def _on_sync_all_data(self) -> None:
+        from tkinter import messagebox
+        if not self._data_folder or not self._data_folder.is_dir():
+            self._on_choose_data_folder()
+            if not self._data_folder or not self._data_folder.is_dir():
+                return
+
+        self._btn_sync.config(state="disabled")
+        self._lbl_sync_status.config(text="⏳ Synchronizing all factory files in background...", foreground="#1565C0")
+
+        import threading
+        import master_import
+
+        def worker():
+            try:
+                loaded, skipped = master_import.import_master_directory(
+                    self._data_folder,
+                    self.situazione_tab,
+                    self.magazino_tab,
+                    self.biglietti_tab,
+                    self.prezzi_tab,
+                )
+                err = None
+            except Exception as exc:  # noqa: BLE001
+                loaded, skipped, err = [], [], str(exc)
+
+            def apply_result():
+                self._btn_sync.config(state="normal")
+                if err:
+                    self._lbl_sync_status.config(text=f"✖ Sync error: {err}", foreground="#C62828")
+                    messagebox.showerror("Sync Failed", f"Failed to sync data folder:\n{err}")
+                    return
+
+                now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._lbl_sync_status.config(text=f"✔ Synced ({len(loaded)} sources) at {now_str}", foreground="#2E7D32")
+                self._lbl_updated.config(text=f"Last sync: {now_str}")
+
+                msg_parts = []
+                if loaded:
+                    msg_parts.append("✅ Successfully Loaded & Distributed:\n" + "\n".join(f"  • {item}" for item in loaded))
+                if skipped:
+                    msg_parts.append("\n⚠️ Missing / Not Found in Folder:\n" + "\n".join(f"  • {item}" for item in skipped))
+
+                summary = "\n".join(msg_parts) if msg_parts else "No recognized files found in folder."
+                messagebox.showinfo("Data Synchronization Complete", summary)
+                self.refresh(force=True)
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_import_master(self) -> None:
+        from tkinter import filedialog, messagebox
+        path = filedialog.askopenfilename(
+            title="Select Master Excel File containing sheets (DFM, Copertura, Produzione, WINCOINT, etc.)",
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+        )
+        if not path:
+            return
+
+        import threading
+        import master_import
+
+        def worker():
+            try:
+                loaded, skipped = master_import.import_master_file(
+                    path,
+                    self.situazione_tab,
+                    self.magazino_tab,
+                    self.biglietti_tab,
+                    self.prezzi_tab,
+                )
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                loaded, skipped, error = [], [], str(exc)
+
+            def apply_result():
+                if error:
+                    messagebox.showerror("Import Failed", error)
+                    return
+                msg_parts = []
+                if loaded:
+                    msg_parts.append("✅ Loaded: " + ", ".join(loaded))
+                if skipped:
+                    msg_parts.append("⚠️ Not found in file: " + ", ".join(skipped))
+                messagebox.showinfo("Master File Import", "\n\n".join(msg_parts) or "No sheets recognized in file.")
+                self.refresh(force=True)
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh(self, force: bool = False) -> None:
         signature = self._current_data_signature()
