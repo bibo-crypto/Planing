@@ -388,6 +388,20 @@ class OverviewTab(ttk.Frame):
                 self._lbl_sync_status.config(text=f"✔ Synced ({len(loaded)} sources) at {now_str}", foreground="#2E7D32")
                 self._lbl_updated.config(text=f"Last sync: {now_str}")
 
+                # The individual _handle_upload/_on_upload_magazino calls
+                # inside import_master_directory populate each tab's
+                # in-memory frames and caches, but Situazione's own table
+                # (compute_situation + its Treeview) only recomputes when
+                # its own Refresh runs -- do that now too, silently, if
+                # every source it needs actually came through this sync.
+                try:
+                    st = self.situazione_tab
+                    required = {"wincoint", "dfm", "data_prod", "copertura", "uscita", "qualita"}
+                    if st is not None and required.issubset(getattr(st, "loaded_frames", {}).keys()):
+                        st._on_refresh()
+                except Exception:
+                    pass
+
                 msg_parts = []
                 if loaded:
                     msg_parts.append("✅ Successfully Loaded & Distributed:\n" + "\n".join(f"  • {item}" for item in loaded))

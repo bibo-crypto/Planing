@@ -85,30 +85,90 @@ def _match_sheets(sheetnames: list[str]) -> dict[str, str]:
 
 
 def find_files_in_directory(dir_path: str | Path) -> dict[str, Path]:
-    """Scan *dir_path* and map each known source key to its matching file Path."""
+    """Scan *dir_path* and map each known source key to its matching file
+    Path. Real export filenames are rarely the bare candidate name (e.g.
+    'Densita__Query.xlsx', 'DFM Agosto 2026.xlsx') so this matches by
+    substring, not exact equality -- exact matches are preferred first
+    (across every file) before falling back to substring matches, and a
+    file already claimed by one key isn't offered to another."""
     dir_path = Path(dir_path)
     if not dir_path.is_dir():
         return {}
 
-    found: dict[str, Path] = {}
     valid_extensions = {".xlsx", ".xls", ".xlsm", ".csv"}
     files = [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in valid_extensions]
+    file_norms = [(f, _norm(f.stem)) for f in files]
 
-    for key, candidates in DIRECTORY_FILE_CANDIDATES.items():
-        matched_file: Path | None = None
-        for candidate in candidates:
-            cand_norm = _norm(candidate)
-            for f in files:
-                f_norm = _norm(f.stem)
-                if f_norm == cand_norm or _norm(f.name) == cand_norm:
-                    matched_file = f
+    found: dict[str, Path] = {}
+    claimed: set[Path] = set()
+
+    def try_match(exact: bool) -> None:
+        for key, candidates in DIRECTORY_FILE_CANDIDATES.items():
+            if key in found:
+                continue
+            for candidate in candidates:
+                cand_norm = _norm(candidate)
+                for f, f_norm in file_norms:
+                    if f in claimed:
+                        continue
+                    hit = (f_norm == cand_norm) if exact else (cand_norm in f_norm)
+                    if hit:
+                        found[key] = f
+                        claimed.add(f)
+                        break
+                if key in found:
                     break
-            if matched_file is not None:
-                break
-        if matched_file is not None:
-            found[key] = matched_file
+
+    try_match(exact=True)
+    try_match(exact=False)
+
+    # data_ordine / dispo_bagno filenames are inherently order-specific
+    # (e.g. 'MED-D-505449-2026.xlsx') so keyword matching rarely finds
+    # them -- fall back to peeking at content shape for whatever files
+    # are still unclaimed.
+    if "data_ordine" not in found or "dispo_bagno" not in found:
+        _content_match_ordine_files(files, claimed, found)
 
     return found
+
+
+def _content_match_ordine_files(files: list[Path], claimed: set[Path], found: dict[str, Path]) -> None:
+    import csv as _csv
+
+    for f in files:
+        if f in claimed:
+            continue
+        try:
+            if f.suffix.lower() == ".csv":
+                if "dispo_bagno" in found:
+                    continue
+                with open(f, encoding="utf-8-sig", newline="") as fh:
+                    sample = fh.readline()
+                if _norm("Dispo") in _norm(sample) and _norm("Articolo") in _norm(sample):
+                    found["dispo_bagno"] = f
+                    claimed.add(f)
+                continue
+
+            wb = openpyxl.load_workbook(f, read_only=True)
+            try:
+                sheetnames = set(wb.sheetnames)
+                if "data_ordine" not in found and "Sheet1" in sheetnames:
+                    header = {_norm(v) for v in next(wb["Sheet1"].iter_rows(values_only=True), []) if v}
+                    signature = {_norm("Descrizione aggiuntiva ordine"), _norm("Cliente")}
+                    el_kamal_signature = {_norm("CODICE"), _norm("Clienti"), _norm("M/C")}
+                    if signature.issubset(header) or el_kamal_signature.issubset(header):
+                        found["data_ordine"] = f
+                        claimed.add(f)
+                        continue
+                if "dispo_bagno" not in found and "Doispo-Bagno" in sheetnames:
+                    # already embedded in a Data Ordine file -- nothing
+                    # separate to assign, so leave dispo_bagno unmatched
+                    # rather than pointing it at the same file twice.
+                    pass
+            finally:
+                wb.close()
+        except Exception:
+            continue
 
 
 def _extract_sheet_to_temp(master_path: str, sheet_name: str) -> str:

@@ -62,6 +62,7 @@ class OrdiniElvyRow:
     sigla_dispo: str = SIGLA_DISPO_CODE
     bagno_proposto: str = ""
     macchina: int | None = None
+    reference_to: str = ""
 
 
 def _to_c_code(articolo_delta: str) -> str:
@@ -105,6 +106,9 @@ def build_ordini_elvy_rows(rows: list[OrderRow]) -> list[OrdiniElvyRow]:
     for r in rows:
         year = _extract_year(r.po_date)
         commento = f"PG-X-PO-{clean_text(r.pod_no)}-{year}" if year else f"PG-X-PO-{clean_text(r.pod_no)}"
+        reference_to = clean_text(r.reference_to)
+        if reference_to:
+            commento = f"{commento}-ref.{reference_to}"
 
         out.append(OrdiniElvyRow(
             articolo_delta=_to_c_code(r.articolo_delta),
@@ -114,6 +118,7 @@ def build_ordini_elvy_rows(rows: list[OrderRow]) -> list[OrdiniElvyRow]:
             commento=commento,
             data_riconsegna=data_riconsegna_dt,
             macchina=_machine_code_for_abbina(r.abbina),
+            reference_to=reference_to,
         ))
     return out
 
@@ -140,6 +145,7 @@ _HEADER_TO_ATTR = {
     "sigla disposizione": "sigla_dispo",
     "bagno preposto": "bagno_proposto",
     "gruppo macchina": "macchina",
+    "reference to": "reference_to",
 }
 
 

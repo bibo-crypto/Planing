@@ -57,6 +57,7 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("Dye Type",            "dye_type",            "text"),
     ("Lot",                 "lot",                 "text"),
     ("Colour",              "colour",              "text"),
+    ("Reference to",        "reference_to",        "text"),
     ("Quantity /Cones",     "quantity_cones",      "number"),
     ("Abbina",              "abbina",              "text"),
     ("Quantity /Kg",        "quantity_kg",         "number"),

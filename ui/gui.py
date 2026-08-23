@@ -72,6 +72,7 @@ from situazione_tab import SituazioneTab
 from situazione_settimana_tab import SettimanaTab
 from magazino_filato_tab import MagazinoFilatoTab
 from kamal_tab import KamalTab
+from ui.tabs.ordine_med_tab import OrdineMedTab
 from ui.tabs.overview_tab import OverviewTab
 from ui.tabs.prezzi_tab import PrezziTab
 from biglietti_tab import BigliettiTab
@@ -297,6 +298,12 @@ class ConverterApp(tk.Tk):
         self._kamal_tab = KamalTab(ordine_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         ordine_notebook.add(self._kamal_tab, text="Ordine Kamal")
 
+        self._ordine_med_tab = OrdineMedTab(
+            ordine_notebook, situazione_tab=None, prefs=self._prefs,
+            save_prefs=self._save_prefs, logger=logger,
+        )
+        ordine_notebook.add(self._ordine_med_tab, text="Ordine Med")
+
         # ── Invoice: Bolla Med + Invoice Elvy, grouped under one parent tab ──
         invoice_parent = ttk.Frame(notebook)
         notebook.add(invoice_parent, text="Invoice")
@@ -325,6 +332,10 @@ class ConverterApp(tk.Tk):
 
         self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         situazione_notebook.add(self._settimana_tab, text="Situazione Settimanale")
+
+        # Ordine Med's Consegna auto-scheduling needs Situazione's live
+        # current_df + Copertura data, which doesn't exist until now.
+        self._ordine_med_tab._situazione_tab = self._situazione_tab
 
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
@@ -906,7 +917,7 @@ class ConverterApp(tk.Tk):
         biglietti_selected = top_text == "Estrazione Ordine" or selected_top == str(self._biglietti_tab)
 
         situazione_selected = settimana_selected = False
-        kamal_selected = ordini_selected = False
+        kamal_selected = ordini_selected = ordine_med_selected = False
         if top_text == "Situazione":
             inner = situazione_notebook.select()
             situazione_selected = inner == str(situazione_tab)
@@ -915,6 +926,7 @@ class ConverterApp(tk.Tk):
             inner_text = ordine_notebook.tab(ordine_notebook.select(), "text")
             kamal_selected = inner_text == "Ordine Kamal"
             ordini_selected = inner_text == "Ordine Elvy"
+            ordine_med_selected = inner_text == "Ordine Med"
         # Do not trigger heavy shared-file loading while switching tabs.
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
@@ -926,6 +938,7 @@ class ConverterApp(tk.Tk):
             or kamal_selected
             or data_elvy_selected
             or ordini_selected
+            or ordine_med_selected
             or overview_selected
             or prezzi_selected
             or biglietti_selected

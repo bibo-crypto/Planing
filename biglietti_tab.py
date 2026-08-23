@@ -49,6 +49,9 @@ class BigliettiTab(ttk.Frame):
     def _build(self):
         self.columnconfigure(0, weight=1)
 
+        style = ttk.Style(self)
+        style.configure("Bold.TButton", font=("Segoe UI", 10, "bold"))
+
         # ── Header banner ──
         header_frame = ttk.Frame(self)
         header_frame.pack(fill="x", padx=4, pady=(0, 10))
@@ -124,6 +127,7 @@ class BigliettiTab(ttk.Frame):
             text="⚡  Convert & Generate Tickets (Excel + Word)",
             command=self._run_convert,
             width=42,
+            style="Bold.TButton",
         )
         self.convert_btn.pack(side="top", anchor="w", pady=(0, 8))
 
@@ -217,30 +221,40 @@ class BigliettiTab(ttk.Frame):
         p = self._pick_file("Select Articoli.xlsx")
         if not p:
             return
+
+        import biglietti_exporter
         try:
-            import biglietti_exporter
             marca_map, marca_errors = biglietti_exporter.load_articoli_marca_map(Path(p))
         except Exception as exc:  # noqa: BLE001
-            self._logger.exception("Articoli (Marca) upload failed")
-            messagebox.showerror("Articles Error", str(exc))
-            return
-        if not marca_map:
-            messagebox.showerror("Articles Error", "; ".join(marca_errors) if marca_errors else "Invalid file.")
-            return
-        save_articoli_cache(p)
-        self.articoli_path = Path(p)
-        msg = f"{len(marca_map)} articles (Brand/Marca) loaded from {Path(p).name}"
+            self._logger.exception("Articoli (Marca) read failed")
+            marca_map, marca_errors = {}, [str(exc)]
 
         try:
             import situazione_db
             import situazione_loaders
-            df, _errors = situazione_loaders.load_codes(p)
-            if df is not None:
-                situazione_db.save_codes(df)
-                msg += f" (and {len(df)} rows shared with Situation)"
-        except Exception:
-            pass
+            titolo_df, titolo_errors = situazione_loaders.load_codes(p)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("Articoli (TITOLO) read failed")
+            titolo_df, titolo_errors = None, [str(exc)]
 
+        # A file only needs to match ONE of the two shapes (Articolo Filato
+        # + Marca, or Articolo Filato + TITOLO) to be usable -- a file
+        # missing 'Marca' is not an error, it just won't feed the richer
+        # Titolo lookup. Only fail if NEITHER shape matched.
+        if not marca_map and not titolo_df:
+            errors = marca_errors + (titolo_errors or [])
+            messagebox.showerror("Articles Error", "; ".join(errors) if errors else "Invalid file: no recognizable Articolo Filato column found.")
+            return
+
+        self.articoli_path = Path(p)
+        parts = []
+        if marca_map:
+            save_articoli_cache(p)
+            parts.append(f"{len(marca_map)} articles (Brand/Marca)")
+        if titolo_df is not None and not titolo_df.empty:
+            situazione_db.save_codes(titolo_df)
+            parts.append(f"{len(titolo_df)} rows shared with Situation")
+        msg = " + ".join(parts) + f" loaded from {Path(p).name}"
         self.articoli_label.config(text=msg, foreground="#111827")
 
     def _pick_densita(self):
@@ -351,6 +365,9 @@ class BigliettiTab(ttk.Frame):
                 export_word(docx, template, records, stem=stem)
                 created_items.append(f"• EL KAMAL: {len(records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
 
+                if self.filato_enabled.get():
+                    created_items.append("• Raw Yarn (Filato): EL KAMAL's order data doesn't include a raw-yarn sheet, so nothing was generated for it.")
+
             else:
                 records, raw = load_order(self.data_path, self.dispo_path)
 
@@ -382,8 +399,13 @@ class BigliettiTab(ttk.Frame):
 
                 # Process Raw Yarn (Filato x Tinturia) if enabled
                 if self.filato_enabled.get():
-                    if raw:
+                    if not self.filato_output_dir:
+                        created_items.append("• Raw Yarn (Filato): no output folder was set, so it was skipped.")
+                    elif not raw:
+                        created_items.append("• Raw Yarn (Filato): the selected Order Data has no raw-yarn sheet (تحضير خيط خام), so nothing was generated.")
+                    else:
                         out_dir = Path(self.filato_output_dir)
+                        out_dir.mkdir(parents=True, exist_ok=True)
                         filato_file = out_dir / f"{self.data_path.stem}_Filato.xlsx"
                         export_filato_workbook(filato_file, raw)
                         created_items.append(f"• Raw Yarn (Filato): {filato_file.name}\n   ↳ Saved to: {filato_file}")
