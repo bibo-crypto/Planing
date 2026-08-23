@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -287,6 +287,56 @@ def load_prezzo_lookup() -> tuple[dict[tuple, tuple], str]:
     return prezzi_logic.build_price_lookup(df), cache.get("source_file", "")
 
 
+# ---------------------------------------------------------------------------
+# Delivery Date (ELVY only) -- how many working days out an order is quoted,
+# based on whether the raw batch/yarn is already assigned (Partita GG) and
+# whether it's already priced (Prezzo), plus which machine tier it's on.
+# Working days skip Friday (pushed to Saturday if a computed date lands on
+# one) -- matches the 'AddDaysSkipFriday' Power Query logic exactly.
+# ---------------------------------------------------------------------------
+_DELIVERY_MACHINES_LONG = {7, 8, 9, 10, 11, 12}
+_DELIVERY_MACHINES_MED = {3, 4, 5, 6}
+
+
+def _add_days_skip_friday(start_date, days_to_add: int):
+    target = start_date + timedelta(days=days_to_add)
+    if target.weekday() == 4:  # Friday
+        target += timedelta(days=1)
+    return target
+
+
+def _compute_delivery_date(raw_batch: Any, prezzo: Any, machine: Any, today=None) -> Any:
+    if not _clean(raw_batch):
+        return "Bending for yarn"
+    today = today or datetime.now().date()
+    try:
+        mc = int(_number(machine))
+    except (TypeError, ValueError):
+        mc = None
+    has_prezzo = prezzo not in (None, "")
+    if not has_prezzo:
+        if mc in _DELIVERY_MACHINES_LONG:
+            days = 24
+        elif mc in _DELIVERY_MACHINES_MED:
+            days = 16
+        else:
+            days = 8
+    else:
+        if mc in _DELIVERY_MACHINES_LONG:
+            days = 16
+        elif mc in _DELIVERY_MACHINES_MED:
+            days = 8
+        else:
+            days = 0
+    return _add_days_skip_friday(today, days)
+
+
+def compute_delivery_date(records: list["OrderRecord"]) -> None:
+    today = datetime.now().date()
+    for r in records:
+        r.delivery_date = _compute_delivery_date(r.raw_batch, r.prezzo, r.machine, today)
+
+
 def _prezzo_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> Any:
     if not lookup:
         return ""
@@ -405,6 +455,7 @@ class OrderRecord:
     color_tube: str = ""
     vmm22: float | int | None = None
     prezzo: Any = ""
+    delivery_date: Any = ""
 
 
 def _read_sheet_rows(ws) -> list[dict[str, Any]]:
@@ -704,6 +755,9 @@ def enrich_records(
 
         r.prezzo = _prezzo_for(r.article, r.color_code, price_lookup)
 
+    if customer == "ELVY":
+        compute_delivery_date(records)
+
 
 def _filato_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
@@ -742,7 +796,7 @@ def export_workbook(
         # just left blank.
         headers = common
     else:
-        headers = common + extra_cols
+        headers = common + ["Delivery Date"] + extra_cols
     ws.append(headers)
     for r in records:
         row = [r.dispo, r.article, r.title, r.formato, r.order_no, r.color_code, r.color_name,
@@ -754,7 +808,7 @@ def export_workbook(
         elif customer == "EL_KAMAL":
             pass
         else:
-            row += [r.color_tube, r.vmm22, r.prezzo, r.densita]
+            row += [r.delivery_date, r.color_tube, r.vmm22, r.prezzo, r.densita]
         ws.append(row)
     if include_filato:
         fws = wb.create_sheet("Filato x Tinturia")
@@ -765,7 +819,7 @@ def export_workbook(
         _style_sheet(fws)
     _style_sheet(
         ws,
-        date_columns=("Consegna",),
+        date_columns=("Consegna", "Delivery Date"),
         duplicate_highlight_columns=("Bagno",),
         range_highlight_columns={"Densita` (360-390)": (360, 390)},
     )

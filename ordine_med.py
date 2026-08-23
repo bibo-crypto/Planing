@@ -78,6 +78,8 @@ class OrdineMedRow:
     consegna: Any = None
     prezzo: Any = ""
     livello: Any = ""
+    check_articolo: str = ""
+    prezzo_plus2: Any = ""
 
 
 def load_ordine(path: Path) -> list[OrdineMedRow]:
@@ -225,6 +227,55 @@ def compute_prezzo(records: list[OrdineMedRow], price_lookup: dict[tuple, tuple]
             r.livello, r.prezzo = price_lookup[key]
 
 
+# Machines (by their Rocche-based M/C total) that get a $2 surcharge.
+PREZZO_SURCHARGE_MACHINES = {56, 32, 24}
+
+
+def compute_prezzo_plus2(records: list[OrdineMedRow]) -> None:
+    """PREZZO + 2$ column: +2 on top of Prezzo for the 3 specific machine
+    sizes (56/32/24 Rocche), otherwise the same price carried over as-is."""
+    for r in records:
+        if isinstance(r.prezzo, (int, float)) and r.mc in PREZZO_SURCHARGE_MACHINES:
+            r.prezzo_plus2 = round(r.prezzo + 2, 2)
+        else:
+            r.prezzo_plus2 = r.prezzo
+
+
+def load_dfm_articolo_colore(path: Path) -> set[tuple[str, str]]:
+    """{(ARTICOLODFM, COLOREDFM)} pairs seen historically in the DFM
+    export -- read from the raw DFM sheet directly (not the simplified
+    situazione_loaders.load_dfm, which drops the color column), so 'Check
+    Articolo' can tell a genuinely new Articolo+Colore combination from one
+    that's simply missing a color code."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        sheet = "DFM" if "DFM" in wb.sheetnames else wb.sheetnames[0]
+        rows = _read_sheet_rows(wb[sheet])
+    finally:
+        wb.close()
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        art = _clean(_get(row, "ARTICOLODFM", "Articolo")).upper()
+        col = _clean(_get(row, "COLOREDFM", "Colore"))
+        if art:
+            pairs.add((art, col))
+    return pairs
+
+
+def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str, str]]) -> None:
+    """'NEW' when this Articolo+Colore combination has never been dyed
+    before (not found in DFM). Left blank rather than defaulting to 'NEW'
+    when no DFM data is available at all, to avoid flagging everything
+    as new just because the source wasn't provided."""
+    if not dfm_pairs:
+        for r in records:
+            r.check_articolo = ""
+        return
+    for r in records:
+        key = (r.articolo.upper(), r.colore)
+        r.check_articolo = "" if key in dfm_pairs else "NEW"
+
+
 # ---------------------------------------------------------------------------
 # Availability / shortage check (the PT-GG query) -- group the order by
 # (Articolo, Titolo, PT GRG) summing Rocche, join against Filato
@@ -309,7 +360,9 @@ def compute_filato_availability(
 # (the availability/shortage table).
 # ---------------------------------------------------------------------------
 
-ORDINE_DA_CREARE_HEADERS = [
+# The full field set, used to build the system-import slice
+# ("Dati sistema", CLIENTE..GRUPPO MACCHINA).
+FULL_ROW_HEADERS = [
     "Riga", "CLIENTE", "ARTICOLO", "COLORE", "Q.TA", "CONSEGNA", "COMMENTO",
     "LAVORANTE", "LAV. SUCC", "DATA RICONSEGNA", "MAG. GREGGIO",
     "SIGLA DISPOSIZONE", "BAGNO PREPOSTO", "GRUPPO MACCHINA",
@@ -319,18 +372,38 @@ ORDINE_DA_CREARE_HEADERS = [
 
 # The system-import slice: CLIENTE .. GRUPPO MACCHINA (columns B-N in the
 # reference sheet's own layout, "Riga" excluded).
-SYSTEM_IMPORT_HEADERS = ORDINE_DA_CREARE_HEADERS[1:14]
+SYSTEM_IMPORT_HEADERS = FULL_ROW_HEADERS[1:14]
+
+# "Ordine da creare"'s own display columns -- CLIENTE, COMMENTO and the
+# fixed ERP constants (LAVORANTE..GRUPPO MACCHINA) live only in "Dati
+# sistema" now; this sheet adds Check Articolo (after M/C) and
+# PREZZO + 2$ (after PREZZO) instead.
+ORDINE_DA_CREARE_HEADERS = [
+    "Riga", "ARTICOLO", "COLORE", "Q.TA", "CONSEGNA", "DATA RICONSEGNA",
+    "TITOLO", "DESCR COL", "LIVELLO", "ABBIN", "M/C", "Check Articolo",
+    "PREZZO", "PREZZO + 2$",
+    "PT GRG", "PT MED", "POLMONI", "Cliente MED", "NOTA grg", "NOTA col",
+]
 
 FILATO_AVAILABILITY_HEADERS = [
     "Articolo", "Titolo", "PT GRG", "Rocche", "Kg", "Mag. Rocche", "Manca", "Disponibilita'",
 ]
 
 
-def _ordine_da_creare_row(r: OrdineMedRow) -> list[Any]:
-    return [
+def _full_row(r: OrdineMedRow) -> dict[str, Any]:
+    return dict(zip(FULL_ROW_HEADERS, [
         r.riga, r.cliente, r.articolo, r.colore, r.rocc, r.consegna, r.commento,
         "900901", "900161", r.data_riconsegna, "900923", "D", "", r.gruppo_macchina,
         r.titolo, r.descr_col, r.livello, r.abbin, r.mc, r.prezzo,
+        r.pt_grg, r.pt_med, r.polmoni, r.cliente_note, r.nota_grg, r.nota_col,
+    ]))
+
+
+def _ordine_da_creare_row(r: OrdineMedRow) -> list[Any]:
+    return [
+        r.riga, r.articolo, r.colore, r.rocc, r.consegna, r.data_riconsegna,
+        r.titolo, r.descr_col, r.livello, r.abbin, r.mc, r.check_articolo,
+        r.prezzo, r.prezzo_plus2,
         r.pt_grg, r.pt_med, r.polmoni, r.cliente_note, r.nota_grg, r.nota_col,
     ]
 
@@ -341,6 +414,8 @@ def export_ordine_med_workbook(
     availability: list[FilatoAvailabilityRow],
 ) -> None:
     from openpyxl import Workbook
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import PatternFill
     from biglietti_exporter import _style_sheet
 
     wb = Workbook()
@@ -351,11 +426,12 @@ def export_ordine_med_workbook(
     for r in records:
         ws.append(_ordine_da_creare_row(r))
     _style_sheet(ws, date_columns=("CONSEGNA", "DATA RICONSEGNA"))
+    _style_ordine_da_creare_extras(ws)
 
-    ws2 = wb.create_sheet("Dati sistema (CLIENTE-GRUPPO MACCHINA)")
+    ws2 = wb.create_sheet("Dati sistema (B-N)")
     ws2.append(SYSTEM_IMPORT_HEADERS)
     for r in records:
-        full = dict(zip(ORDINE_DA_CREARE_HEADERS, _ordine_da_creare_row(r)))
+        full = _full_row(r)
         ws2.append([full[h] for h in SYSTEM_IMPORT_HEADERS])
     _style_sheet(ws2, date_columns=("CONSEGNA", "DATA RICONSEGNA"))
 
@@ -363,10 +439,8 @@ def export_ordine_med_workbook(
     ws3.append(FILATO_AVAILABILITY_HEADERS)
     for a in availability:
         ws3.append([a.articolo, a.titolo, a.pt_grg, a.rocche, a.kg, a.mag_rocche, a.manca, a.disponibilita])
-    _style_sheet(ws3, range_highlight_columns=None)
+    _style_sheet(ws3)
     # Highlight shortages (Disponibilita' = NO) in red.
-    from openpyxl.formatting.rule import FormulaRule
-    from openpyxl.styles import PatternFill
     if ws3.max_row > 1:
         red_fill = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")
         rng = f"A2:H{ws3.max_row}"
@@ -377,3 +451,47 @@ def export_ordine_med_workbook(
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
     wb.close()
+
+
+def _style_ordine_da_creare_extras(ws) -> None:
+    """The bespoke formatting "Ordine da creare" needs beyond the shared
+    _style_sheet borders/banding: Check Articolo highlighted red when
+    'NEW', LIVELLO solid red throughout, ABBIN duplicates highlighted
+    green, and the PREZZO + 2$ header given a distinct fill so it reads
+    as a derived column rather than raw input."""
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Font, PatternFill
+
+    header = [c.value for c in ws[1]]
+    last_row = ws.max_row
+    if last_row <= 1:
+        return
+
+    def col_letter(name: str) -> str | None:
+        return ws.cell(row=1, column=header.index(name) + 1).column_letter if name in header else None
+
+    red_fill = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")
+    green_fill = PatternFill(start_color="FFC6EFCE", end_color="FFC6EFCE", fill_type="solid")
+
+    check_col = col_letter("Check Articolo")
+    if check_col:
+        rng = f"{check_col}2:{check_col}{last_row}"
+        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'{check_col}2="NEW"'], fill=red_fill, stopIfTrue=False))
+
+    livello_col = col_letter("LIVELLO")
+    if livello_col:
+        col_idx = header.index("LIVELLO") + 1
+        for r in range(2, last_row + 1):
+            ws.cell(row=r, column=col_idx).fill = red_fill
+
+    abbin_col = col_letter("ABBIN")
+    if abbin_col:
+        rng = f"{abbin_col}2:{abbin_col}{last_row}"
+        formula = f'AND({abbin_col}2<>"",COUNTIF(${abbin_col}$2:${abbin_col}${last_row},{abbin_col}2)>1)'
+        ws.conditional_formatting.add(rng, FormulaRule(formula=[formula], fill=green_fill, stopIfTrue=False))
+
+    plus2_col = col_letter("PREZZO + 2$")
+    if plus2_col:
+        header_cell = ws.cell(row=1, column=header.index("PREZZO + 2$") + 1)
+        header_cell.fill = PatternFill(start_color="FFED7D31", end_color="FFED7D31", fill_type="solid")
+        header_cell.font = Font(bold=True, color="FFFFFFFF")

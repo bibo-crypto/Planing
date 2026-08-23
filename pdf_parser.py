@@ -70,6 +70,7 @@ RIGHT_SCHEMA: list[tuple[str, list[str]]] = [
     ("value_usd", ["value in usd", "value in", "value"]),
     ("ship_date", ["ship. date", "ship date", "ship."]),
     ("abbina",    ["abbina"]),
+    ("reference_to", ["reference to", "ref. to", "ref to"]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,10 @@ class OrderRow:
     value_usd: float | None = None
     ship_date: str = ""
     abbina: str = ""
+    # New PDF column: a free-text reference the customer attaches to the
+    # order (e.g. 'Last Patch') -- shown as its own column and folded into
+    # Commento after the year.
+    reference_to: str = ""
     # "prima volta tint." when this exact Articolo Delta + COLOREDFM pair
     # has no prior entry at all in the DFM reference (see dfm_lookup.py's
     # is_first_time_dyeing) -- left "" otherwise.
@@ -704,6 +709,7 @@ def _assemble_row(
         value_usd=parse_number(get("value_usd")),
         ship_date=get("ship_date"),
         abbina=abbina,
+        reference_to=get("reference_to"),
     )
 
 
