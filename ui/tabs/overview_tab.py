@@ -36,13 +36,14 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
 
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from utils import parse_number
+from utils import load_settings, parse_number
 import situazione_logic as business_logic
 
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
@@ -62,6 +63,7 @@ HEADERS_IT = {
     "data_uscita": "Data Uscita", "custom": "Controllo",
     "days_in_qc": "Giorni in C.Q",
     "days_to_delivery": "Giorni alla consegna",
+    "prezzo": "Prezzo", "issue": "Problema",
 }
 CHECK_COLUMNS = [
     "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
@@ -279,7 +281,7 @@ class OverviewTab(ttk.Frame):
         sync_frame.pack(side="top", fill="x", padx=8, pady=(4, 10))
         sync_frame.columnconfigure(1, weight=1)
 
-        ttk.Button(sync_frame, text="📂  Choose Data Folder...", command=self._on_choose_data_folder, width=24).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Button(sync_frame, text="📂  Upload All Data from Folder...", command=self._on_choose_data_folder, width=28).grid(row=0, column=0, sticky="w", pady=2)
 
         folder_text = str(self._data_folder) if self._data_folder else "No data folder selected"
         folder_color = "#111827" if self._data_folder else "grey"
@@ -291,9 +293,7 @@ class OverviewTab(ttk.Frame):
 
         sec_row = ttk.Frame(sync_frame)
         sec_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        sec_row.columnconfigure(1, weight=1)
-
-        ttk.Button(sec_row, text="📄  Import Master Excel File...", command=self._on_import_master, width=28).grid(row=0, column=0, sticky="w")
+        sec_row.columnconfigure(0, weight=1)
 
         self._lbl_sync_status = ttk.Label(sec_row, text="● Ready to sync", foreground="#2E7D32", font=("Segoe UI", 9))
         self._lbl_sync_status.grid(row=0, column=1, sticky="e", padx=(10, 0))
@@ -344,19 +344,35 @@ class OverviewTab(ttk.Frame):
         )
         if not path:
             return
-        self._data_folder = Path(path)
-        self._lbl_folder.config(text=str(path), foreground="#111827")
+        self._data_folder = Path(path).expanduser().resolve()
+        self._lbl_folder.config(text=str(self._data_folder), foreground="#111827")
+        # Persist immediately in the same settings store used at startup.
+        # The absolute path also avoids a changed working directory making a
+        # valid selected folder look missing on the next launch.
+        self._prefs["master_data_dir"] = str(self._data_folder)
         if self._save_prefs:
-            self._save_prefs(master_data_dir=str(path))
-        if messagebox.askyesno("Sync Now?", f"Data folder selected:\n{path}\n\nDo you want to update and distribute all data files now?"):
-            self._on_sync_all_data()
+            self._save_prefs(master_data_dir=str(self._data_folder))
+        # Selecting the folder only stores the master directory. The update
+        # button is the only action that reads and distributes its files.
+        self._lbl_sync_status.config(text="● Folder saved — press Update All Data", foreground="#1565C0")
 
     def _on_sync_all_data(self) -> None:
         from tkinter import messagebox
+        # Reload the persisted value on every update click. This covers the
+        # case where Overview was rebuilt or another tab replaced its prefs
+        # mapping after the folder was selected.
+        saved_folder = load_settings().get("master_data_dir")
+        if saved_folder:
+            candidate = Path(str(saved_folder)).expanduser()
+            if candidate.is_dir():
+                self._data_folder = candidate.resolve()
+                self._lbl_folder.config(text=str(self._data_folder), foreground="#111827")
         if not self._data_folder or not self._data_folder.is_dir():
-            self._on_choose_data_folder()
-            if not self._data_folder or not self._data_folder.is_dir():
-                return
+            messagebox.showwarning(
+                "Data folder not selected",
+                "Select the master data folder first with Upload All Data from Folder.",
+            )
+            return
 
         self._btn_sync.config(state="disabled")
         self._lbl_sync_status.config(text="⏳ Synchronizing all factory files in background...", foreground="#1565C0")
@@ -410,47 +426,6 @@ class OverviewTab(ttk.Frame):
 
                 summary = "\n".join(msg_parts) if msg_parts else "No recognized files found in folder."
                 messagebox.showinfo("Data Synchronization Complete", summary)
-                self.refresh(force=True)
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_import_master(self) -> None:
-        from tkinter import filedialog, messagebox
-        path = filedialog.askopenfilename(
-            title="Select Master Excel File containing sheets (DFM, Copertura, Produzione, WINCOINT, etc.)",
-            filetypes=[("Excel files", "*.xlsx *.xls")],
-        )
-        if not path:
-            return
-
-        import threading
-        import master_import
-
-        def worker():
-            try:
-                loaded, skipped = master_import.import_master_file(
-                    path,
-                    self.situazione_tab,
-                    self.magazino_tab,
-                    self.biglietti_tab,
-                    self.prezzi_tab,
-                )
-                error = None
-            except Exception as exc:  # noqa: BLE001
-                loaded, skipped, error = [], [], str(exc)
-
-            def apply_result():
-                if error:
-                    messagebox.showerror("Import Failed", error)
-                    return
-                msg_parts = []
-                if loaded:
-                    msg_parts.append("✅ Loaded: " + ", ".join(loaded))
-                if skipped:
-                    msg_parts.append("⚠️ Not found in file: " + ", ".join(skipped))
-                messagebox.showinfo("Master File Import", "\n\n".join(msg_parts) or "No sheets recognized in file.")
                 self.refresh(force=True)
 
             self.after(0, apply_result)
@@ -555,6 +530,17 @@ class OverviewTab(ttk.Frame):
         self._add_card(4, "⚠️ Ritardo in Q.C", f"{len(check_df):,}", alert=True)
         self._add_card(5, "📅 Ritardo Consegna", f"{len(delivery_df):,}", alert=True)
 
+        price_anomalies = business_logic.find_price_anomalies(df)
+        price_problem_colors = len({
+            str(item.get("colore", "")).strip()
+            for item in price_anomalies
+            if str(item.get("colore", "")).strip()
+        })
+        self._add_card(
+            6, "💲 Errori Prezzo — colori", str(price_problem_colors),
+            alert=price_problem_colors > 0,
+        )
+
         self._add_machine_summary(df)
 
         self._add_table(
@@ -580,6 +566,11 @@ class OverviewTab(ttk.Frame):
             delivery_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche",
                           "consegna", "days_to_delivery", "new_comment"],
             "ordini_urgenti_consegna.xlsx",
+        )
+        self._add_table(
+            "💲 Errori Prezzo (Prezzo mancante o sospetto)",
+            pd.DataFrame(price_anomalies), ["cliente", "articolo", "codice", "ordine", "riga", "bagno", "mc", "prezzo", "issue"],
+            "errori_prezzo.xlsx", count_column="colore",
         )
 
     def _add_machine_summary(self, situation_df: pd.DataFrame) -> None:
@@ -610,7 +601,8 @@ class OverviewTab(ttk.Frame):
             self._cards_frame, text="Copertura macchine", bg="#f8fafc", fg="#16324f",
             font=("Segoe UI", 10, "bold"), padx=8, pady=6,
         )
-        frame.grid(row=2, column=0, columnspan=3, padx=6, pady=(0, 10), sticky="ew")
+        # Row 2 is reserved for the Errori Prezzi color counter card.
+        frame.grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 10), sticky="ew")
         self._cards_frame.columnconfigure(0, weight=1)
         self._cards_frame.columnconfigure(1, weight=1)
         self._cards_frame.columnconfigure(2, weight=1)
@@ -646,7 +638,7 @@ class OverviewTab(ttk.Frame):
         ttk.Label(card, text=title, style=title_style, wraplength=180).pack(anchor="w")
         ttk.Label(card, text=value, style=value_style).pack(anchor="w", pady=(4, 0))
 
-    def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str) -> None:
+    def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str, count_column: str | None = None) -> None:
         frame = ttk.LabelFrame(self._tables_frame, text=title, padding=6)
         col = self._table_count % 2
         row = self._table_count // 2
@@ -662,7 +654,10 @@ class OverviewTab(ttk.Frame):
         ttk.Label(header, text="Cerca:").pack(side="left", padx=(2, 5))
         search_entry = ttk.Entry(header, textvariable=search_var, width=28)
         search_entry.pack(side="left", padx=(0, 8))
-
+        count_label = None
+        if count_column:
+            count_label = ttk.Label(header, text="", foreground="#667085")
+            count_label.pack(side="left", padx=(4, 0))
         table_area = ttk.Frame(frame)
         table_area.pack(fill="both", expand=True)
         tree = ttk.Treeview(table_area, columns=available_cols, show="headings", height=7)
@@ -689,7 +684,13 @@ class OverviewTab(ttk.Frame):
                 visible = df.loc[mask]
             for _, row in visible.iterrows():
                 tree.insert("", "end", values=[row.get(c, "") for c in available_cols])
-
+            if count_label is not None:
+                count = int(visible[count_column].nunique()) if count_column in visible.columns else len(visible)
+                count_label.config(
+                    text=f"Colori visualizzati: {count}",
+                    foreground="#C62828" if count > 0 else "#667085",
+                    font=("Segoe UI", 9, "bold") if count > 0 else ("Segoe UI", 9),
+                )
         search_var.trace_add("write", render_filtered_rows)
         render_filtered_rows()
 

@@ -53,7 +53,6 @@ class KamalTab(ttk.Frame):
         # fixing the gap where a returning session wouldn't reflect an
         # already-uploaded DFM until the user re-uploads it this session.
         self.sync_shared_dfm()
-        self.sync_shared_dfm()
         self.sync_shared_magazino()
         self.sync_shared_lotti()
 

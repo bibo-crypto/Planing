@@ -26,14 +26,16 @@ from biglietti_exporter import (
 from articoli_cache import save_articoli_cache
 from densita_cache import load_densita_cache, save_densita_cache
 from magazino_cache import load_magazino_cache
+from path_manager import save_source, source_path
 
 
 class BigliettiTab(ttk.Frame):
-    def __init__(self, parent, prefs: dict, save_prefs, logger):
+    def __init__(self, parent: tk.Misc, prefs: dict, save_prefs, logger, on_shared_cache_changed=None):
         super().__init__(parent, padding=12)
         self._prefs = prefs
         self._save_prefs = save_prefs
         self._logger = logger
+        self._on_shared_cache_changed = on_shared_cache_changed
         self.data_path: Path | None = None
         self.dispo_path: Path | None = None
         self.elvy_output_dir: Path | None = None
@@ -151,11 +153,11 @@ class BigliettiTab(ttk.Frame):
         setattr(self, f"{kind}_dir_label", lab)
 
     def _restore(self):
-        for key, attr in [
-            ("biglietti_data_path", "data_path"),
-            ("biglietti_dispo_path", "dispo_path"),
+        for key, attr, source in [
+            ("biglietti_data_path", "data_path", "data_ordine"),
+            ("biglietti_dispo_path", "dispo_path", "dispo_bagno"),
         ]:
-            p = self._prefs.get(key)
+            p = self._prefs.get(key) or (str(source_path(source)) if source_path(source) else "")
             if p and Path(p).is_file():
                 setattr(self, attr, Path(p))
                 getattr(self, f"{key}_label").config(text=p, foreground="#111827")
@@ -201,6 +203,7 @@ class BigliettiTab(ttk.Frame):
         if p:
             self.data_path = Path(p)
             self.biglietti_data_path_label.config(text=p, foreground="#111827")
+            save_source("data_ordine", self.data_path)
             self._save_prefs(biglietti_data_path=p)
 
     def _pick_dispo(self):
@@ -208,6 +211,7 @@ class BigliettiTab(ttk.Frame):
         if p:
             self.dispo_path = Path(p)
             self.biglietti_dispo_path_label.config(text=p, foreground="#111827")
+            save_source("dispo_bagno", self.dispo_path)
             self._save_prefs(biglietti_dispo_path=p)
 
     def _pick_output_dir(self, kind: str):
@@ -247,6 +251,7 @@ class BigliettiTab(ttk.Frame):
             return
 
         self.articoli_path = Path(p)
+        save_source("articoli", self.articoli_path)
         parts = []
         if marca_map:
             save_articoli_cache(p)
@@ -256,6 +261,8 @@ class BigliettiTab(ttk.Frame):
             parts.append(f"{len(titolo_df)} rows shared with Situation")
         msg = " + ".join(parts) + f" loaded from {Path(p).name}"
         self.articoli_label.config(text=msg, foreground="#111827")
+        if self._on_shared_cache_changed:
+            self._on_shared_cache_changed()
 
     def _pick_densita(self):
         p = self._pick_file("Select Densita' Query.xlsx")
@@ -263,6 +270,8 @@ class BigliettiTab(ttk.Frame):
             self.densita_path = Path(p)
             self.densita_label.config(text=p, foreground="#111827")
             save_densita_cache(p)
+            if self._on_shared_cache_changed:
+                self._on_shared_cache_changed()
 
     def _set_status(self, msg: str):
         color = "#C62828" if "Error" in msg else ("#1565C0" if "progress" in msg or "Converting" in msg else "#2E7D32")
@@ -407,7 +416,7 @@ class BigliettiTab(ttk.Frame):
                         out_dir = Path(self.filato_output_dir)
                         out_dir.mkdir(parents=True, exist_ok=True)
                         filato_file = out_dir / f"{self.data_path.stem}_Filato.xlsx"
-                        export_filato_workbook(filato_file, raw)
+                        export_filato_workbook(filato_file, records, raw)
                         created_items.append(f"• Raw Yarn (Filato): {filato_file.name}\n   ↳ Saved to: {filato_file}")
 
             summary_text = "\n\n".join(created_items)

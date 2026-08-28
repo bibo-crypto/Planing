@@ -21,6 +21,8 @@ from typing import Any
 
 import openpyxl
 
+from path_manager import save_source
+
 SHEET_CANDIDATES: dict[str, list[str]] = {
     "dfm": ["dfm"],
     "copertura": ["copertura"],
@@ -296,9 +298,12 @@ def _route(key: str, tmp_path: str, master_path: str, situazione_tab, magazino_t
         else:
             from prezzi_cache import save_prezzi_cache
             save_prezzi_cache(master_path)
-        if prezzi_tab is not None and hasattr(prezzi_tab, "load_file"):
+        if prezzi_tab is not None:
             try:
-                prezzi_tab.load_file(master_path)
+                if hasattr(prezzi_tab, "_load_path"):
+                    prezzi_tab.after(0, lambda: prezzi_tab._load_path(master_path, save_cache=False))
+                elif hasattr(prezzi_tab, "load_file"):
+                    prezzi_tab.after(0, lambda: prezzi_tab.load_file(master_path))
             except Exception:
                 pass
         if biglietti_tab is not None and hasattr(biglietti_tab, "_restore"):
@@ -328,15 +333,26 @@ def _route(key: str, tmp_path: str, master_path: str, situazione_tab, magazino_t
                 situazione_tab.refresh_prezzo_densita()
             except Exception:
                 pass
+        # Densita is shared by Biglietti and Ordine MED. Persist the same
+        # source path and update Ordine MED's visible selection directly.
+        save_source("densita", master_path)
         if biglietti_tab is not None:
             biglietti_tab.densita_path = Path(master_path)
+            if hasattr(biglietti_tab, "densita_label"):
+                biglietti_tab.after(0, lambda: biglietti_tab.densita_label.config(text=str(master_path), foreground="#111827"))
             if hasattr(biglietti_tab, "_restore"):
                 try:
                     biglietti_tab._restore()
                 except Exception:
                     pass
+        ordine_med_tab = getattr(situazione_tab, "ordine_med_tab", None) if situazione_tab is not None else None
+        if ordine_med_tab is not None:
+            ordine_med_tab.densita_path = Path(master_path)
+            if hasattr(ordine_med_tab, "_lbl_densita"):
+                ordine_med_tab.after(0, lambda: ordine_med_tab._lbl_densita.config(text=str(master_path), foreground="black"))
 
     elif key == "data_ordine":
+        save_source("data_ordine", master_path)
         if biglietti_tab is not None:
             biglietti_tab.data_path = Path(master_path)
             if hasattr(biglietti_tab, "biglietti_data_path_label"):
@@ -345,6 +361,7 @@ def _route(key: str, tmp_path: str, master_path: str, situazione_tab, magazino_t
                 biglietti_tab._save_prefs(biglietti_data_path=str(master_path))
 
     elif key == "dispo_bagno":
+        save_source("dispo_bagno", master_path)
         if biglietti_tab is not None:
             biglietti_tab.dispo_path = Path(master_path)
             if hasattr(biglietti_tab, "biglietti_dispo_path_label"):

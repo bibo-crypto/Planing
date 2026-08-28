@@ -282,8 +282,11 @@ class ConverterApp(tk.Tk):
         self._build_elvy_tab(elvy_tab)
 
         # ── Biglietti: ERP order -> ELVY/MED workbook + Word tickets ──
-        self._biglietti_tab = BigliettiTab(notebook, self._prefs, self._save_prefs, logger)
-        notebook.add(self._biglietti_tab, text="Estrazione Ordine")
+        self._biglietti_tab = BigliettiTab(
+            notebook, self._prefs, self._save_prefs, logger,
+            on_shared_cache_changed=self._on_shared_cache_changed,
+        )
+        notebook.add(self._biglietti_tab, text="Create (EXCEL+Biglietti)")
 
         # ── Ordine: Ordine Elvy + Ordine Kamal, grouped under one parent tab ──
         ordine_parent = ttk.Frame(notebook)
@@ -301,6 +304,7 @@ class ConverterApp(tk.Tk):
         self._ordine_med_tab = OrdineMedTab(
             ordine_notebook, situazione_tab=None, prefs=self._prefs,
             save_prefs=self._save_prefs, logger=logger,
+            on_shared_cache_changed=self._on_shared_cache_changed,
         )
         ordine_notebook.add(self._ordine_med_tab, text="Ordine Med")
 
@@ -336,11 +340,12 @@ class ConverterApp(tk.Tk):
         # Ordine Med's Consegna auto-scheduling needs Situazione's live
         # current_df + Copertura data, which doesn't exist until now.
         self._ordine_med_tab._situazione_tab = self._situazione_tab
+        self._situazione_tab.ordine_med_tab = self._ordine_med_tab
 
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
-        self._prezzi_tab = PrezziTab(notebook)
+        self._prezzi_tab = PrezziTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._prezzi_tab, text="Prezzi")
 
         # Now that Magazino Filato exists, let Situazione auto-fill its
@@ -384,17 +389,21 @@ class ConverterApp(tk.Tk):
         self._restore_saved_paths()
 
     def _on_shared_cache_changed(self) -> None:
-        """Update tabs when a shared DFM, Produzione or Magazino file is uploaded elsewhere."""
+        """Refresh every consumer after any shared source is uploaded."""
         self._refresh_dfm_status()
         self._refresh_magazino_status()
-        if getattr(self, "_situazione_tab", None):
+        if hasattr(self, "_situazione_tab"):
             self._situazione_tab.sync_shared_async()
+            if hasattr(self._situazione_tab, "sync_remaining_shared_sources"):
+                self._situazione_tab.sync_remaining_shared_sources()
         if getattr(self, "_settimana_tab", None):
             self._settimana_tab.sync_shared_async()
         if getattr(self, "_kamal_tab", None):
             self._kamal_tab.sync_shared_dfm()
             self._kamal_tab.sync_shared_magazino()
             self._kamal_tab.sync_shared_lotti()
+        if getattr(self, "_ordine_med_tab", None):
+            self._ordine_med_tab.sync_shared_magazino()
         if getattr(self, "_magazino_tab", None):
             self._magazino_tab.sync_shared_async()
             self._magazino_tab.sync_shared_lotti_async()
@@ -914,7 +923,7 @@ class ConverterApp(tk.Tk):
         magazino_selected = selected_top == str(magazino_tab)
         overview_selected = selected_top == str(self._overview_tab)
         prezzi_selected = selected_top == str(self._prezzi_tab)
-        biglietti_selected = top_text == "Estrazione Ordine" or selected_top == str(self._biglietti_tab)
+        biglietti_selected = top_text == "Create (EXCEL+Biglietti)" or selected_top == str(self._biglietti_tab)
 
         situazione_selected = settimana_selected = False
         kamal_selected = ordini_selected = ordine_med_selected = False
