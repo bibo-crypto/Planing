@@ -16,6 +16,7 @@ import pandas as pd
 
 import prezzi_logic as logic
 from prezzi_cache import load_prezzi_cache, save_prezzi_cache
+from path_manager import save_source
 from utils import logger
 
 COLUMNS = logic.DISPLAY_COLUMNS
@@ -25,8 +26,9 @@ HEADERS = logic.HEADERS
 class PrezziTab(ttk.Frame):
     """Embeddable 'Prezzi' tab."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_shared_cache_changed=None):
         super().__init__(master)
+        self._on_shared_cache_changed = on_shared_cache_changed
         self._base_df = pd.DataFrame()
         self.prezzi_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
@@ -162,6 +164,9 @@ class PrezziTab(ttk.Frame):
                 self.status_var.set(f"{Path(path).name} — {len(df)} price rows")
                 if save_cache:
                     save_prezzi_cache(path)
+                    save_source("listini", path)
+                    if self._on_shared_cache_changed:
+                        self._on_shared_cache_changed()
                 self._apply_search_and_sort()
 
             self.after(0, apply_result)

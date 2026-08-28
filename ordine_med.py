@@ -227,18 +227,15 @@ def compute_prezzo(records: list[OrdineMedRow], price_lookup: dict[tuple, tuple]
             r.livello, r.prezzo = price_lookup[key]
 
 
-# Machines (by their Rocche-based M/C total) that get a $2 surcharge.
-PREZZO_SURCHARGE_MACHINES = {56, 32, 24}
-
-
+# Machines (by their Rocche-based M/C total) that get a $2 surcharge on
+# top of Prezzo. Shared with Situazione's own Prezzo column -- see
+# biglietti_exporter.apply_machine_surcharge / PREZZO_SURCHARGE_MACHINES.
 def compute_prezzo_plus2(records: list[OrdineMedRow]) -> None:
     """PREZZO + 2$ column: +2 on top of Prezzo for the 3 specific machine
     sizes (56/32/24 Rocche), otherwise the same price carried over as-is."""
+    from biglietti_exporter import apply_machine_surcharge
     for r in records:
-        if isinstance(r.prezzo, (int, float)) and r.mc in PREZZO_SURCHARGE_MACHINES:
-            r.prezzo_plus2 = round(r.prezzo + 2, 2)
-        else:
-            r.prezzo_plus2 = r.prezzo
+        r.prezzo_plus2 = apply_machine_surcharge(r.prezzo, r.mc)
 
 
 def load_dfm_articolo_colore(path: Path) -> set[tuple[str, str]]:
@@ -285,10 +282,20 @@ def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str
 def load_filato_disponibile(path: Path) -> dict[int, int]:
     """{PARTITA: Mag.Rocche} -- filters to MAGAZZINO in {900160, 900910},
     excludes committed stock (MAGAZZINO=900160 and ORDINE=0), sums COLLI
-    per PARTITA. Verified against real data."""
+    per PARTITA. Verified against real data.
+
+    Reads a sheet named 'Filato Disponibile' or 'Magazino' when present
+    (this is commonly a multi-sheet workbook shared with other tabs, e.g.
+    ORDINE_MED-MACRO.xlsm bundles DFM/ORDINE/Filato Disponibile/etc. in
+    one file) -- wb.active is whichever sheet was open when the file was
+    last saved, not necessarily this one, so it's only the last resort."""
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
-        rows = _read_sheet_rows(wb.active)
+        sheet_name = next(
+            (s for s in wb.sheetnames if _key(s) in (_key("Filato Disponibile"), _key("Magazino"))),
+            wb.active.title,
+        )
+        rows = _read_sheet_rows(wb[sheet_name])
     finally:
         wb.close()
     totals: dict[int, int] = {}
@@ -406,6 +413,52 @@ def _ordine_da_creare_row(r: OrdineMedRow) -> list[Any]:
         r.prezzo, r.prezzo_plus2,
         r.pt_grg, r.pt_med, r.polmoni, r.cliente_note, r.nota_grg, r.nota_col,
     ]
+
+
+def export_erp_order_workbook(path: Path, records: list[OrdineMedRow]) -> None:
+    """Write the ERP-ready CLIENTE..GRUPPO MACCHINA sheet separately."""
+    from openpyxl import Workbook
+    from biglietti_exporter import _style_sheet
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Dati sistema (B-N)"
+    ws.append(SYSTEM_IMPORT_HEADERS)
+    for record in records:
+        full = _full_row(record)
+        ws.append([full[header] for header in SYSTEM_IMPORT_HEADERS])
+    _style_sheet(ws, date_columns=("CONSEGNA", "DATA RICONSEGNA"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    wb.close()
+
+
+def export_filato_availability_workbook(
+    path: Path,
+    availability: list[FilatoAvailabilityRow],
+) -> None:
+    """Write the availability result as a standalone ERP-support workbook."""
+    from openpyxl import Workbook
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import PatternFill
+    from biglietti_exporter import _style_sheet
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Filato X Tinturia"
+    ws.append(FILATO_AVAILABILITY_HEADERS)
+    for row in availability:
+        ws.append([row.articolo, row.titolo, row.pt_grg, row.rocche, row.kg,
+                   row.mag_rocche, row.manca, row.disponibilita])
+    _style_sheet(ws)
+    if ws.max_row > 1:
+        red_fill = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")
+        ws.conditional_formatting.add(
+            f"A2:H{ws.max_row}", FormulaRule(formula=['$H2="NO"'], fill=red_fill)
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    wb.close()
 
 
 def export_ordine_med_workbook(

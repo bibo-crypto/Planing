@@ -534,3 +534,64 @@ def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
     if merged.empty:
         return {}
     return merged.groupby("machine_number").size().to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Price validation -- flags Situazione rows whose Prezzo looks wrong.
+# Checked: an exact 0.01 value (a known placeholder/data-entry mistake in
+# the source ERP), and a genuinely missing price (blank/zero) on a row
+# that otherwise has enough identifying data to expect one. The $24/32/56
+# surcharge itself is applied when Prezzo is computed (see
+# biglietti_exporter.apply_machine_surcharge), so a correctly-surcharged
+# price never shows up here -- only prices that are missing or match the
+# known-bad placeholder do.
+# ---------------------------------------------------------------------------
+
+PRICE_PLACEHOLDER_VALUE = 0.01
+
+
+def find_price_anomalies(df):
+    """Returns a list of dicts (cliente, articolo, colore, bagno, mc,
+    prezzo, issue) for every row whose Prezzo needs a human to check it.
+    Never raises -- an empty/missing dataframe just returns []."""
+    if df is None or df.empty:
+        return []
+    if "prezzo" not in df.columns:
+        return []
+
+    def _as_number(value):
+        try:
+            if value in (None, ""):
+                return None
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    for _, row in df.iterrows():
+        articolo = str(row.get("articolo", "") or "").strip()
+        colore = str(row.get("colore", "") or row.get("codice", "") or "").strip()
+        if not articolo:
+            continue  # nothing to price-check on a blank row
+
+        prezzo_num = _as_number(row.get("prezzo"))
+        issue = None
+        if prezzo_num is not None and abs(prezzo_num - PRICE_PLACEHOLDER_VALUE) < 1e-9:
+            issue = f"Prezzo sospetto ({PRICE_PLACEHOLDER_VALUE})"
+        elif prezzo_num is None or prezzo_num == 0:
+            issue = "Prezzo mancante"
+
+        if issue:
+            out.append({
+                "cliente": row.get("cliente", ""),
+                "articolo": articolo,
+                "colore": colore,
+                "codice": row.get("codice", "") or colore,
+                "ordine": row.get("ordine", ""),
+                "riga": row.get("riga", ""),
+                "bagno": row.get("bagno", ""),
+                "mc": row.get("mc", ""),
+                "prezzo": row.get("prezzo", ""),
+                "issue": issue,
+            })
+    return out

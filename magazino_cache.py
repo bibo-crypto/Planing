@@ -1,38 +1,30 @@
-"""Shared location of the last raw-yarn Magazino export."""
+"""Shared location of the last raw-yarn Magazino export.
+
+Thin wrapper over file_cache.py -- see that module for the real
+implementation. The one thing this source does that the others don't:
+an optional pre-summarized dataframe gets saved alongside the path.
+"""
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils import APP_DATA_DIR, logger
+from file_cache import load_file_cache, save_file_cache
+from utils import logger
 
-CACHE_FILE = APP_DATA_DIR / "settings" / "magazino_file_cache.json"
+_KEY = "magazino"
 
 
 def save_magazino_cache(source_path: Path | str, summary=None) -> None:
-    try:
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "source_file": Path(source_path).name,
-            "source_path": str(source_path),
-            "loaded_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        if summary is not None:
+    extra = None
+    if summary is not None:
+        try:
             # to_json converts pandas/numpy scalar values to JSON-safe types.
-            payload["summary_rows"] = json.loads(summary.to_json(orient="records"))
-        CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not save Magazino file cache: %s", exc)
+            extra = {"summary_rows": json.loads(summary.to_json(orient="records"))}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not include Magazino summary in cache: %s", exc)
+    save_file_cache(_KEY, source_path, extra=extra)
 
 
 def load_magazino_cache() -> dict[str, Any]:
-    empty = {"source_file": "", "source_path": "", "loaded_at": ""}
-    try:
-        if CACHE_FILE.is_file():
-            value = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            if isinstance(value, dict):
-                return value
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not load Magazino file cache: %s", exc)
-    return empty
+    return load_file_cache(_KEY)

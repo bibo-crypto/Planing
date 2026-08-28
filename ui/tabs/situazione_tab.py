@@ -29,6 +29,7 @@ from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
 import biglietti_exporter
 from densita_cache import load_densita_cache
+from path_manager import load_source, save_source, source_path
 
 STATUS_COLORS = {
     "Filato": "#e0e0e0",
@@ -157,6 +158,8 @@ class SituazioneTab(ttk.Frame):
         self.current_df = pd.DataFrame()
         self._filter_after_id = None
         self._shared_syncing = False
+        self._other_shared_syncing = False
+        self._shared_source_paths = {}
         self._startup_restore_in_progress = False
         self._startup_snapshot_current = False
         self._table_loaded_callbacks = []
@@ -178,6 +181,7 @@ class SituazioneTab(ttk.Frame):
         self._load_table_from_db()
         self.after(700, self._auto_restore_saved_files)
         self.after(1000, self.sync_shared_async)
+        self.after(1200, self.sync_remaining_shared_sources)
 
     # ------------------------------------------------------------------ UI
     def _configure_styles(self):
@@ -757,6 +761,66 @@ class SituazioneTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def sync_remaining_shared_sources(self):
+        """Load all non-specialized sources saved by another page.
+
+        DFM and Produzione have dedicated parsers/caches and are handled by
+        ``sync_shared_async``. The remaining Situation inputs use the same
+        centralized path registry, so a file uploaded in Overview or another
+        page is parsed here automatically.
+        """
+        if self._other_shared_syncing:
+            return
+        source_keys = ("copertura", "wincoint", "uscita", "qualita", "articoli", "listini")
+        paths = {}
+        for key in source_keys:
+            path = source_path(key, existing_only=True)
+            if path and self._shared_source_paths.get(key) != str(path):
+                paths[key] = path
+        if not paths:
+            return
+        self._other_shared_syncing = True
+
+        def worker():
+            results = {}
+            for key, path in paths.items():
+                try:
+                    if key == "articoli":
+                        result = data_loaders.load_codes(str(path))
+                    elif key == "listini":
+                        import prezzi_logic
+                        result = prezzi_logic.load_prezzi(str(path))
+                    else:
+                        result = data_loaders.LOADERS[key][1](str(path))
+                    results[key] = (path, result)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not restore shared %s file: %s", key, exc)
+
+            def apply_result():
+                self._other_shared_syncing = False
+                for key, (path, result) in results.items():
+                    df, errors = result
+                    if errors or df is None or df.empty:
+                        continue
+                    self._shared_source_paths[key] = str(path)
+                    if key == "articoli":
+                        db.save_codes(df)
+                        self.codes_row.set_status(True, f"✅ Saved ({len(df)} codes)")
+                    elif key == "listini":
+                        self.listini_row.set_status(True, f"✅ Saved ({len(df)} rows)")
+                        self.refresh_prezzo_densita()
+                    else:
+                        self.loaded_frames[key] = df
+                        if key == "copertura":
+                            self._copertura_revision += 1
+                        self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
+                        db.save_upload(key, path.name, len(df), "ok", f"✅ {len(df)} rows - {path.name}", file_path=str(path))
+                self.after_idle(self.sync_remaining_shared_sources)
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _save_shared_dfm(self, path):
         """Update the shared DFM cache when Situazione is the upload source."""
         try:
@@ -831,6 +895,10 @@ class SituazioneTab(ttk.Frame):
             self._save_shared_dfm(display_path)
         if key == "data_prod":
             self._save_shared_prod(display_path)
+        # Every successful individual upload becomes available to all pages.
+        # DFM/Produzione retain their specialized lookup caches as well.
+        if key not in ("dfm", "data_prod"):
+            save_source(key, display_path)
         logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(display_path))
 
     def _handle_codes_upload(self, _key, path, cache_path=None):
@@ -847,6 +915,7 @@ class SituazioneTab(ttk.Frame):
             return
 
         db.save_codes(df)
+        save_source("articoli", display_path)
         msg = f"✅ Saved ({len(df)} codes) - {os.path.basename(display_path)}"
         self.codes_row.set_status(True, msg)
         db.save_upload("codes", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
@@ -880,6 +949,7 @@ class SituazioneTab(ttk.Frame):
             return
 
         prezzi_cache.save_prezzi_cache(display_path)
+        save_source("listini", display_path)
         msg = f"✅ Saved ({len(df)} rows) - {os.path.basename(display_path)}"
         self.listini_row.set_status(True, msg)
         db.save_upload("listini", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
@@ -1093,7 +1163,8 @@ class SituazioneTab(ttk.Frame):
             logger.warning("Situazione: Densita' Query lookup failed: %s", exc)
 
         def _prezzo_row(row):
-            return biglietti_exporter.prezzo_for(row.get("articolo", ""), row.get("codice", ""), price_lookup)
+            base = biglietti_exporter.prezzo_for(row.get("articolo", ""), row.get("codice", ""), price_lookup)
+            return biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
 
         def _densita_row(row):
             if not densita_map:

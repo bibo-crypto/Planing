@@ -70,7 +70,7 @@ RIGHT_SCHEMA: list[tuple[str, list[str]]] = [
     ("value_usd", ["value in usd", "value in", "value"]),
     ("ship_date", ["ship. date", "ship date", "ship."]),
     ("abbina",    ["abbina"]),
-    ("reference_to", ["reference to", "ref. to", "ref to"]),
+    ("reference_to", ["reference to", "refrence to", "referance to", "ref. to", "ref to"]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -574,7 +574,7 @@ class PDFParser:
                 # captured together with the colour name ("Water Color").
                 for field_name in (
                     "colour", "qty_cones", "qty_kg",
-                    "price_usd", "value_usd", "ship_date", "abbina",
+                    "price_usd", "value_usd", "ship_date", "abbina", "reference_to",
                 ):
                     slot = slots.get(field_name)
                     if not slot:
@@ -589,12 +589,20 @@ class PDFParser:
 
             elif acc:
                 # ── Continuation line ───────────────────────────────────
-                # Only extend article_description; ignore right-side columns.
+                # Only extend article_description; ignore right-side columns
+                # -- except reference_to, whose value (e.g. 'Last Patch')
+                # consistently sits on a wrapped second line under the
+                # header, same as Ship. Date's own week note ('C.W 34').
                 # Same colour-overlap exclusion applies.
                 art_words = _article_area_words(line)
                 acc["article_description"].extend(
                     w["text"] for w in art_words
                 )
+                ref_slot = slots.get("reference_to")
+                if ref_slot:
+                    for w in line:
+                        if _in_slot(w, ref_slot):
+                            acc["reference_to"].append(w["text"])
 
         flush()
         return rows, current_abbina, row_tops

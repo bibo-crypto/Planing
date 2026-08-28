@@ -351,6 +351,27 @@ def _prezzo_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> Any:
 prezzo_for = _prezzo_for
 
 
+# Machines (by their Rocche-based M/C total, e.g. Situazione's own 'mc'
+# field or Ordine MED's) that get a $2 surcharge on top of the Listini
+# price. Shared here since both Ordine MED's 'PREZZO + 2$' column and
+# Situazione's own Prezzo column apply the exact same rule.
+PREZZO_SURCHARGE_MACHINES = {24, 32, 56}
+
+
+def apply_machine_surcharge(price: Any, machine: Any) -> Any:
+    """price + 2 when machine is 24/32/56 Rocche, otherwise price
+    unchanged. machine may be an int, numeric string, or None/blank --
+    anything that doesn't cleanly parse just skips the surcharge rather
+    than raising."""
+    if not isinstance(price, (int, float)):
+        return price
+    try:
+        mc = int(_number(machine))
+    except (TypeError, ValueError):
+        return price
+    return round(price + 2, 2) if mc in PREZZO_SURCHARGE_MACHINES else price
+
+
 # ---------------------------------------------------------------------------
 # Densita' Query workbook -- KG (PESO ROCCHE query) + Densita`(360-390),
 # both keyed by Partita (raw_batch / "Partita GG").
@@ -759,18 +780,38 @@ def enrich_records(
         compute_delivery_date(records)
 
 
-def _filato_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out = []
-    for r in raw_rows:
-        if not _clean(_get(r, "Articolo")):
+def _filato_rows(records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per raw batch (Partita GG), Rocche summed from the actual
+    order records -- not read off the small 'تحضير خيط خام' reference
+    sheet's own count, which can be stale/incomplete on its own (a real
+    case: a raw batch's order Rocche was 72 but that sheet's count showed
+    0 for it). Titolo/Peso still come from that sheet when available,
+    purely for context."""
+    raw_by_article = {_clean(_get(r, "Articolo")).upper(): r for r in raw_rows}
+
+    totals: dict[str, float] = {}
+    for rec in records:
+        key = _clean(rec.raw_batch)
+        if not key:
             continue
+        totals[key] = totals.get(key, 0) + (_number(rec.quantity_cones) or 0)
+
+    out = []
+    seen: set[str] = set()
+    for rec in records:
+        key = _clean(rec.raw_batch)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        article_g = ("G" + rec.article[1:]) if rec.article[:1].upper() == "C" else rec.article
+        raw = raw_by_article.get(article_g.upper(), {})
         out.append({
-            "Articolo": _clean(_get(r, "Articolo")),
-            "Titolo": _clean(_get(r, "Titolo")),
-            "Partita": _clean(_get(r, "Partita.GG", "Partita")),
-            "Rocche": _number(_get(r, "عدد", "Rocche")),
-            "Peso": _number(_get(r, "وزن", "Peso")),
-            "تحضير خام": _clean(_get(r, "Custom", "تحضير خام")) or "تحضير خام",
+            "Articolo": article_g,
+            "Titolo": rec.title or _clean(_get(raw, "Titolo")),
+            "Partita": key,
+            "Rocche": totals[key],
+            "Peso": _number(_get(raw, "وزن", "Peso")),
+            "تحضير خام": _clean(_get(raw, "Custom", "تحضير خام")) or "تحضير خام",
         })
     return out
 
@@ -814,7 +855,7 @@ def export_workbook(
         fws = wb.create_sheet("Filato x Tinturia")
         fheaders = ["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"]
         fws.append(fheaders)
-        for r in _filato_rows(raw_rows):
+        for r in _filato_rows(records, raw_rows):
             fws.append([r[h] for h in fheaders])
         _style_sheet(fws)
     _style_sheet(
@@ -828,14 +869,14 @@ def export_workbook(
     wb.close()
 
 
-def export_filato_workbook(path: Path, raw_rows: list[dict[str, Any]]) -> None:
+def export_filato_workbook(path: Path, records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -> None:
     """Export only the optional ``Filato x Tinturia`` workbook."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Filato x Tinturia"
     headers = ["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"]
     ws.append(headers)
-    for r in _filato_rows(raw_rows):
+    for r in _filato_rows(records, raw_rows):
         ws.append([r[h] for h in headers])
     _style_sheet(ws)
     path.parent.mkdir(parents=True, exist_ok=True)
