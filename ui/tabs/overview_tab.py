@@ -233,10 +233,19 @@ class OverviewTab(ttk.Frame):
     def _build_ui(self) -> None:
         style = ttk.Style(self)
         style.configure("Overview.Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#667085",
-                        font=("Segoe UI", 9))
+        style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#526173",
+                        font=("Segoe UI", 9, "bold"))
         style.configure("Overview.CardValue.TLabel", background="#ffffff", foreground="#16324f",
-                        font=("Segoe UI", 19, "bold"))
+                        font=("Segoe UI", 21, "bold"))
+        style.configure("Overview.Table.TLabelframe", background="#ffffff", borderwidth=1, relief="solid")
+        style.configure("Overview.Table.TLabelframe.Label", background="#ffffff", foreground="#16324f",
+                        font=("Segoe UI", 10, "bold"))
+        style.configure("Overview.Treeview", background="#ffffff", fieldbackground="#ffffff",
+                        foreground="#25364d", rowheight=28, font=("Segoe UI", 9))
+        style.configure("Overview.Treeview.Heading", background="#16324f", foreground="#ffffff",
+                        font=("Segoe UI", 9, "bold"), padding=(7, 6))
+        style.map("Overview.Treeview", background=[("selected", "#2f80ed")],
+                  foreground=[("selected", "#ffffff")])
         style.configure("Overview.AlertCard.TFrame", background="#fff7ed", relief="solid", borderwidth=1)
         style.configure("Overview.AlertCardTitle.TLabel", background="#fff7ed", foreground="#c2410c",
                         font=("Segoe UI", 9, "bold"))
@@ -259,7 +268,8 @@ class OverviewTab(ttk.Frame):
         canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        self._body = ttk.Frame(canvas)
+        self._body = ttk.Frame(canvas, padding=(4, 2))
+        self._body.columnconfigure(0, weight=1)
         body_window = canvas.create_window((0, 0), window=self._body, anchor="nw")
 
         def _on_body_configure(_event=None):
@@ -298,11 +308,15 @@ class OverviewTab(ttk.Frame):
         self._lbl_sync_status = ttk.Label(sec_row, text="● Ready to sync", foreground="#2E7D32", font=("Segoe UI", 9))
         self._lbl_sync_status.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-        self._cards_frame = ttk.Frame(self._body)
-        self._cards_frame.pack(side="top", fill="x", padx=8, pady=(4, 10))
+        self._cards_frame = ttk.Frame(self._body, padding=(0, 2))
+        self._cards_frame.pack(side="top", fill="x", padx=10, pady=(3, 12))
+        for column in range(3):
+            self._cards_frame.columnconfigure(column, weight=1, uniform="overview_card")
 
-        self._tables_frame = ttk.Frame(self._body)
-        self._tables_frame.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 10))
+        self._tables_frame = ttk.Frame(self._body, padding=(0, 2))
+        self._tables_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 14))
+        self._tables_frame.columnconfigure(0, weight=1, uniform="overview_table")
+        self._tables_frame.columnconfigure(1, weight=1, uniform="overview_table")
         self._table_count = 0
 
     # ------------------------------------------------------------------
@@ -633,13 +647,14 @@ class OverviewTab(ttk.Frame):
         card_style = "Overview.AlertCard.TFrame" if alert else "Overview.Card.TFrame"
         title_style = "Overview.AlertCardTitle.TLabel" if alert else "Overview.CardTitle.TLabel"
         value_style = "Overview.AlertCardValue.TLabel" if alert else "Overview.CardValue.TLabel"
-        card = ttk.Frame(self._cards_frame, style=card_style, padding=12)
-        card.grid(row=col // 3, column=col % 3, padx=6, pady=4, sticky="nsew")
+        card = ttk.Frame(self._cards_frame, style=card_style, padding=(14, 12))
+        card.grid(row=col // 3, column=col % 3, padx=5, pady=5, sticky="nsew")
+        self._cards_frame.rowconfigure(col // 3, weight=1, minsize=86)
         ttk.Label(card, text=title, style=title_style, wraplength=180).pack(anchor="w")
         ttk.Label(card, text=value, style=value_style).pack(anchor="w", pady=(4, 0))
 
     def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str, count_column: str | None = None) -> None:
-        frame = ttk.LabelFrame(self._tables_frame, text=title, padding=6)
+        frame = ttk.LabelFrame(self._tables_frame, text=title, padding=(9, 8), style="Overview.Table.TLabelframe")
         col = self._table_count % 2
         row = self._table_count // 2
         self._tables_frame.columnconfigure(col, weight=1)
@@ -660,10 +675,10 @@ class OverviewTab(ttk.Frame):
             count_label.pack(side="left", padx=(4, 0))
         table_area = ttk.Frame(frame)
         table_area.pack(fill="both", expand=True)
-        tree = ttk.Treeview(table_area, columns=available_cols, show="headings", height=7)
+        tree = ttk.Treeview(table_area, columns=available_cols, show="headings", height=11, style="Overview.Treeview")
         for c in available_cols:
             tree.heading(c, text=HEADERS_IT.get(c, c.capitalize()))
-            tree.column(c, width=120, anchor="center")
+            tree.column(c, width=132, minwidth=92, anchor="center", stretch=True)
         vsb = ttk.Scrollbar(table_area, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(table_area, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -682,8 +697,9 @@ class OverviewTab(ttk.Frame):
                     lambda column: column.str.contains(query, case=False, regex=False, na=False)
                 ).any(axis=1)
                 visible = df.loc[mask]
-            for _, row in visible.iterrows():
-                tree.insert("", "end", values=[row.get(c, "") for c in available_cols])
+            for index, (_, row) in enumerate(visible.iterrows()):
+                tree.insert("", "end", values=[row.get(c, "") for c in available_cols],
+                            tags=("evenrow" if index % 2 == 0 else "oddrow",))
             if count_label is not None:
                 count = int(visible[count_column].nunique()) if count_column in visible.columns else len(visible)
                 count_label.config(
@@ -691,6 +707,8 @@ class OverviewTab(ttk.Frame):
                     foreground="#C62828" if count > 0 else "#667085",
                     font=("Segoe UI", 9, "bold") if count > 0 else ("Segoe UI", 9),
                 )
+        tree.tag_configure("evenrow", background="#f8fafc")
+        tree.tag_configure("oddrow", background="#ffffff")
         search_var.trace_add("write", render_filtered_rows)
         render_filtered_rows()
 
