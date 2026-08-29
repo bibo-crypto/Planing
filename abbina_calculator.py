@@ -23,32 +23,26 @@ from __future__ import annotations
 
 from pdf_parser import OrderRow
 from utils import logger
+from constants import ABBINA_MACHINE_CODES, MACHINE_CAPACITIES
 
 
 # ---------------------------------------------------------------------------
 # Machine capacity table — must remain sorted ascending
 # ---------------------------------------------------------------------------
 
-MACHINE_CAPACITIES: list[int] = [6, 24, 32, 56, 72, 128, 192, 384, 672]
+# Backward-compatible alias; the canonical values live in constants.py.
+MACHINE_CAPACITIES: list[int] = list(MACHINE_CAPACITIES)
 
 # Physical machine number for each cone capacity — used by the "Ordini
 # ELVY" export sheet to turn an Abbina value like "Machine 72 Cones" into
 # a MACCHINA code.
-MACHINE_CODES: dict[int, int] = {
-    6: 3301,
-    24: 3310,
-    32: 3306,
-    56: 3302,
-    72: 3307,
-    128: 3303,
-    192: 3308,
-    384: 3304,
-    672: 3305,
-}
+MACHINE_CODES: dict[int, int] = dict(ABBINA_MACHINE_CODES)
 
 
 def _smallest_fitting_machine(total_cones: float) -> int:
-    """Return the smallest machine capacity that fits *total_cones*."""
+    """Return 0 for an empty group, otherwise the smallest fitting capacity."""
+    if total_cones <= 0:
+        return 0
     for capacity in MACHINE_CAPACITIES:
         if capacity >= total_cones:
             return capacity

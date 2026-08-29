@@ -229,6 +229,8 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
         )
         if nc == "__END_PROD_RAW__":
             nc = r.get("end_prod")
+        if isinstance(nc, str) and nc.startswith("__"):
+            return ""
         return nc
 
     df["new_comment"] = df.apply(_row_new_comment, axis=1)

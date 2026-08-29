@@ -26,6 +26,8 @@ import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from constants import MACHINE_CAPACITIES
+
 
 def _clean(v: Any) -> str:
     return " ".join(str(v or "").replace("\xa0", " ").split())
@@ -64,8 +66,11 @@ def _first_match(text: str, pattern: str) -> str:
 # M/C (machine) lookup -- Rocche total per Bagno group -> physical machine
 # number. Values taken from the reference Power Query's machine table.
 # ---------------------------------------------------------------------------
+# Mapping remains exporter-specific; the capacity list is centralized.
 MACHINE_SIZE_TABLE: dict[int, int] = {
-    6: 11, 24: 12, 32: 9, 56: 10, 72: 7, 128: 8, 192: 5, 384: 6, 672: 3,
+    capacity: machine for capacity, machine in zip(
+        MACHINE_CAPACITIES, (11, 12, 9, 10, 7, 8, 5, 6, 3)
+    )
 }
 # Seen only on MED orders in the reference query (7 Rocche -> machine 11).
 # Kept separate since it overlaps oddly with the 6 -> 11 rule; flagged for
@@ -79,7 +84,8 @@ _MACHINE_MATCH_TOLERANCE = 0.15
 
 
 def _machine_for_count(count: float | int | None, extra: dict[int, int] | None = None) -> str:
-    if not count:
+    """Return a machine number; non-positive or missing count means blank."""
+    if count is None or count <= 0:
         return ""
     table = dict(MACHINE_SIZE_TABLE)
     if extra:

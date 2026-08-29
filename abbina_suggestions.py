@@ -8,14 +8,14 @@ from collections import defaultdict
 
 import pandas as pd
 
+from constants import MACHINE_CAPACITIES as SHARED_MACHINE_CAPACITIES, SUGGESTION_MACHINE_NUMBERS
 
-MACHINE_CAPACITIES = [6, 24, 32, 56, 72, 128, 192, 384, 672]
-MACHINE_NUMBERS = {
-    6: 11, 24: 12, 32: 9, 56: 10, 72: 7,
-    128: 8, 192: 5, 384: 6, 672: 3,
-}
+
+MACHINE_CAPACITIES = list(SHARED_MACHINE_CAPACITIES)
+MACHINE_NUMBERS = dict(SUGGESTION_MACHINE_NUMBERS)
 SPECIAL_TITLES = {"30/1", "31/1", "36/1", "9.5/1", "23/1", "15,4/1",
                   "26,8/1", "38/1", "8,3/1", "35,4/1"}
+_NORMALIZED_SPECIAL_TITLES = {title.replace(" ", "").casefold() for title in SPECIAL_TITLES}
 
 
 def _text(value):
@@ -41,7 +41,7 @@ def titles_compatible(left, right):
     b = _text(right).replace(" ", "").casefold()
     if not a or not b:
         return False
-    if a in {x.casefold() for x in SPECIAL_TITLES} or b in {x.casefold() for x in SPECIAL_TITLES}:
+    if a in _NORMALIZED_SPECIAL_TITLES or b in _NORMALIZED_SPECIAL_TITLES:
         return a == b
     plies_a, plies_b = _title_plies(a), _title_plies(b)
     if plies_a is None or plies_b is None:
