@@ -23,6 +23,81 @@ from itertools import combinations
 from utils import clean_text, parse_number
 
 READY_CODES = {"AA", "AC", "AU", "AT"}
+ELVY_CLIENT_CODES = {"3009", "ELVY"}
+DELIVERY_ONE_WEEK_MACHINES = {192, 384, 672}
+DELIVERY_TWO_WEEK_MACHINES = {6, 24, 32, 56, 72, 128}
+
+
+def _is_elvy_client(value) -> bool:
+    normalized = clean_text(value).upper()
+    if normalized.endswith(".0"):
+        normalized = normalized[:-2]
+    return normalized in ELVY_CLIENT_CODES
+
+
+def _parse_delivery_date(value):
+    text = clean_text(value)
+    parsed = pd.to_datetime(
+        text, errors="coerce", dayfirst=not bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text))
+    )
+    return None if pd.isna(parsed) else parsed.normalize()
+
+
+def _add_delivery_days(start_date, days: int):
+    target = start_date + pd.to_timedelta(int(days), unit="D")
+    if target.dayofweek == 4:  # Friday is a holiday for this schedule.
+        target += pd.to_timedelta(1, unit="D")
+    return target
+
+
+def compute_delivery_date(row, today=None):
+    """Return the Elvy delivery date, or the yarn-waiting status."""
+    if not _is_elvy_client(row.get("cliente", "")):
+        return ""
+
+    comment = clean_text(row.get("comment", ""))
+    new_comment = clean_text(row.get("new_comment", ""))
+    is_pgx = comment.upper().startswith("PG-X")
+    yarn_match = clean_text(row.get("raw_yarn_match", ""))
+    if is_pgx and not yarn_match:
+        return "Bending for yarn"
+
+    today = pd.Timestamp(today or datetime.now().date()).normalize()
+    start_date = _parse_delivery_date(row.get("data"))
+    if start_date is None:
+        return ""
+
+    explicit_arrival = _parse_delivery_date(row.get("yarn_arrival_date"))
+    was_waiting = clean_text(row.get("old_comment", "")).casefold() == "filato"
+    if is_pgx and yarn_match:
+        start_date = explicit_arrival or (today if was_waiting else start_date)
+
+    try:
+        machine = int(float(str(row.get("mc", "")).replace(",", ".")))
+    except (TypeError, ValueError):
+        machine = None
+    if machine in DELIVERY_ONE_WEEK_MACHINES:
+        days = 7
+    elif machine in DELIVERY_TWO_WEEK_MACHINES:
+        days = 14
+    else:
+        days = 0
+
+    if new_comment.casefold() == "lab" or "LAB" in comment.upper():
+        days += 7
+    return _add_delivery_days(start_date, days).strftime("%Y-%m-%d")
+
+
+def compute_delivery_dates(df, today=None):
+    """Add the derived ``delivery_date`` column without changing other rows."""
+    result = df.copy()
+    if result.empty:
+        result["delivery_date"] = pd.Series(dtype=str)
+        return result
+    result["delivery_date"] = result.apply(
+        lambda row: compute_delivery_date(row, today=today), axis=1
+    )
+    return result
 
 
 def _blank(x):

@@ -12,8 +12,28 @@ folders later).
   `self._prefs`/`self._save_prefs` (the persisted-settings dict every tab
   reads/writes through).
 - `ui/tabs/*.py` — one file per tab. Each tab owns its own widgets and
-  its own upload/export handlers; business logic it needs lives in a
-  same-named `*_logic.py` at the root, not inside the tab file.
+  upload/export handlers; business logic it needs lives in a same-named
+  `*_logic.py` at the root, not inside the tab file.
+
+### Import boundary
+New code must import UI pages from `ui.tabs.*`. The root-level `*_tab.py`
+files are compatibility shims for older callers and should not be imported
+by code inside `ui/`. This keeps page ownership in one place while preserving
+the public import paths used by the launcher and older integrations.
+
+### Maintenance map
+- `ui/tabs/` — Tkinter widgets, event handlers, and rendering only.
+- `*_logic.py` — pure dataframe/business rules and calculations.
+- `*_parser.py` / `*_loaders.py` — input normalization and validation.
+- `*_exporter.py` — Excel, Word, and PDF output.
+- `*_cache.py`, `file_cache.py`, `path_manager.py` — persisted source paths
+  and shared cache state.
+- `master_import.py` — orchestration boundary for folder/master-file imports;
+  it may call tab adapters but should not contain business calculations.
+
+The `logic/` package is the canonical home for business-rule modules. Root
+`*_logic.py` files are compatibility shims for older imports; new code should
+import from `logic.*` directly.
 
 ## Business logic (`*_logic.py`, root)
 Pure(ish) computation, no Tkinter: `situazione_logic.py` (Copertura,
@@ -94,4 +114,23 @@ saved filename.
 Setup) + `build.bat`. When a module gains a new third-party import, add
 it to `requirements.txt` and, if PyInstaller's static analysis won't
 find it on its own (dynamic imports, C extensions), to
-`extra_hiddenimports` in `main.spec` too.
+`extra_hiddenimports` in `main.spec` too. `build.bat` reuses an existing
+`venv` in place (via `sync_venv_packages.py`, which removes anything no
+longer in `requirements.txt`) instead of deleting and recreating it on
+every build.
+
+## Number/text parsing (deliberately NOT consolidated)
+`biglietti_exporter._clean`/`_number`, `utils.clean_text`/`parse_number`,
+`abbina_suggestions._number`, and `elvy_invoice_parser._parse_number`
+(which already just wraps `utils.parse_number`) look like duplicates at
+a glance, but they aren't behaviorally identical: `utils.parse_number`
+disambiguates thousands-vs-decimal separators for the general case
+("1,234.56" vs "1.234,56"), while `biglietti_exporter._number` and
+`abbina_suggestions._number` take the simpler, deliberate assumption
+that a comma is always a decimal separator (correct for the real
+Italian/Egyptian ERP exports Biglietti/Ordine MED parse, which use
+comma-decimals without thousands separators) and differ from each other
+in their None-vs-0.0 failure return. Merging any of these would risk
+silently changing parsed values across pipelines that are already
+verified against real data -- if you're looking at this thinking "these
+should be one function," they were considered and kept apart on purpose.

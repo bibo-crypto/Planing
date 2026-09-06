@@ -32,7 +32,7 @@ SHEET_CANDIDATES: dict[str, list[str]] = {
     "qualita": ["qualita", "qualità"],
     "codes": ["articoli"],
     "magazino": ["magazino", "magazzino"],
-    "lotti": ["lotti"],
+    "lotti": ["lotti", "lotto"],
     "listini": ["listini", "prezzi"],
 }
 
@@ -45,7 +45,7 @@ DIRECTORY_FILE_CANDIDATES: dict[str, list[str]] = {
     "qualita": ["qualita", "qualità"],
     "codes": ["articoli", "codes"],
     "magazino": ["magazino", "magazzino"],
-    "lotti": ["lotti"],
+    "lotti": ["lotti", "lotto"],
     "listini": ["listini", "prezzi"],
     "densita": ["densita' query", "densita query", "densita", "density query"],
     "data_ordine": ["data ordine", "data_ordine", "dataordine", "ordine data"],
@@ -135,8 +135,6 @@ def find_files_in_directory(dir_path: str | Path) -> dict[str, Path]:
 
 
 def _content_match_ordine_files(files: list[Path], claimed: set[Path], found: dict[str, Path]) -> None:
-    import csv as _csv
-
     for f in files:
         if f in claimed:
             continue
@@ -145,32 +143,48 @@ def _content_match_ordine_files(files: list[Path], claimed: set[Path], found: di
                 if "dispo_bagno" in found:
                     continue
                 with open(f, encoding="utf-8-sig", newline="") as fh:
-                    sample = fh.readline()
-                if _norm("Dispo") in _norm(sample) and _norm("Articolo") in _norm(sample):
+                    sample = fh.read(8192)
+                if _has_header_signature(sample.splitlines(), {"dispo", "articolo"}):
                     found["dispo_bagno"] = f
                     claimed.add(f)
                 continue
 
             wb = openpyxl.load_workbook(f, read_only=True)
             try:
-                sheetnames = set(wb.sheetnames)
-                if "data_ordine" not in found and "Sheet1" in sheetnames:
-                    header = {_norm(v) for v in next(wb["Sheet1"].iter_rows(values_only=True), []) if v}
-                    signature = {_norm("Descrizione aggiuntiva ordine"), _norm("Cliente")}
-                    el_kamal_signature = {_norm("CODICE"), _norm("Clienti"), _norm("M/C")}
-                    if signature.issubset(header) or el_kamal_signature.issubset(header):
-                        found["data_ordine"] = f
+                data_signature = {"descrizioneaggiuntivaordine", "cliente"}
+                kamal_signature = {"codice", "clienti", "mc"}
+                dispo_signature = {"dispo", "articolo"}
+                for sheet_name in wb.sheetnames:
+                    sheet = wb[sheet_name]
+                    header_sets = [
+                        {_norm(v) for v in values if v}
+                        for values in sheet.iter_rows(values_only=True, max_row=12)
+                    ]
+                    if any(data_signature.issubset(headers) or kamal_signature.issubset(headers)
+                           for headers in header_sets):
+                        if "data_ordine" not in found:
+                            found["data_ordine"] = f
+                            claimed.add(f)
+                        break
+                    if "dispo_bagno" not in found and any(
+                        dispo_signature.issubset(headers) for headers in header_sets
+                    ):
+                        found["dispo_bagno"] = f
                         claimed.add(f)
-                        continue
-                if "dispo_bagno" not in found and "Doispo-Bagno" in sheetnames:
-                    # already embedded in a Data Ordine file -- nothing
-                    # separate to assign, so leave dispo_bagno unmatched
-                    # rather than pointing it at the same file twice.
-                    pass
+                        break
             finally:
                 wb.close()
         except Exception:
             continue
+
+
+def _has_header_signature(lines, required: set[str]) -> bool:
+    """Return whether a delimited header line contains all required names."""
+    for line in lines[:12]:
+        values = line.replace(",", ";").split(";")
+        if required.issubset({_norm(value) for value in values if value}):
+            return True
+    return False
 
 
 def _extract_sheet_to_temp(master_path: str, sheet_name: str) -> str:

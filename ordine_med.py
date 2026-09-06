@@ -30,17 +30,18 @@ from typing import Any
 import openpyxl
 
 from biglietti_exporter import _clean, _get, _key, _number, _read_sheet_rows  # noqa: F401 -- shared normalization helpers
+from constants import ABBINA_MACHINE_CODES
 
 
 # ---------------------------------------------------------------------------
 # GRUPPO MACCHINA lookup -- Rocche-per-ABBIN-group total -> the 3300-series
 # code this sheet uses (distinct from Biglietti's own M/C machine numbers;
 # both derive from the same Rocche-count idea but are separate ERP fields).
+# Sourced from constants.py (the single verified table, cross-checked
+# against real DFM/Ordine da creare data) plus the MED-only 7-Rocche
+# overlap this query alone needs.
 # ---------------------------------------------------------------------------
-GRUPPO_MACCHINA_TABLE: dict[int, int] = {
-    6: 3301, 7: 3301, 24: 3310, 32: 3306, 56: 3302,
-    72: 3307, 128: 3303, 192: 3308, 384: 3304, 672: 3309,
-}
+GRUPPO_MACCHINA_TABLE: dict[int, int] = {**ABBINA_MACHINE_CODES, 7: 3301}
 
 
 def _polmoni_multiplier(polmoni_text: str) -> int:

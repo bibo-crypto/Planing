@@ -14,7 +14,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
 
-import prezzi_logic as logic
+from logic import prezzi as logic
 from prezzi_cache import load_prezzi_cache, save_prezzi_cache
 from path_manager import save_source
 from utils import logger

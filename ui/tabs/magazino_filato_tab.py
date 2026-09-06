@@ -14,8 +14,8 @@ from tkinter import ttk, filedialog, messagebox
 from typing import Callable
 import pandas as pd
 
-import lotti_logic
-import magazino_logic as logic
+from logic import lotti as lotti_logic
+from logic import magazino as logic
 from lotti_cache import load_lotti_cache, save_lotti_cache
 from magazino_cache import load_magazino_cache, save_magazino_cache
 from utils import logger

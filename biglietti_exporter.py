@@ -240,6 +240,9 @@ def load_articoli_marca_map(path: Path) -> tuple[dict[str, str], list[str]]:
     return out, errors
 
 
+_ARTICOLI_MARCA_CACHE: tuple[str, int, int, dict[str, str]] | None = None
+
+
 def load_articoli_marca_lookup() -> dict[str, str]:
     """Convenience: re-read whatever Articoli.xlsx was last uploaded via
     the Biglietti tab's own Articoli button (path cached in
@@ -252,7 +255,14 @@ def load_articoli_marca_lookup() -> dict[str, str]:
     path = cache.get("source_path")
     if not path or not Path(path).is_file():
         return {}
-    marca_map, _errors = load_articoli_marca_map(Path(path))
+    source = Path(path)
+    stat = source.stat()
+    cache_key = (str(source), stat.st_mtime_ns, stat.st_size)
+    global _ARTICOLI_MARCA_CACHE
+    if _ARTICOLI_MARCA_CACHE and _ARTICOLI_MARCA_CACHE[:3] == cache_key:
+        return _ARTICOLI_MARCA_CACHE[3]
+    marca_map, _errors = load_articoli_marca_map(source)
+    _ARTICOLI_MARCA_CACHE = (*cache_key, marca_map)
     return marca_map
 
 
@@ -275,9 +285,13 @@ def _titolo_lookup(articolo: str, codes_map: dict[str, str]) -> str:
 # here since the Prezzi tab already provides one).
 # ---------------------------------------------------------------------------
 
+_PREZZO_LOOKUP_CACHE: tuple[str, int, int, dict[tuple, tuple], str] | None = None
+
+
 def load_prezzo_lookup() -> tuple[dict[tuple, tuple], str]:
     """Returns (lookup, source_file_name). Empty lookup + '' if nothing has
     been uploaded to the Prezzi tab yet."""
+    global _PREZZO_LOOKUP_CACHE
     try:
         import prezzi_cache
         import prezzi_logic
@@ -287,10 +301,18 @@ def load_prezzo_lookup() -> tuple[dict[tuple, tuple], str]:
     path = cache.get("source_path")
     if not path or not Path(path).is_file():
         return {}, ""
+    source = Path(path)
+    stat = source.stat()
+    cache_key = (str(source), stat.st_mtime_ns, stat.st_size)
+    if _PREZZO_LOOKUP_CACHE and _PREZZO_LOOKUP_CACHE[:3] == cache_key:
+        return _PREZZO_LOOKUP_CACHE[3], _PREZZO_LOOKUP_CACHE[4]
     df, _errors = prezzi_logic.load_prezzi(path)
     if df is None or df.empty:
         return {}, ""
-    return prezzi_logic.build_price_lookup(df), cache.get("source_file", "")
+    lookup = prezzi_logic.build_price_lookup(df)
+    source_file = cache.get("source_file", "")
+    _PREZZO_LOOKUP_CACHE = (*cache_key, lookup, source_file)
+    return lookup, source_file
 
 
 # ---------------------------------------------------------------------------
@@ -486,19 +508,33 @@ class OrderRecord:
 
 
 def _read_sheet_rows(ws) -> list[dict[str, Any]]:
-    """Read a sheet using the best header row (row 1 or row 2)."""
+    """Read a sheet using its most likely header row, even after export shifts."""
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
+    known_headers = {
+        "cliente", "clienti", "articolo", "codice", "colore", "ordine", "riga",
+        "consegna", "ordinata", "assegnata", "descrizioneaggiuntivaordine",
+        "dispo", "bagno", "partita", "partitagg", "titolo", "mc", "rocche",
+        "qta", "q ta", "dataconsegna", "data consegna", "commento",
+        "disposizione", "numbagno",
+    }
     candidates = []
-    for idx in (0, 1):
+    for idx in range(min(12, len(rows))):
         if idx < len(rows):
             headers = [_key(x) or f"__col{i + 1}" for i, x in enumerate(rows[idx])]
-            score = sum(bool(x) for x in headers)
-            candidates.append((score, idx, headers))
-    # Prefer the first row when scores tie; a data row can contain as many
-    # non-empty cells as a header row in ERP exports.
-    _, header_idx, headers = max(candidates, key=lambda item: (item[0], -item[1]), default=(0, 0, []))
+            known_score = sum(header in known_headers for header in headers)
+            nonempty_score = sum(bool(x) for x in headers)
+            candidates.append((known_score, nonempty_score, idx, headers))
+    best_known = max((item[0] for item in candidates), default=0)
+    if best_known >= 2:
+        _, _, header_idx, headers = max(
+            candidates, key=lambda item: (item[0], item[1], -item[2])
+        )
+    else:
+        _, _, header_idx, headers = max(
+            candidates, key=lambda item: (item[1], -item[2]), default=(0, 0, 0, [])
+        )
     out = []
     for values in rows[header_idx + 1:]:
         if not any(_clean(x) for x in values):
@@ -521,7 +557,22 @@ def _read_sheet_rows(ws) -> list[dict[str, Any]]:
 
 
 def _get(row: dict[str, Any], *names: str) -> Any:
+    aliases = {
+        "articolo": ("codice articolo", "articolo codice"),
+        "colore": ("codice colore", "colore codice", "descrizione colore"),
+        "ordinata": ("qta", "q ta", "q.t.a", "quantita", "quantità", "rocche"),
+        "riga": ("numero riga", "nr riga", "n riga"),
+        "consegna": ("data consegna", "delivery date"),
+        "descrizione aggiuntiva ordine": ("descrizione ordine", "commento ordine", "commento"),
+        "dispo": ("disposizione", "sigla disposizione"),
+        "bagno": ("n bagno", "numero bagno"),
+        "partita": ("partita col", "partita colore"),
+        "partita.gg": ("partita gg", "partita grezzo", "partita filato"),
+    }
+    expanded = list(names)
     for name in names:
+        expanded.extend(aliases.get(_key(name), ()))
+    for name in expanded:
         if _key(name) in row and _clean(row[_key(name)]):
             return row[_key(name)]
     return ""
@@ -561,20 +612,39 @@ def load_dispo_bagno_rows(path: Path) -> list[dict[str, Any]]:
         return _read_dispo_csv(path)
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
-        return _read_sheet_rows(wb.active)
+        sheet = next(
+            (ws for ws in wb.worksheets
+             if "dispo" in _key(ws.title) and "bagno" in _key(ws.title)),
+            wb.active,
+        )
+        return _read_sheet_rows(sheet)
     finally:
         wb.close()
 
 
 def load_order(input_path: Path, dispo_path: Path | None = None) -> tuple[list[OrderRecord], list[dict[str, Any]]]:
     wb = openpyxl.load_workbook(input_path, data_only=True, read_only=True)
-    if "Sheet1" not in wb.sheetnames:
-        raise ValueError('Il file Data Ordine deve contenere il foglio "Sheet1".')
-    data = _read_sheet_rows(wb["Sheet1"])
-    dispo_rows = _read_sheet_rows(wb["Doispo-Bagno"]) if "Doispo-Bagno" in wb.sheetnames else []
+    order_sheet = next(
+        (name for name in wb.sheetnames if _key(name) in {"ordine", "sheet1"}),
+        None,
+    )
+    if order_sheet is None:
+        raise ValueError('Il file Data Ordine deve contenere un foglio Ordine o Sheet1.')
+    data = _read_sheet_rows(wb[order_sheet])
+    dispo_sheet = next(
+        (name for name in wb.sheetnames
+         if "dispo" in _key(name) and "bagno" in _key(name)),
+        None,
+    )
+    dispo_rows = _read_sheet_rows(wb[dispo_sheet]) if dispo_sheet else []
+    raw_sheet = next(
+        (name for name in wb.sheetnames
+         if "filato" in _key(name) or "tinturia" in _key(name)),
+        None,
+    )
+    raw_rows = _read_sheet_rows(wb[raw_sheet]) if raw_sheet else []
     if dispo_path and dispo_path != input_path:
         dispo_rows = load_dispo_bagno_rows(dispo_path)
-    raw_rows = _read_sheet_rows(wb["تحضير خيط خام"]) if "تحضير خيط خام" in wb.sheetnames else []
     if not data:
         raise ValueError("Sheet1 non contiene righe d'ordine.")
     dispo_by_riga = {
