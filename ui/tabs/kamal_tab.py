@@ -26,8 +26,8 @@ from ordini_elvy import export_filato_full, export_ordini_full, match_raw_yarn, 
 from utils import logger, load_settings, save_settings
 from typing import Callable
 
-import magazino_logic
-import lotti_logic
+from logic import magazino as magazino_logic
+from logic import lotti as lotti_logic
 
 
 class KamalTab(ttk.Frame):

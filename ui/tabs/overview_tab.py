@@ -55,6 +55,7 @@ HEADERS_IT = {
     "cliente": "Cliente", "colore": "Colore", "titolo": "Titolo",
     "articolo": "Articolo", "codice": "Codice", "ordine": "Ordine",
     "riga": "Riga", "data": "Data", "consegna": "Consegna",
+    "delivery_date": "Delivery Date",
     "partita": "Partita", "rocche": "Rocche", "mc": "M/C",
     "comment": "Commento", "raw_yarn_match": "Filato Disponibile",
     "cq": "C.Q", "tinto": "Tinto", "bagno": "Bagno",
@@ -68,6 +69,7 @@ HEADERS_IT = {
 CHECK_COLUMNS = [
     "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
     "data", "consegna", "partita", "rocche", "mc", "comment", "raw_yarn_match",
+    "delivery_date",
     "cq", "tinto", "bagno", "old_comment", "new_comment", "planedate",
     "data_qualita", "data_uscita", "custom", "days_in_qc",
 ]
@@ -148,7 +150,9 @@ def _write_typed_excel_table(ws, df: pd.DataFrame) -> None:
                 values.append(None)
             elif kind == "date":
                 parsed = pd.to_datetime(value, errors="coerce")
-                values.append(None if pd.isna(parsed) else parsed.to_pydatetime())
+                values.append(
+                    str(value) if pd.isna(parsed) else parsed.strftime("%d/%m/%Y")
+                )
             elif kind == "number":
                 parsed = parse_number(value)
                 values.append(parsed if parsed is not None else str(value))
@@ -165,8 +169,10 @@ def _write_typed_excel_table(ws, df: pd.DataFrame) -> None:
         )
         header_cell.alignment = openpyxl.styles.Alignment(horizontal="center")
         if kind == "date":
+            # Dates are exported as text deliberately. Excel otherwise may
+            # reinterpret the day/month order using the computer locale.
             for cell in ws[letter][1:]:
-                cell.number_format = "yyyy-mm-dd"
+                cell.number_format = "@"
         elif kind == "number":
             for cell in ws[letter][1:]:
                 # Overview quantities and identifiers are whole numbers:
@@ -205,12 +211,25 @@ def attach_excel_export(tree: ttk.Treeview, default_filename: str) -> None:
     tree.bind("<Button-3>", _popup)
 
 
+def _format_display_dates(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Format report dates for people while keeping blanks blank."""
+    result = df.copy()
+    for column in columns:
+        if column not in result.columns:
+            continue
+        original = result[column].fillna("").astype(str)
+        parsed = pd.to_datetime(result[column], errors="coerce", dayfirst=False)
+        formatted = parsed.dt.strftime("%d/%m/%Y")
+        result[column] = formatted.where(parsed.notna(), original)
+    return result
+
+
 class OverviewTab(ttk.Frame):
     """Dashboard: KPI cards + charts + detail lists, all read-only."""
 
     AUTO_REFRESH_MS = 5000
 
-    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None):
+    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None, on_shared_cache_changed=None):
         super().__init__(master)
         self.situazione_tab = situazione_tab
         self.magazino_tab = magazino_tab
@@ -218,6 +237,7 @@ class OverviewTab(ttk.Frame):
         self.prezzi_tab = prezzi_tab
         self._save_prefs = save_prefs
         self._prefs = prefs or {}
+        self._on_shared_cache_changed = on_shared_cache_changed
         p_dir = self._prefs.get("master_data_dir")
         self._data_folder = Path(p_dir) if p_dir and Path(p_dir).is_dir() else None
 
@@ -234,9 +254,9 @@ class OverviewTab(ttk.Frame):
         style = ttk.Style(self)
         style.configure("Overview.Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
         style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#526173",
-                        font=("Segoe UI", 9, "bold"))
+                        font=("Segoe UI", 10, "bold"))
         style.configure("Overview.CardValue.TLabel", background="#ffffff", foreground="#16324f",
-                        font=("Segoe UI", 21, "bold"))
+                        font=("Segoe UI", 24, "bold"))
         style.configure("Overview.Table.TLabelframe", background="#ffffff", borderwidth=1, relief="solid")
         style.configure("Overview.Table.TLabelframe.Label", background="#ffffff", foreground="#16324f",
                         font=("Segoe UI", 10, "bold"))
@@ -248,9 +268,9 @@ class OverviewTab(ttk.Frame):
                   foreground=[("selected", "#ffffff")])
         style.configure("Overview.AlertCard.TFrame", background="#fff7ed", relief="solid", borderwidth=1)
         style.configure("Overview.AlertCardTitle.TLabel", background="#fff7ed", foreground="#c2410c",
-                        font=("Segoe UI", 9, "bold"))
+                        font=("Segoe UI", 10, "bold"))
         style.configure("Overview.AlertCardValue.TLabel", background="#fff7ed", foreground="#9a3412",
-                        font=("Segoe UI", 19, "bold"))
+                        font=("Segoe UI", 24, "bold"))
 
         toolbar = ttk.Frame(self)
         toolbar.pack(side="top", fill="x", padx=8, pady=(8, 4))
@@ -309,12 +329,12 @@ class OverviewTab(ttk.Frame):
         self._lbl_sync_status.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
         self._cards_frame = ttk.Frame(self._body, padding=(0, 2))
-        self._cards_frame.pack(side="top", fill="x", padx=10, pady=(3, 12))
-        for column in range(3):
+        self._cards_frame.pack(side="top", fill="x", padx=4, pady=(3, 12))
+        for column in range(5):
             self._cards_frame.columnconfigure(column, weight=1, uniform="overview_card")
 
         self._tables_frame = ttk.Frame(self._body, padding=(0, 2))
-        self._tables_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 14))
+        self._tables_frame.pack(side="top", fill="both", expand=True, padx=4, pady=(0, 14))
         self._tables_frame.columnconfigure(0, weight=1, uniform="overview_table")
         self._tables_frame.columnconfigure(1, weight=1, uniform="overview_table")
         self._table_count = 0
@@ -432,6 +452,21 @@ class OverviewTab(ttk.Frame):
                 except Exception:
                     pass
 
+                # Propagate to every other tab that keeps its own live
+                # in-memory copy of a shared source (Kamal/Ordine MED/
+                # Magazino Filato/Situazione Settimanale/Ordine Elvy/Prezzi)
+                # -- otherwise they'd only pick up what this sync just wrote
+                # next time the user happens to interact with them.
+                if self._on_shared_cache_changed:
+                    try:
+                        self._on_shared_cache_changed()
+                    except Exception:
+                        pass
+                    # Magazino and the shared DFM/Produzione consumers finish
+                    # their own parsing in workers. Re-run the fan-out after
+                    # those caches have had time to become available.
+                    self.after(1000, self._refresh_shared_tabs)
+
                 msg_parts = []
                 if loaded:
                     msg_parts.append("✅ Successfully Loaded & Distributed:\n" + "\n".join(f"  • {item}" for item in loaded))
@@ -445,6 +480,18 @@ class OverviewTab(ttk.Frame):
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_shared_tabs(self, attempt: int = 0) -> None:
+        """Retry shared-source fan-out after background upload handlers finish."""
+        if not self.winfo_exists():
+            return
+        if self._on_shared_cache_changed:
+            try:
+                self._on_shared_cache_changed()
+            except Exception:
+                pass
+        if attempt < 7:
+            self.after(1000, lambda: self._refresh_shared_tabs(attempt + 1))
 
     def refresh(self, force: bool = False) -> None:
         signature = self._current_data_signature()
@@ -517,8 +564,11 @@ class OverviewTab(ttk.Frame):
         # The current situation data stores dates as ISO strings, so parse them
         # explicitly instead of comparing display text.
         delivery_df = df.iloc[0:0].copy()
-        if not df.empty and "consegna" in df.columns:
-            due_dates = pd.to_datetime(df["consegna"], errors="coerce")
+        if not df.empty:
+            is_elvy = df.get("cliente", pd.Series("", index=df.index)).astype(str).str.upper().isin({"ELVY", "3009", "3009.0"})
+            derived_dates = pd.to_datetime(df.get("delivery_date", pd.Series(index=df.index)), errors="coerce")
+            original_dates = pd.to_datetime(df.get("consegna", pd.Series(index=df.index)), errors="coerce")
+            due_dates = original_dates.where(~is_elvy, derived_dates)
             today = pd.Timestamp.now().normalize()
             deadline = today + pd.Timedelta(days=DELIVERY_ALERT_DAYS)
             # Delivery risk is limited to batches still queued in quality
@@ -533,6 +583,11 @@ class OverviewTab(ttk.Frame):
 
         n_shortage_colors = shortage_df["colore"].nunique() if not shortage_df.empty else 0
         n_ready_colors = ready_df["colore"].nunique() if not ready_df.empty else 0
+        elvy_mask = df.get("cliente", pd.Series("", index=df.index)).astype(str).str.upper().isin({"ELVY", "3009", "3009.0"})
+        elvy_df = df.loc[elvy_mask].copy()
+        elvy_delivery = pd.to_datetime(elvy_df.get("delivery_date", pd.Series(index=elvy_df.index)), errors="coerce")
+        elvy_total_colors = elvy_df["colore"].nunique() if not elvy_df.empty and "colore" in elvy_df else 0
+        elvy_due_colors = int((elvy_delivery.notna() & elvy_delivery.le(pd.Timestamp.now().normalize() + pd.Timedelta(days=DELIVERY_ALERT_DAYS))).sum())
         total_yarn_kg = (
             magazino["mag_peso"].sum() if not magazino.empty and "mag_peso" in magazino else 0.0
         )
@@ -543,6 +598,8 @@ class OverviewTab(ttk.Frame):
         self._add_card(3, "⚠️ In attesa di filato", str(n_shortage_colors))
         self._add_card(4, "⚠️ Ritardo in Q.C", f"{len(check_df):,}", alert=True)
         self._add_card(5, "📅 Ritardo Consegna", f"{len(delivery_df):,}", alert=True)
+        self._add_card(6, "🎨 Elvy: totale colori", f"{elvy_total_colors:,}")
+        self._add_card(7, f"📅 Elvy: entro {DELIVERY_ALERT_DAYS} giorni", f"{elvy_due_colors:,}", alert=elvy_due_colors > 0)
 
         price_anomalies = business_logic.find_price_anomalies(df)
         price_problem_colors = len({
@@ -551,7 +608,7 @@ class OverviewTab(ttk.Frame):
             if str(item.get("colore", "")).strip()
         })
         self._add_card(
-            6, "💲 Errori Prezzo — colori", str(price_problem_colors),
+            8, "💲 Errori Prezzo — colori", str(price_problem_colors),
             alert=price_problem_colors > 0,
         )
 
@@ -559,7 +616,7 @@ class OverviewTab(ttk.Frame):
 
         self._add_table(
             "Colori pronti da spedire (senza uscita)",
-            ready_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche", "mc", "bagno"],
+            ready_df, ["cliente", "codice", "colore", "titolo", "prezzo", "partita", "rocche", "mc", "bagno"],
             "colori_pronti.xlsx",
         )
         self._add_table(
@@ -578,8 +635,19 @@ class OverviewTab(ttk.Frame):
         self._add_table(
             f"📅 Ritardo consegna / entro {DELIVERY_ALERT_DAYS} giorni (C.Q = OO)",
             delivery_df, ["cliente", "codice", "colore", "titolo", "partita", "rocche",
-                          "consegna", "days_to_delivery", "new_comment"],
+                          "delivery_date", "days_to_delivery", "new_comment"],
             "ordini_urgenti_consegna.xlsx",
+        )
+        elvy_columns = [
+            "articolo", "titolo", "codice", "colore", "prezzo", "ordine", "riga",
+            "data", "partita", "rocche", "mc", "comment", "cq", "bagno",
+            "new_comment", "delivery_date",
+        ]
+        self._add_table(
+            "Tutti i colori Elvy",
+            elvy_df,
+            elvy_columns,
+            "colori_elvy.xlsx",
         )
         self._add_table(
             "💲 Errori Prezzo (Prezzo mancante o sospetto)",
@@ -615,11 +683,9 @@ class OverviewTab(ttk.Frame):
             self._cards_frame, text="Copertura macchine", bg="#f8fafc", fg="#16324f",
             font=("Segoe UI", 10, "bold"), padx=8, pady=6,
         )
-        # Row 2 is reserved for the Errori Prezzi color counter card.
-        frame.grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 10), sticky="ew")
-        self._cards_frame.columnconfigure(0, weight=1)
-        self._cards_frame.columnconfigure(1, weight=1)
-        self._cards_frame.columnconfigure(2, weight=1)
+        frame.grid(row=2, column=0, columnspan=5, padx=2, pady=(0, 10), sticky="ew")
+        for column in range(5):
+            self._cards_frame.columnconfigure(column, weight=1, uniform="overview_card")
 
         covered_until = business_logic.machine_coverage_until
 
@@ -629,18 +695,18 @@ class OverviewTab(ttk.Frame):
             card = tk.Frame(
                 frame, bg="#fee2e2" if empty else "#eaf2f8",
                 highlightbackground="#ef4444" if empty else "#cbd5e1",
-                highlightthickness=1, width=106, height=76,
+                highlightthickness=1, width=110, height=82,
             )
             card.grid(row=0, column=index, padx=3, pady=3, sticky="ew")
             card.grid_propagate(False)
             frame.columnconfigure(index, weight=1, minsize=106)
             tk.Label(card, text=f"M{machine}", bg=card["bg"], fg="#991b1b" if empty else "#16324f",
-                     font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x")
+                     font=("Segoe UI", 10, "bold"), anchor="center").pack(fill="x")
             tk.Label(card, text=f"{count} colori", bg=card["bg"], fg="#991b1b" if empty else "#344054",
-                     font=("Segoe UI", 11, "bold"), anchor="center").pack(fill="x")
+                     font=("Segoe UI", 12, "bold"), anchor="center").pack(fill="x")
             tk.Label(card, text=f"Fino al: {covered_until(count)}", bg=card["bg"],
                      fg="#991b1b" if empty else "#667085",
-                     font=("Segoe UI", 8, "bold"), anchor="center").pack(fill="x", pady=(2, 0))
+                     font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x", pady=(3, 0))
 
     def _add_card(self, col: int, title: str, value: str, alert: bool = False) -> None:
         self._cards_frame.columnconfigure(col, weight=1)
@@ -648,9 +714,11 @@ class OverviewTab(ttk.Frame):
         title_style = "Overview.AlertCardTitle.TLabel" if alert else "Overview.CardTitle.TLabel"
         value_style = "Overview.AlertCardValue.TLabel" if alert else "Overview.CardValue.TLabel"
         card = ttk.Frame(self._cards_frame, style=card_style, padding=(14, 12))
-        card.grid(row=col // 3, column=col % 3, padx=5, pady=5, sticky="nsew")
-        self._cards_frame.rowconfigure(col // 3, weight=1, minsize=86)
-        ttk.Label(card, text=title, style=title_style, wraplength=180).pack(anchor="w")
+        grid_row = col // 5
+        grid_column = col % 5
+        card.grid(row=grid_row, column=grid_column, padx=3, pady=4, sticky="nsew")
+        self._cards_frame.rowconfigure(grid_row, weight=1, minsize=100)
+        ttk.Label(card, text=title, style=title_style, wraplength=150).pack(anchor="w")
         ttk.Label(card, text=value, style=value_style).pack(anchor="w", pady=(4, 0))
 
     def _add_table(self, title: str, df: pd.DataFrame, cols: list[str], export_filename: str, count_column: str | None = None) -> None:
@@ -664,7 +732,8 @@ class OverviewTab(ttk.Frame):
         header = ttk.Frame(frame)
         header.pack(side="top", fill="x", pady=(0, 4))
 
-        available_cols = [c for c in cols if df.empty or c in df.columns] or cols
+        display_df = _format_display_dates(df, ["data", "consegna", "delivery_date", "tinto", "data_qualita", "data_uscita"])
+        available_cols = [c for c in cols if display_df.empty or c in display_df.columns] or cols
         search_var = tk.StringVar()
         ttk.Label(header, text="Cerca:").pack(side="left", padx=(2, 5))
         search_entry = ttk.Entry(header, textvariable=search_var, width=28)
@@ -690,13 +759,13 @@ class OverviewTab(ttk.Frame):
 
         def render_filtered_rows(*_args):
             tree.delete(*tree.get_children())
-            visible = df
+            visible = display_df
             query = search_var.get().strip()
-            if query and not df.empty:
-                mask = df[available_cols].astype(str).apply(
+            if query and not display_df.empty:
+                mask = display_df[available_cols].astype(str).apply(
                     lambda column: column.str.contains(query, case=False, regex=False, na=False)
                 ).any(axis=1)
-                visible = df.loc[mask]
+                visible = display_df.loc[mask]
             for index, (_, row) in enumerate(visible.iterrows()):
                 tree.insert("", "end", values=[row.get(c, "") for c in available_cols],
                             tags=("evenrow" if index % 2 == 0 else "oddrow",))

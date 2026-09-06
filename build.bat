@@ -25,17 +25,23 @@ if errorlevel 1 (
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo  [OK] %%v detected
 echo.
 
-:: -- Create virtual environment -------------------------------------------
-echo  [1/5]  Creating virtual environment (venv)...
-if exist venv (
-    echo         Removing old venv...
-    rmdir /s /q venv
-)
-python -m venv venv
-if errorlevel 1 (
-    echo  [ERROR] Failed to create venv.
-    if not defined PLANING_NO_PAUSE pause
-    exit /b 1
+:: -- Create or reuse virtual environment -----------------------------------
+if exist venv\Scripts\python.exe (
+    echo  [1/5]  Reusing existing virtual environment ^(venv^)...
+    echo         Skipping recreation -- packages will be added/removed to
+    echo         match requirements.txt instead of rebuilding from scratch.
+) else (
+    echo  [1/5]  Creating virtual environment ^(venv^)...
+    if exist venv (
+        echo         Found an incomplete venv folder, removing it first...
+        rmdir /s /q venv
+    )
+    python -m venv venv
+    if errorlevel 1 (
+        echo  [ERROR] Failed to create venv.
+        if not defined PLANING_NO_PAUSE pause
+        exit /b 1
+    )
 )
 echo         Done.
 echo.
@@ -52,13 +58,16 @@ echo         Done.
 echo.
 
 :: -- Install dependencies ---------------------------------------------------
-echo  [3/5]  Installing dependencies from requirements.txt...
+echo  [3/5]  Syncing dependencies with requirements.txt...
 python -m pip install --upgrade pip --quiet
 if errorlevel 1 (
     echo  [ERROR] Could not upgrade pip.
     if not defined PLANING_NO_PAUSE pause
     exit /b 1
 )
+echo         Removing packages no longer needed...
+python sync_venv_packages.py
+echo         Installing/updating packages from requirements.txt...
 python -m pip install -r requirements.txt --quiet
 if errorlevel 1 (
     echo  [ERROR] pip install requirements.txt failed.

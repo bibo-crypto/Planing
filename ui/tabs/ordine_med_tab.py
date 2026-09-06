@@ -12,7 +12,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import ordine_med
-from biglietti_exporter import load_articoli_marca_lookup, load_articoli_titolo_map, load_densita_query, load_prezzo_lookup
 from densita_cache import load_densita_cache, save_densita_cache
 from magazino_cache import load_magazino_cache, save_magazino_cache
 from path_manager import save_source, source_path
@@ -30,8 +29,8 @@ class OrdineMedTab(ttk.Frame):
         self.output_path: Path | None = None
         self.erp_folder: Path | None = None
         self.filato_folder: Path | None = None
-        self.erp_enabled = tk.BooleanVar(value=False)
-        self.filato_enabled = tk.BooleanVar(value=False)
+        self.erp_enabled = tk.BooleanVar(value=True)
+        self.filato_enabled = tk.BooleanVar(value=True)
         self.magazino_path: Path | None = None
         self.densita_path: Path | None = None
         self._build_ui()
@@ -43,16 +42,13 @@ class OrdineMedTab(ttk.Frame):
 
         sel_frame = ttk.LabelFrame(self, text="Input", padding=6)
         sel_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
-        sel_frame.columnconfigure((0, 1, 2), weight=1)
+        sel_frame.columnconfigure((0, 1), weight=1)
         ttk.Button(sel_frame, text="📄 Select Ordine File", command=self._on_select_ordine, width=18).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
         ttk.Button(sel_frame, text="💾 Output Folder", command=self._on_select_output, width=16).grid(row=0, column=1, padx=4, pady=4, sticky="ew")
-        ttk.Button(sel_frame, text="📁 ERP File Folder", command=self._on_select_erp_folder, width=18).grid(row=0, column=2, padx=4, pady=4, sticky="ew")
         self._lbl_ordine = ttk.Label(sel_frame, text="No Ordine file selected", foreground="grey", anchor="w")
         self._lbl_ordine.grid(row=1, column=0, sticky="ew", padx=4)
         self._lbl_output = ttk.Label(sel_frame, text="No output folder selected", foreground="grey", anchor="w")
         self._lbl_output.grid(row=1, column=1, sticky="ew", padx=4)
-        self._lbl_erp = ttk.Label(sel_frame, text="No ERP folder selected", foreground="grey", anchor="w")
-        self._lbl_erp.grid(row=1, column=2, sticky="ew", padx=4)
 
         self._lbl_shared = ttk.Label(
             self,
@@ -170,8 +166,8 @@ class OrdineMedTab(ttk.Frame):
         if filato_str and Path(filato_str).is_dir():
             self.filato_folder = Path(filato_str)
             self._lbl_filato.config(text=filato_str, foreground="black")
-        self.erp_enabled.set(bool(self._prefs.get("ordine_med_erp_enabled", False)))
-        self.filato_enabled.set(bool(self._prefs.get("ordine_med_filato_enabled", False)))
+        self.erp_enabled.set(bool(self._prefs.get("ordine_med_erp_enabled", True)))
+        self.filato_enabled.set(bool(self._prefs.get("ordine_med_filato_enabled", True)))
 
         ordine = source_path("data_ordine")
         if ordine and ordine.is_file():
@@ -211,6 +207,12 @@ class OrdineMedTab(ttk.Frame):
 
     def _worker(self):
         try:
+            from biglietti_exporter import (
+                load_articoli_marca_lookup,
+                load_articoli_titolo_map,
+                load_densita_query,
+                load_prezzo_lookup,
+            )
             records = ordine_med.load_ordine(self.ordine_path)
             ordine_med.compute_mc_and_gruppo(records)
 

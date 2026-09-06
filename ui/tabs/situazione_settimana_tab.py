@@ -14,8 +14,8 @@ from typing import Callable
 import pandas as pd
 
 import situazione_loaders as data_loaders
-import situazione_settimana_logic as logic
-from situazione_tab import SourceRow
+from logic import situazione_settimana as logic
+from ui.tabs.situazione_tab import SourceRow
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger

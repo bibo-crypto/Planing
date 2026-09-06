@@ -23,11 +23,10 @@ import situazione_db as db
 import situazione_loaders as data_loaders
 import situazione_logic as business_logic
 from abbina_suggestions import build_suggestions
-from yarn_shortage_tab import YarnShortageTab
+from ui.tabs.yarn_shortage_tab import YarnShortageTab
 from dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from prod_lookup import load_prod_cache, save_prod_cache
 from utils import logger
-import biglietti_exporter
 from densita_cache import load_densita_cache
 from path_manager import load_source, save_source, source_path
 
@@ -75,6 +74,7 @@ COLUMN_SPEC = [
     ("ordine", "Ordine", "text"),
     ("riga", "Riga", "number"),
     ("data", "Data", "date"),
+    ("delivery_date", "Delivery Date", "date"),
     ("consegna", "Consegna", "date"),
     ("partita", "Partita", "number"),
     ("rocche", "Rocche", "number"),
@@ -927,6 +927,7 @@ class SituazioneTab(ttk.Frame):
         # isn't found.
         try:
             import articoli_cache
+            import biglietti_exporter
             marca_map, _errors = biglietti_exporter.load_articoli_marca_map(Path(path))
             if marca_map:
                 articoli_cache.save_articoli_cache(display_path)
@@ -1087,6 +1088,7 @@ class SituazioneTab(ttk.Frame):
         if self.current_df.empty:
             return
         self._recompute_raw_yarn_match()
+        self.current_df = business_logic.compute_delivery_dates(self.current_df)
         self._data_revision += 1
         self._render_tree(self.current_df)
 
@@ -1131,6 +1133,7 @@ class SituazioneTab(ttk.Frame):
                 if not self.winfo_exists() or len(self.current_df) != len(snapshot):
                     return
                 self.current_df["raw_yarn_match"] = matches
+                self.current_df = business_logic.compute_delivery_dates(self.current_df)
                 self._data_revision += 1
                 self._render_tree(self.current_df)
 
@@ -1144,6 +1147,7 @@ class SituazioneTab(ttk.Frame):
         Partita, from the Densita' Query workbook uploaded on either the
         Biglietti or Situazione tab -- best-effort, never blocks: blank if
         the relevant source has not been uploaded yet."""
+        import biglietti_exporter
         if self.current_df.empty:
             self.current_df["prezzo"] = ""
             self.current_df["densita"] = ""
@@ -1188,6 +1192,7 @@ class SituazioneTab(ttk.Frame):
             )
             self.sort_state["bagno"] = False  # next click on Bagno heading reverses to Z-A
         self._recompute_raw_yarn_match()
+        self.current_df = business_logic.compute_delivery_dates(self.current_df)
         self._recompute_prezzo_densita()
         self._render_tree(self.current_df)
         for callback in tuple(self._table_loaded_callbacks):
@@ -1219,6 +1224,12 @@ class SituazioneTab(ttk.Frame):
         if df.empty:
             return
         display_df = df.reindex(columns=self.columns, fill_value="")
+        for date_column in ("data", "delivery_date", "consegna", "tinto", "data_qualita", "data_uscita"):
+            if date_column in display_df.columns:
+                original = display_df[date_column].fillna("").astype(str)
+                parsed = pd.to_datetime(display_df[date_column], errors="coerce")
+                formatted = parsed.dt.strftime("%d/%m/%Y")
+                display_df[date_column] = formatted.where(parsed.notna(), original)
         rows = list(display_df.itertuples(index=False, name=None))
 
         def insert_chunk(start=0):

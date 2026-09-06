@@ -59,7 +59,7 @@ from dfm_lookup import (
     raw_to_finished_articolo,
     save_dfm_cache,
 )
-import prezzi_logic
+from logic import prezzi as prezzi_logic
 from magazino_cache import load_magazino_cache, save_magazino_cache
 from utils import find_pdfs, load_settings, logger, make_output_path, save_settings
 from modern_widgets import RoundedButton
@@ -68,14 +68,14 @@ from modern_widgets import RoundedButton
 # rounded pill controls throughout the application.
 ttk.Button = RoundedButton
 
-from situazione_tab import SituazioneTab
-from situazione_settimana_tab import SettimanaTab
-from magazino_filato_tab import MagazinoFilatoTab
-from kamal_tab import KamalTab
+from ui.tabs.situazione_tab import SituazioneTab
+from ui.tabs.situazione_settimana_tab import SettimanaTab
+from ui.tabs.magazino_filato_tab import MagazinoFilatoTab
+from ui.tabs.kamal_tab import KamalTab
 from ui.tabs.ordine_med_tab import OrdineMedTab
 from ui.tabs.overview_tab import OverviewTab
 from ui.tabs.prezzi_tab import PrezziTab
-from biglietti_tab import BigliettiTab
+from ui.tabs.biglietti_tab import BigliettiTab
 
 
 def _resource_path(filename: str) -> Path:
@@ -365,6 +365,7 @@ class ConverterApp(tk.Tk):
             prezzi_tab=self._prezzi_tab,
             save_prefs=self._save_prefs,
             prefs=self._prefs,
+            on_shared_cache_changed=self._on_shared_cache_changed,
         )
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
@@ -1182,7 +1183,7 @@ class ConverterApp(tk.Tk):
         codes_map = None
         if raw_yarn_path is not None:
             try:
-                import magazino_logic
+                from logic import magazino as magazino_logic
                 magazino_df, magazino_errors = magazino_logic.load_magazino(str(raw_yarn_path))
                 if magazino_errors or magazino_df is None or magazino_df.empty:
                     msg = f"Raw yarn file could not be read: {'; '.join(magazino_errors) if magazino_errors else 'empty after filtering'}"
