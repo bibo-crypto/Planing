@@ -2,17 +2,20 @@ import unittest
 from pathlib import Path
 import tempfile
 import pandas as pd
+from unittest.mock import patch
 
-from abbina_calculator import _smallest_fitting_machine
-from abbina_suggestions import titles_compatible
-from biglietti_exporter import _machine_for_count
-from biglietti_exporter import _get, _read_sheet_rows
-from master_import import find_files_in_directory
-from situazione_logic import compute_delivery_date, compute_delivery_dates
-from ui.tabs.overview_tab import _format_display_dates
-from ui.tabs.overview_tab import _write_typed_excel_table
+from calculate.abbina_calculator import _smallest_fitting_machine
+from calculate.abbina_suggestions import titles_compatible
+from exporters.biglietti_exporter import _machine_for_count
+from exporters.biglietti_exporter import _get, _read_sheet_rows
+from pipelines.master_import import find_files_in_directory
+import pipelines.master_import as master_import
+from calculate.situazione import compute_delivery_date, compute_delivery_dates
+from calculate.lotti import load_lotti
+from gui.tabs.overview_tab import _format_display_dates
+from gui.tabs.overview_tab import _write_typed_excel_table
 import openpyxl
-import path_manager
+import utility.path_manager as path_manager
 
 
 class PlanningRegressionTests(unittest.TestCase):
@@ -64,6 +67,136 @@ class PlanningRegressionTests(unittest.TestCase):
             path.write_bytes(b"placeholder")
             self.assertEqual(find_files_in_directory(temp_dir)["lotti"], path)
 
+    def test_master_file_finds_data_ordine_sheet_by_content(self):
+        # Data Ordine / Dispo Bagno sheets inside a single bundled master
+        # workbook have order-specific names (e.g. "MED-D-505449-2026"),
+        # never a matchable candidate like "copertura" -- they must be
+        # found by sniffing header content instead, the same way loose
+        # files in a folder already are.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master_path = Path(temp_dir) / "Master.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Copertura"
+            ws.append(["N. Bagno", "Machine", "Batch Start"])
+            order_ws = wb.create_sheet("MED-D-505449-2026")
+            order_ws.append(["Cliente", "DescrizioneAggiuntivaOrdine", "Altro"])
+            order_ws.append(["ACME", "Some note", "x"])
+            wb.save(master_path)
+
+            matches = master_import._match_sheets(["Copertura", "MED-D-505449-2026"])
+            self.assertNotIn("data_ordine", matches)  # not findable by name
+
+            wb2 = openpyxl.load_workbook(master_path, read_only=True)
+            try:
+                sniffed = master_import._content_match_ordine_sheets(
+                    wb2, wb2.sheetnames, set(matches.values())
+                )
+            finally:
+                wb2.close()
+            self.assertEqual(sniffed.get("data_ordine"), "MED-D-505449-2026")
+
+    def test_lotti_loader_reads_all_workbook_sheets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "LOTTI.xlsx"
+            workbook = openpyxl.Workbook()
+            worksheet = workbook.active
+            worksheet.append(["MAGAZZINO", "ARTICOLO", "PARTITA", "ORDINE", "QESI", "LOTTO"])
+            worksheet.append([900910, "G130-1", "P-1", 0, 10, "L-1"])
+            workbook.create_sheet("Seconda")
+            workbook.save(path)
+
+            frame, errors = load_lotti(path)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(frame.loc[0, "lotto"], "L-1")
+
+    def test_overview_import_skips_order_only_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            (folder / "Data Ordine.xlsx").write_bytes(b"placeholder")
+            (folder / "Dispo Bagno.xlsx").write_bytes(b"placeholder")
+
+            with patch.object(master_import, "_route") as route:
+                loaded, skipped = master_import.import_master_directory(
+                    folder,
+                    situazione_tab=None,
+                    magazino_tab=None,
+                    skip_keys={"data_ordine", "dispo_bagno"},
+                )
+
+            route.assert_not_called()
+            self.assertNotIn("Data Ordine", loaded + skipped)
+            self.assertNotIn("Dispo Bagno", loaded + skipped)
+
+    def test_master_directory_routes_biglietti_template(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            template = Path(temp_dir) / "Biglietti.docx"
+            template.write_bytes(b"template")
+
+            class Biglietti:
+                def __init__(self):
+                    self.path = None
+
+                def set_template_path(self, path):
+                    self.path = path
+
+            target = Biglietti()
+            master_import.import_master_directory(
+                temp_dir, situazione_tab=None, magazino_tab=None,
+                biglietti_tab=target,
+            )
+
+            self.assertEqual(target.path, str(template))
+
+    def test_master_file_reports_unfound_sources_as_skipped(self):
+        # Regression guard for the previous silent-drop bug: import_master_file
+        # used to build its skipped-list from SHEET_CANDIDATES only, so a
+        # source with no sheet-name candidate at all (Data Ordine, Dispo
+        # Bagno) simply vanished from both loaded and skipped instead of
+        # being reported as missing.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master_path = Path(temp_dir) / "Master.xlsx"
+            wb = openpyxl.Workbook()
+            wb.active.title = "Sheet1"
+            wb.save(master_path)
+            loaded, skipped = master_import.import_master_file(
+                str(master_path), situazione_tab=None, magazino_tab=None
+            )
+            self.assertIn("Data Ordine", skipped)
+            self.assertIn("Dispo Bagno", skipped)
+
+    def test_master_file_keeps_shared_magazino_and_lotti_extracts(self):
+        class SharedTab:
+            def __init__(self):
+                self.magazino_paths = []
+                self.lotti_paths = []
+
+            def _on_upload_magazino(self, path, cache_path=None):
+                self.magazino_paths.append((path, cache_path))
+
+            def _on_upload_lotti(self, path, cache_path=None):
+                self.lotti_paths.append((path, cache_path))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master_path = Path(temp_dir) / "Master.xlsx"
+            workbook = openpyxl.Workbook()
+            workbook.active.title = "Magazino"
+            workbook["Magazino"].append(["Articolo", "Partita", "Peso"])
+            workbook.create_sheet("LOTTI").append(["Partita", "Lotto"])
+            workbook.save(master_path)
+
+            shared_tab = SharedTab()
+            master_import.import_master_file(
+                str(master_path), situazione_tab=None, magazino_tab=shared_tab
+            )
+
+            self.assertTrue(shared_tab.magazino_paths)
+            self.assertTrue(shared_tab.lotti_paths)
+            for path, cache_path in shared_tab.magazino_paths + shared_tab.lotti_paths:
+                self.assertEqual(path, cache_path)
+                self.assertTrue(Path(path).is_file())
+
     def test_order_headers_can_start_later_and_use_aliases(self):
         class Sheet:
             def iter_rows(self, values_only=True):
@@ -86,36 +219,37 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(result.loc[1, "delivery_date"], "Bending for yarn")
 
     def test_overview_shared_refresh_helper_is_available(self):
-        from ui.tabs.overview_tab import OverviewTab
+        from gui.tabs.overview_tab import OverviewTab
         self.assertTrue(hasattr(OverviewTab, "_refresh_shared_tabs"))
 
     def test_canonical_ui_tab_imports(self):
-        from ui.tabs.biglietti_tab import BigliettiTab
-        from ui.tabs.kamal_tab import KamalTab
-        from ui.tabs.magazino_filato_tab import MagazinoFilatoTab
-        from ui.tabs.situazione_settimana_tab import SettimanaTab
-        from ui.tabs.situazione_tab import SituazioneTab
+        from gui.tabs.biglietti_tab import BigliettiTab
+        from gui.tabs.kamal_tab import KamalTab
+        from gui.tabs.magazino_filato_tab import MagazinoFilatoTab
+        from gui.tabs.situazione_settimana_tab import SettimanaTab
+        from gui.tabs.situazione_tab import SituazioneTab
 
         self.assertTrue(all((BigliettiTab, KamalTab, MagazinoFilatoTab, SettimanaTab, SituazioneTab)))
 
     def test_canonical_logic_imports(self):
-        from logic.lotti import summarize_by_partita
-        from logic.prezzi import build_price_lookup, load_prezzi
-        from logic.magazino import summarize_by_partita as magazino_summary
-        from logic.situazione_settimana import summarize as weekly_summary
-        from prezzi_logic import build_price_lookup as legacy_lookup
-        from lotti_logic import summarize_by_partita as legacy_lotti_summary
-        from situazione_settimana_logic import summarize as legacy_weekly_summary
-        from magazino_logic import summarize_by_partita as legacy_magazino_summary
+        # The old root-level *_logic.py compatibility shims (prezzi_logic,
+        # lotti_logic, situazione_settimana_logic, magazino_logic) were
+        # removed once every caller was migrated to import from calculate.*
+        # directly (see ARCHITECTURE.md). This just confirms the canonical
+        # modules still expose the expected callables.
+        from calculate.lotti import summarize_by_partita
+        from calculate.prezzi import build_price_lookup, load_prezzi
+        from calculate.magazino import summarize_by_partita as magazino_summary
+        from calculate.situazione_settimana import summarize as weekly_summary
 
-        self.assertIs(build_price_lookup, legacy_lookup)
-        self.assertIs(summarize_by_partita, legacy_lotti_summary)
-        self.assertIs(weekly_summary, legacy_weekly_summary)
-        self.assertIs(magazino_summary, legacy_magazino_summary)
+        self.assertTrue(callable(build_price_lookup))
+        self.assertTrue(callable(summarize_by_partita))
+        self.assertTrue(callable(magazino_summary))
+        self.assertTrue(callable(weekly_summary))
         self.assertTrue(callable(load_prezzi))
 
     def test_price_lookup_cache_reuses_same_source(self):
-        import biglietti_exporter
+        import exporters.biglietti_exporter as biglietti_exporter
         self.assertTrue(hasattr(biglietti_exporter, "_PREZZO_LOOKUP_CACHE"))
         self.assertTrue(hasattr(biglietti_exporter, "_ARTICOLI_MARCA_CACHE"))
 

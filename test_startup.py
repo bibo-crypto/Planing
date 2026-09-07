@@ -1,7 +1,7 @@
 import traceback
 import tkinter as tk
 
-from gui import ConverterApp
+from gui.gui import ConverterApp
 
 
 def main() -> None:

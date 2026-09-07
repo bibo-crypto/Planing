@@ -20,6 +20,7 @@ logs/
 settings/
 *.log
 *.pkl
+*.prof
 
 # Situazione local database and SQLite sidecars
 situazione/*.db
