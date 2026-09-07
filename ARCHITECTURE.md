@@ -1,64 +1,99 @@
 # Architecture
 
-A map of what lives where. The app is a single Tkinter desktop app; most
-files sit flat at the repo root (Python doesn't need folders to keep
-modules organized, and a flat layout keeps every import a plain
-`import module_name` with no package-path churn if a file moves between
-folders later).
+A map of what lives where. The app is a single Tkinter desktop app. Modules
+are grouped into folders by role, so a new contributor (or future-you) can
+tell what a file does from its path alone, and every import is a plain
+`from <folder>.<module> import ...` with no root-level clutter.
 
-## UI (`ui/`)
-- `ui/gui.py` — the main window: builds the notebook of tabs, wires
-  cross-tab callbacks (e.g. `_on_shared_cache_changed`), owns
-  `self._prefs`/`self._save_prefs` (the persisted-settings dict every tab
-  reads/writes through).
-- `ui/tabs/*.py` — one file per tab. Each tab owns its own widgets and
-  upload/export handlers; business logic it needs lives in a same-named
-  `*_logic.py` at the root, not inside the tab file.
+## Layout
 
-### Import boundary
-New code must import UI pages from `ui.tabs.*`. The root-level `*_tab.py`
-files are compatibility shims for older callers and should not be imported
-by code inside `ui/`. This keeps page ownership in one place while preserving
-the public import paths used by the launcher and older integrations.
+```
+main.py                 entry point
+
+gui/                     Tkinter UI: windows, tabs, widgets
+  gui.py                 main window, notebook, cross-tab wiring
+  modern_widgets.py       shared custom widgets (RoundedButton, ...)
+  tabs/                   one file per notebook tab
+
+calculate/               pure business logic, no Tkinter
+  situazione.py           Copertura / machine-queue / compute_situation
+  situazione_settimana.py
+  magazino.py, lotti.py, prezzi.py
+  abbina_calculator.py, abbina_suggestions.py
+  constants.py            shared machine capacity/code tables
+
+parsers/                 read a specific file shape into a dataframe/rows
+  pdf_parser.py, bolla_parser.py, elvy_invoice_parser.py, kamal_parser.py
+  dfm_lookup.py, prod_lookup.py, situazione_loaders.py, elvy_mapping.py
+
+exporters/               write Excel/Word output
+  excel_exporter.py, bolla_exporter.py, elvy_invoice_exporter.py
+  kamal_excel_exporter.py, biglietti_exporter.py
+
+pipelines/               customer-specific "raw order -> ticket/workbook" flows
+  ordine_kamal.py, ordine_med.py, ordini_elvy.py
+  master_import.py        "load everything from one folder" for Overview
+
+utility/                 shared infra: generic helpers, path/file caches, db
+  utils.py, path_manager.py, file_cache.py
+  articoli_cache.py, densita_cache.py, lotti_cache.py, magazino_cache.py,
+  prezzi_cache.py
+  situazione_db.py        SQLite-backed upload log + Articolo->TITOLO table
+
+tests/                   regression tests (pytest/unittest)
+```
+
+Packaging/build tooling stays at the repo root since it isn't application
+code: `main.spec`, `build.bat`, `installer.iss`, `requirements.txt`,
+`runtime_hook.py`, `sync_venv_packages.py`, `icon.ico`, plus the two
+standalone smoke-test scripts `test_startup.py` / `test_update.py` (these
+are manual scripts, not part of the `tests/` pytest package).
+
+### Import rule
+New code imports from these packages directly — `from calculate.situazione
+import ...`, `from utility.utils import ...`, etc. There are no more
+root-level `*_tab.py` / `*_logic.py` compatibility shims: the folder reorg
+finished the migration that this file previously described as in-progress,
+so every caller now points straight at the canonical module. If you're
+looking at an old note/branch that still says `import situazione_logic` or
+`import ui.tabs...`, update it to `import calculate.situazione` /
+`import gui.tabs...`.
 
 ### Maintenance map
-- `ui/tabs/` — Tkinter widgets, event handlers, and rendering only.
-- `*_logic.py` — pure dataframe/business rules and calculations.
-- `*_parser.py` / `*_loaders.py` — input normalization and validation.
-- `*_exporter.py` — Excel, Word, and PDF output.
-- `*_cache.py`, `file_cache.py`, `path_manager.py` — persisted source paths
-  and shared cache state.
-- `master_import.py` — orchestration boundary for folder/master-file imports;
-  it may call tab adapters but should not contain business calculations.
+- `gui/tabs/` — Tkinter widgets, event handlers, and rendering only.
+- `calculate/*.py` — pure dataframe/business rules and calculations.
+- `parsers/*.py` — input normalization and validation.
+- `exporters/*.py` — Excel, Word, and PDF output.
+- `utility/*_cache.py`, `utility/file_cache.py`, `utility/path_manager.py` —
+  persisted source paths and shared cache state.
+- `pipelines/master_import.py` — orchestration boundary for folder/master-file
+  imports; it may call tab adapters but should not contain business
+  calculations.
 
-The `logic/` package is the canonical home for business-rule modules. Root
-`*_logic.py` files are compatibility shims for older imports; new code should
-import from `logic.*` directly.
-
-## Business logic (`*_logic.py`, root)
-Pure(ish) computation, no Tkinter: `situazione_logic.py` (Copertura,
-machine-queue scheduling, `compute_situation`), `magazino_logic.py`,
-`prezzi_logic.py`, `lotti_logic.py`. These take dataframes/paths in,
+## Business logic (`calculate/`)
+Pure(ish) computation, no Tkinter: `calculate/situazione.py` (Copertura,
+machine-queue scheduling, `compute_situation`), `calculate/magazino.py`,
+`calculate/prezzi.py`, `calculate/lotti.py`. These take dataframes/paths in,
 return dataframes/values out — safe to unit-test without a display.
 
-## Loaders / parsers (root)
+## Loaders / parsers (`parsers/`)
 Read a specific file shape into a dataframe or a list of dataclass rows:
 `situazione_loaders.py` (DFM/Copertura/Produzione/Wincoint/Uscita/
 Qualita/Articoli), `pdf_parser.py` (the Elvy PO PDF), `dfm_lookup.py`,
 `prod_lookup.py`.
 
-## Customer-specific pipelines (root)
+## Customer-specific pipelines (`pipelines/`)
 Each customer's "raw order -> ticket/workbook" flow is one module:
-- `biglietti_exporter.py` — ELVY / MED / EL KAMAL dyeing tickets
+- `exporters/biglietti_exporter.py` — ELVY / MED / EL KAMAL dyeing tickets
   (Biglietti) + their Excel workbook. `load_order`/`load_el_kamal_order`
   parse, `enrich_records` fills in Titolo/M-C/KG/Prezzo/etc.,
   `export_workbook`/`export_word` write the output.
-- `ordine_med.py` — the "Ordine da creare" / Filato-availability
+- `pipelines/ordine_med.py` — the "Ordine da creare" / Filato-availability
   extraction (separate from Biglietti; different source shape).
-- `ordini_elvy.py` — the ERP-import "Ordini ELVY" sheet built from PDF
-  orders.
-- `kamal_parser.py` / `kamal_excel_exporter.py` — the older
-  Kamal-specific PDF pipeline (predates `biglietti_exporter.py`'s own
+- `pipelines/ordini_elvy.py` — the ERP-import "Ordini ELVY" sheet built from
+  PDF orders.
+- `pipelines/ordine_kamal.py` / `exporters/kamal_excel_exporter.py` — the
+  older Kamal-specific PDF pipeline (predates `biglietti_exporter.py`'s own
   EL KAMAL support; kept for its own tab, not merged in).
 
 Each pipeline module owns its own field-normalization helpers
@@ -66,16 +101,16 @@ Each pipeline module owns its own field-normalization helpers
 "utils" grab-bag — they're one-liners, and duplicating them keeps each
 module's logic self-contained.
 
-## Centralized source paths (`path_manager.py` + `file_cache.py`)
+## Centralized source paths (`utility/path_manager.py` + `utility/file_cache.py`)
 `path_manager.py` is the canonical registry for every shared source name used
 by the pages and by Overview's bulk import. It normalizes aliases such as
 `data_prod`/`produzione` and `listini`/`prezzi`, while `file_cache.py` remains
 the single JSON persistence implementation. Individual `*_cache.py` modules
-are compatibility wrappers, so uploads from any page resolve to the same
-stored path and survive application restarts. Data Ordine and Dispo-Bagno are
-also recorded centrally for Biglietti and Ordine MED.
+are thin wrappers, so uploads from any page resolve to the same stored path
+and survive application restarts. Data Ordine and Dispo-Bagno are also
+recorded centrally for Biglietti and Ordine MED.
 
-## "Where was that file last uploaded" caches (root, `*_cache.py`)
+## "Where was that file last uploaded" caches (`utility/*_cache.py`)
 One JSON file per source (`settings/<key>_file_cache.json`) remembering
 the last path used, so re-opening the app or switching tabs doesn't
 require re-browsing. All of them are thin wrappers around
@@ -88,12 +123,12 @@ Filato source as Ordine Elvy/Ordine Kamal/Situazione/Magazino Filato) —
 there is no separate "Filato Disponibile" cache; that file shape is the
 same as Magazino's own export.
 
-## Cross-tab / bulk import (root)
-- `master_import.py` — "load everything from one folder/file" for
+## Cross-tab / bulk import
+- `pipelines/master_import.py` — "load everything from one folder/file" for
   Overview: matches files by name (falling back to content-sniffing for
   Data Ordine/Dispo-Bagno, which have no stable filename), routes each to
   the same handler its own tab's upload button uses.
-- `situazione_db.py` — the one piece of actual persistence beyond
+- `utility/situazione_db.py` — the one piece of actual persistence beyond
   per-source path caches: SQLite-backed upload log + the shared
   Articolo->TITOLO codes table.
 
@@ -109,15 +144,28 @@ and Produzione). A successful upload from another page invokes the same pass,
 so the file is read into the correct page state instead of merely displaying a
 saved filename.
 
+## Dev-mode data location (`utility/utils.py`)
+`APP_DATA_DIR` decides where `logs/`, `settings/`, and the Situazione SQLite
+file live. When frozen (PyInstaller build) it uses the per-user AppData
+folder; when running from source it uses "the folder next to this file" —
+which, since `utils.py` sits one level under the project root now
+(`utility/utils.py`), is computed as `Path(__file__).resolve().parent.parent`
+so dev-mode data keeps landing at the repo root, exactly as it did before the
+folder reorg. If `utility/utils.py` ever moves again, update that parent
+count to match its new depth.
+
 ## Packaging
 `main.spec` (PyInstaller) + `requirements.txt` + `installer.iss` (Inno
-Setup) + `build.bat`. When a module gains a new third-party import, add
-it to `requirements.txt` and, if PyInstaller's static analysis won't
-find it on its own (dynamic imports, C extensions), to
-`extra_hiddenimports` in `main.spec` too. `build.bat` reuses an existing
-`venv` in place (via `sync_venv_packages.py`, which removes anything no
-longer in `requirements.txt`) instead of deleting and recreating it on
-every build.
+Setup) + `build.bat`. `pathex=['.']` plus PyInstaller's import-following
+analysis means the `gui/`, `calculate/`, `parsers/`, `exporters/`,
+`pipelines/`, `utility/` packages need no extra spec changes — PyInstaller
+discovers them the same way it always discovered `ui/`/`logic/`. When a
+module gains a new third-party import, add it to `requirements.txt` and, if
+PyInstaller's static analysis won't find it on its own (dynamic imports, C
+extensions), to `extra_hiddenimports` in `main.spec` too. `build.bat` reuses
+an existing `venv` in place (via `sync_venv_packages.py`, which removes
+anything no longer in `requirements.txt`) instead of deleting and recreating
+it on every build.
 
 ## Number/text parsing (deliberately NOT consolidated)
 `biglietti_exporter._clean`/`_number`, `utils.clean_text`/`parse_number`,

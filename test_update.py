@@ -2,8 +2,8 @@ from pathlib import Path
 import tempfile
 import openpyxl
 
-import path_manager
-from ordine_med import (
+import utility.path_manager as path_manager
+from pipelines.ordine_med import (
     FilatoAvailabilityRow,
     OrdineMedRow,
     export_erp_order_workbook,
