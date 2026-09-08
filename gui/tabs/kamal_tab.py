@@ -40,7 +40,8 @@ class KamalTab(ttk.Frame):
         self._lotti_path: Path | None = None
         self._output_path: Path | None = None
         self._kamal_erp_export_dir: Path | None = None
-        self._kamal_update_erp_file = tk.BooleanVar(value=False)
+        self._kamal_update_erp_file = tk.BooleanVar(value=True)
+        self._kamal_update_filato_file = tk.BooleanVar(value=True)
         self._shared_dfm_path = ""
         self._on_shared_cache_changed = on_shared_cache_changed
         self._prefs = load_settings()
@@ -90,13 +91,8 @@ class KamalTab(ttk.Frame):
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(
-            erp_frame,
-            text="After converting, extract \"EXCEL PER ORDINE VENDITA EGITTO\" and "
-                 "\"Filato x Tinturia\" into the folder below — each file is (re)written "
-                 "fresh, fully formatted, every Convert",
-            variable=self._kamal_update_erp_file,
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(erp_frame, text="Extract ERP order file", variable=self._kamal_update_erp_file).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(erp_frame, text="Extract Filato x Tinturia", variable=self._kamal_update_filato_file).grid(row=0, column=1, sticky="w")
 
         ttk.Button(
             erp_frame, text="📁 Select ERP Files Folder…", command=self._on_select_erp_folder, width=22
@@ -110,6 +106,10 @@ class KamalTab(ttk.Frame):
         self._kamal_update_erp_file.trace_add(
             "write",
             lambda *_: self._save_prefs(kamal_update_erp_file=self._kamal_update_erp_file.get()),
+        )
+        self._kamal_update_filato_file.trace_add(
+            "write",
+            lambda *_: self._save_prefs(kamal_update_filato_file=self._kamal_update_filato_file.get()),
         )
 
         action_frame = ttk.Frame(self, padding=(6, 4))
@@ -187,8 +187,8 @@ class KamalTab(ttk.Frame):
         # Restore the ERP update checkbox together with the saved file path.
         # The variable trace persists user changes; this restores the value
         # on the next application launch.
-        if self._prefs.get("kamal_update_erp_file"):
-            self._kamal_update_erp_file.set(True)
+        self._kamal_update_erp_file.set(self._prefs.get("kamal_update_erp_file", True))
+        self._kamal_update_filato_file.set(self._prefs.get("kamal_update_filato_file", True))
 
         raw_yarn_str = self._prefs.get("kamal_raw_yarn_path")
         if raw_yarn_str and Path(raw_yarn_str).is_file():
@@ -345,30 +345,32 @@ class KamalTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Error exporting: {exc}")
 
-            if self._kamal_update_erp_file.get():
+            if self._kamal_update_erp_file.get() or self._kamal_update_filato_file.get():
                 if self._kamal_erp_export_dir is None:
                     errors.append("ERP file extraction was enabled but no folder is selected.")
                 else:
                     ordini_path = self._kamal_erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
                     filato_path = self._kamal_erp_export_dir / "Filato x Tinturia.xlsx"
-                    try:
-                        ordini_rows = build_ordine_kamal_rows(all_rows, dfm_c170_entries)
-                        assign_ordine_kamal_machines(ordini_rows)
-                        if lotti_summary is not None and not lotti_summary.empty:
-                            match_by_lotto(ordini_rows, lotti_summary)
-                        if magazino_summary is not None and not magazino_summary.empty:
-                            match_raw_yarn(ordini_rows, magazino_summary, codes_map, quantity_attr="peso_kg")
-                        n = export_ordini_full(ordini_path, ordini_rows)
-                        logger.info("Ordine Kamal: extracted ERP file %s (%d rows)", ordini_path.name, n)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"Error extracting {ordini_path.name}: {exc}")
+                    if self._kamal_update_erp_file.get():
+                        try:
+                            ordini_rows = build_ordine_kamal_rows(all_rows, dfm_c170_entries)
+                            assign_ordine_kamal_machines(ordini_rows)
+                            if lotti_summary is not None and not lotti_summary.empty:
+                                match_by_lotto(ordini_rows, lotti_summary)
+                            if magazino_summary is not None and not magazino_summary.empty:
+                                match_raw_yarn(ordini_rows, magazino_summary, codes_map, quantity_attr="peso_kg")
+                            n = export_ordini_full(ordini_path, ordini_rows)
+                            logger.info("Ordine Kamal: extracted ERP file %s (%d rows)", ordini_path.name, n)
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"Error extracting {ordini_path.name}: {exc}")
 
-                    try:
-                        matches = read_filato_tinturia_sheet(self._output_path)
-                        n2 = export_filato_full(filato_path, matches)
-                        logger.info("Filato x Tinturia: extracted %s (%d rows)", filato_path.name, n2)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"Error extracting {filato_path.name}: {exc}")
+                    if self._kamal_update_filato_file.get():
+                        try:
+                            matches = read_filato_tinturia_sheet(self._output_path)
+                            n2 = export_filato_full(filato_path, matches, source_path=self._output_path)
+                            logger.info("Filato x Tinturia: extracted %s (%d rows)", filato_path.name, n2)
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"Error extracting {filato_path.name}: {exc}")
 
         self.after(0, self._on_conversion_done, errors, len(all_rows))
 

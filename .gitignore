@@ -41,3 +41,6 @@ situazione/*.sqlite-*
 Thumbs.db
 desktop.ini
 
+
+.cursor/hooks.json
+.cursor/hooks/after-agent-response.js

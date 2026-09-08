@@ -84,8 +84,55 @@ def _load_prezzi_uncached(path: str | Path) -> tuple[pd.DataFrame | None, list[s
         "CLDESCR": df["CLDESCR"].map(clean_text),
         "LIVELLOLPZ": pd.to_numeric(df["LIVELLOLPZ"], errors="coerce"),
         "PREZZOLPZ": pd.to_numeric(df["PREZZOLPZ"], errors="coerce"),
+        # Not one of DISPLAY_COLUMNS, so it never shows in the Prezzi tab or
+        # its export -- kept only so detect_price_anomalies() below can tell
+        # which of a repeated Articolo+Colore's surviving distinct prices
+        # came first.
+        "_START_DATE": df["_start"].dt.strftime("%Y-%m-%d").fillna(""),
     })
     return out.reset_index(drop=True), []
+
+
+def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd.DataFrame:
+    """Flag every Articolo+Colore that has more than one surviving distinct
+    price (load_prezzi() already dedupes identical prices for the same
+    combo, so any group with 2+ rows here is a genuine price change, not a
+    duplicate export row) and the jump from the previous price to the next
+    is at least ``min_pct_change`` percent in either direction.
+
+    Returns one row per flagged transition, largest change first, so a
+    handful of genuine repricings don't get buried under small rounding-size
+    changes.
+    """
+    columns = ["CLARTICOLO", "CLCOLORE", "CLDESCR", "old_price", "new_price", "pct_change", "changed_on"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for (articolo, colore), group in df.groupby(["CLARTICOLO", "CLCOLORE"]):
+        if len(group) < 2:
+            continue
+        group = group.sort_values("_START_DATE")
+        prices = group["PREZZOLPZ"].tolist()
+        dates = group["_START_DATE"].tolist()
+        descr = group["CLDESCR"].iloc[-1]
+        for i in range(1, len(prices)):
+            old_price, new_price = prices[i - 1], prices[i]
+            if pd.isna(old_price) or pd.isna(new_price) or old_price == 0:
+                continue
+            pct_change = (new_price - old_price) / old_price * 100
+            if abs(pct_change) >= min_pct_change:
+                rows.append({
+                    "CLARTICOLO": articolo, "CLCOLORE": colore, "CLDESCR": descr,
+                    "old_price": old_price, "new_price": new_price,
+                    "pct_change": round(pct_change, 1), "changed_on": dates[i] or "(no date)",
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        "pct_change", key=lambda s: s.abs(), ascending=False
+    ).reset_index(drop=True)
 
 
 def build_price_lookup(df: pd.DataFrame) -> dict[tuple[str, str], tuple]:

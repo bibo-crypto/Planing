@@ -272,6 +272,8 @@ class OverviewTab(ttk.Frame):
                         font=("Segoe UI", 10, "bold"))
         style.configure("Overview.AlertCardValue.TLabel", background="#fff7ed", foreground="#9a3412",
                         font=("Segoe UI", 24, "bold"))
+        style.configure("Overview.DangerCardValue.TLabel", background="#fff7ed", foreground="#c62828",
+                font=("Segoe UI", 24, "bold"))
 
         toolbar = ttk.Frame(self)
         toolbar.pack(side="top", fill="x", padx=8, pady=(8, 4))
@@ -364,10 +366,13 @@ class OverviewTab(ttk.Frame):
 
     def _current_data_signature(self):
         """Return cheap revision counters maintained by the source tabs."""
+        prezzi_df = getattr(self.prezzi_tab, "_base_df", None)
         return (
             getattr(self.situazione_tab, "_data_revision", 0),
             getattr(self.situazione_tab, "_copertura_revision", 0),
             getattr(self.magazino_tab, "_data_revision", 0),
+            getattr(self.prezzi_tab, "_loaded_source_path", ""),
+            len(prezzi_df) if isinstance(prezzi_df, pd.DataFrame) else 0,
         )
 
     def _on_choose_data_folder(self) -> None:
@@ -615,6 +620,11 @@ class OverviewTab(ttk.Frame):
             8, "💲 Errori Prezzo — colori", str(price_problem_colors),
             alert=price_problem_colors > 0,
         )
+        price_change_count = self._price_change_count()
+        self._add_card(
+            9, "⚠ Price Changes", str(price_change_count),
+            alert=price_change_count > 0, danger=price_change_count > 0,
+        )
 
         self._add_machine_summary(df)
 
@@ -715,16 +725,25 @@ class OverviewTab(ttk.Frame):
                      fg="#991b1b" if empty else "#667085",
                      font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x", pady=(3, 0))
 
-    def _add_card(self, col: int, title: str, value: str, alert: bool = False) -> None:
+    def _price_change_count(self) -> int:
+        """Return the number of Listini price transitions over the alert threshold."""
+        prezzi_tab = self.prezzi_tab
+        base_df = getattr(prezzi_tab, "_base_df", None)
+        if not isinstance(base_df, pd.DataFrame) or base_df.empty:
+            return 0
+        from calculate.prezzi import detect_price_anomalies
+        return len(detect_price_anomalies(base_df, min_pct_change=10.0))
+
+    def _add_card(self, col: int, title: str, value: str, alert: bool = False, danger: bool = False) -> None:
         card_style = "Overview.AlertCard.TFrame" if alert else "Overview.Card.TFrame"
         title_style = "Overview.AlertCardTitle.TLabel" if alert else "Overview.CardTitle.TLabel"
-        value_style = "Overview.AlertCardValue.TLabel" if alert else "Overview.CardValue.TLabel"
+        value_style = "Overview.DangerCardValue.TLabel" if danger else ("Overview.AlertCardValue.TLabel" if alert else "Overview.CardValue.TLabel")
         card = ttk.Frame(self._cards_frame, style=card_style, padding=(14, 12))
         grid_row = col // 5
         item_in_row = col % 5
-        # The first row has five cards; the second has four. Use a 20-column
-        # grid so both rows can distribute their cards across the full width.
-        span = 4 if grid_row == 0 else 5
+        # Keep five equal-width cards on every row, including the row that
+        # contains Price Changes.
+        span = 4
         grid_column = item_in_row * span
         card.grid(
             row=grid_row, column=grid_column, columnspan=span,

@@ -271,7 +271,7 @@ class OrdineMedTab(ttk.Frame):
                 if not self.filato_folder or not self.filato_folder.is_dir():
                     raise ValueError("Filato extraction is enabled but no Filato folder is selected.")
                 ordine_med.export_filato_availability_workbook(
-                    self.filato_folder / "Filato X Tinturia.xlsx", availability
+                    self.filato_folder / "Filato X Tinturia.xlsx", availability, source_path=output_file
                 )
 
             shortage_count = sum(1 for a in availability if a.disponibilita == "NO")

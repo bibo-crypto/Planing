@@ -211,7 +211,8 @@ _FILATO_HEADER_TO_ATTR = {
     "articolo": "articolo",
     "titolo": "titolo",
     "partita": "partita",
-    "rocce": "rocce",
+    "rocche": "rocce",
+    "rocce": "rocce",  # backwards compatibility with older exports
     "peso": "peso",
     "تحضير خام": "label",
 }
@@ -237,8 +238,11 @@ def read_filato_tinturia_sheet(source_path: Path) -> list[RawYarnMatch]:
             col_attr[cell.column] = attr
 
     rows: list[RawYarnMatch] = []
-    for row in ws.iter_rows(min_row=2):
-        values = {attr: row[col_idx - 1].value for col_idx, attr in col_attr.items()}
+    for row_idx in range(2, ws.max_row + 1):
+        values = {
+            attr: ws.cell(row=row_idx, column=col_idx).value
+            for col_idx, attr in col_attr.items()
+        }
         if not any(v not in (None, "") for v in values.values()):
             continue
         rows.append(RawYarnMatch(
@@ -323,7 +327,11 @@ def export_ordini_full(target_path: Path, ordini_rows: list) -> int:
     return len(ordini_rows)
 
 
-def export_filato_full(target_path: Path, matches: list["RawYarnMatch"]) -> int:
+def export_filato_full(
+    target_path: Path,
+    matches: list["RawYarnMatch"],
+    source_path: Path | None = None,
+) -> int:
     """
     Create a brand-new "Filato x Tinturia" workbook at *target_path*, fully
     formatted the same way as the sheet embedded in the PO/Kamal export --
@@ -332,7 +340,50 @@ def export_filato_full(target_path: Path, matches: list["RawYarnMatch"]) -> int:
     called, overwriting whatever was there before.
     Returns the number of rows written.
     """
+    import copy
     import openpyxl  # local import: this module doesn't need openpyxl otherwise
+
+    if source_path is not None:
+        source_wb = openpyxl.load_workbook(source_path)
+        try:
+            source_ws = source_wb["Filato x Tinturia"]
+            target_wb = openpyxl.Workbook()
+            target_ws = target_wb.active
+            target_ws.title = source_ws.title
+            for row in source_ws.iter_rows():
+                for source_cell in row:
+                    target_cell = target_ws.cell(
+                        row=source_cell.row,
+                        column=source_cell.column,
+                        value=source_cell.value,
+                    )
+                    if source_cell.has_style:
+                        target_cell.font = copy.copy(source_cell.font)
+                        target_cell.fill = copy.copy(source_cell.fill)
+                        target_cell.border = copy.copy(source_cell.border)
+                        target_cell.alignment = copy.copy(source_cell.alignment)
+                        target_cell.protection = copy.copy(source_cell.protection)
+                        target_cell.number_format = source_cell.number_format
+                    if source_cell.hyperlink:
+                        target_cell._hyperlink = copy.copy(source_cell.hyperlink)
+                    if source_cell.comment:
+                        target_cell.comment = copy.copy(source_cell.comment)
+            for key, dimension in source_ws.column_dimensions.items():
+                target_ws.column_dimensions[key] = copy.copy(dimension)
+            for key, dimension in source_ws.row_dimensions.items():
+                target_ws.row_dimensions[key] = copy.copy(dimension)
+            for merged_range in source_ws.merged_cells.ranges:
+                target_ws.merge_cells(str(merged_range))
+            target_ws.freeze_panes = source_ws.freeze_panes
+            target_ws.auto_filter.ref = source_ws.auto_filter.ref
+            target_ws.sheet_view.rightToLeft = source_ws.sheet_view.rightToLeft
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_wb.save(target_path)
+            target_wb.close()
+            return max(source_ws.max_row - 1, 0)
+        finally:
+            source_wb.close()
+
     from openpyxl.styles import Alignment, Font
     from exporters.excel_exporter import FILATO_TINTURIA_COLUMNS, apply_column_widths, freeze_and_filter, write_data, write_header
 

@@ -41,6 +41,7 @@ class PrezziTab(ttk.Frame):
         self._sort_reverse = False
         self._articolo_var = tk.StringVar()
         self._codice_var = tk.StringVar()
+        self._anomalies_window = None
 
         self._configure_styles()
         self._build_upload_panel()
@@ -88,6 +89,11 @@ class PrezziTab(ttk.Frame):
 
         self._btn_export = ttk.Button(row_search, text="📤 Extract Excel", command=self._on_export)
         self._btn_export.pack(side="right")
+
+        self._btn_price_changes = ttk.Button(
+            row_search, text="⚠ Price Changes", command=self._open_price_anomalies,
+        )
+        self._btn_price_changes.pack(side="right", padx=(0, 8))
 
     def _build_treeview(self) -> None:
         frame = ttk.Frame(self)
@@ -333,3 +339,88 @@ class PrezziTab(ttk.Frame):
             ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 16)
 
         wb.save(path)
+
+    # ------------------------------------------------------------------
+    # Price-change anomalies
+    # ------------------------------------------------------------------
+    def _open_price_anomalies(self) -> None:
+        """Flag Articolo+Colore pairs whose price jumped/dropped by 10%+
+        between two dated Listini entries -- catches pricing mistakes and
+        genuine repricings alike, sorted by the biggest change first."""
+        if self._base_df is None or self._base_df.empty:
+            messagebox.showinfo("Price Changes", "Upload the Listini file first.", parent=self)
+            return
+        if self._anomalies_window is not None:
+            try:
+                if self._anomalies_window.winfo_exists():
+                    self._anomalies_window.lift()
+                    self._anomalies_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self._anomalies_window = None
+
+        anomalies = logic.detect_price_anomalies(self._base_df, min_pct_change=10.0)
+
+        window = tk.Toplevel(self)
+        self._anomalies_window = window
+        window.title("Listini — Price Changes (10%+)")
+        window.geometry("760x460")
+        window.minsize(560, 320)
+        ttk.Label(
+            window, text="Articolo + Colore pairs whose price changed by 10% or more between two dated entries",
+            font=("Segoe UI", 10, "bold"), wraplength=720,
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("CLARTICOLO", "CLCOLORE", "CLDESCR", "old_price", "new_price", "pct_change", "changed_on")
+        labels = {
+            "CLARTICOLO": "Articolo", "CLCOLORE": "Colore", "CLDESCR": "Descr. Colore",
+            "old_price": "Old Price", "new_price": "New Price", "pct_change": "Change %",
+            "changed_on": "Changed On",
+        }
+        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        widths = [110, 90, 150, 90, 90, 90, 100]
+        for column, width in zip(columns, widths):
+            tree.heading(column, text=labels[column])
+            tree.column(column, width=width, anchor="center")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.tag_configure("up", foreground="#b91c1c")
+        tree.tag_configure("down", foreground="#15803d")
+
+        if anomalies.empty:
+            ttk.Label(frame, text="No price changes of 10% or more found.").grid(row=0, column=0)
+        else:
+            for _, row in anomalies.iterrows():
+                tag = "up" if row["pct_change"] > 0 else "down"
+                tree.insert("", "end", values=(
+                    row["CLARTICOLO"], row["CLCOLORE"], row["CLDESCR"],
+                    f"{row['old_price']:.2f}", f"{row['new_price']:.2f}",
+                    f"{row['pct_change']:+.1f}%", row["changed_on"],
+                ), tags=(tag,))
+
+        def export_anomalies():
+            if anomalies.empty:
+                messagebox.showinfo("Price Changes", "Nothing to export.", parent=window)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=window, title="Export Price Changes", defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")], initialfile="price_changes.xlsx",
+            )
+            if not path:
+                return
+            try:
+                anomalies.rename(columns=labels).to_excel(path, index=False, sheet_name="Price Changes")
+                messagebox.showinfo("Price Changes", f"Export completed:\n{path}", parent=window)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Price Changes", str(exc), parent=window)
+
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Export to Excel", command=export_anomalies).pack(side="right", padx=3)

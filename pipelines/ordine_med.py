@@ -269,9 +269,18 @@ def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str
         for r in records:
             r.check_articolo = ""
         return
+    def normalize_article(value: Any) -> str:
+        article = _clean(value).upper()
+        return article[1:] if article[:1] in {"C", "G"} else article
+
+    def normalize_colour(value: Any) -> str:
+        number = _number(value)
+        return str(int(number)) if number is not None and float(number).is_integer() else _clean(value).upper()
+
+    normalized_pairs = {(normalize_article(article), normalize_colour(colour)) for article, colour in dfm_pairs}
     for r in records:
-        key = (r.articolo.upper(), r.colore)
-        r.check_articolo = "" if key in dfm_pairs else "NEW"
+        key = (normalize_article(r.articolo), normalize_colour(r.colore))
+        r.check_articolo = "" if key in normalized_pairs else "NEW"
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +446,47 @@ def export_erp_order_workbook(path: Path, records: list[OrdineMedRow]) -> None:
 def export_filato_availability_workbook(
     path: Path,
     availability: list[FilatoAvailabilityRow],
+    source_path: Path | None = None,
 ) -> None:
     """Write the availability result as a standalone ERP-support workbook."""
-    from openpyxl import Workbook
+    import copy
+    from openpyxl import Workbook, load_workbook
     from openpyxl.formatting.rule import FormulaRule
     from openpyxl.styles import PatternFill
     from exporters.biglietti_exporter import _style_sheet
+
+    if source_path is not None and source_path.is_file():
+        source_wb = load_workbook(source_path)
+        try:
+            source_ws = next(
+                (sheet for sheet in source_wb.worksheets if _key(sheet.title) == _key("Filato X Tinturia")),
+                None,
+            )
+            if source_ws is not None:
+                wb = Workbook()
+                ws = wb.active
+                ws.title = source_ws.title
+                for row in source_ws.iter_rows(min_col=1, max_col=5):
+                    for source_cell in row:
+                        target_cell = ws.cell(source_cell.row, source_cell.column, source_cell.value)
+                        if source_cell.has_style:
+                            target_cell.font = copy.copy(source_cell.font)
+                            target_cell.fill = copy.copy(source_cell.fill)
+                            target_cell.border = copy.copy(source_cell.border)
+                            target_cell.alignment = copy.copy(source_cell.alignment)
+                            target_cell.protection = copy.copy(source_cell.protection)
+                            target_cell.number_format = source_cell.number_format
+                for key, dimension in source_ws.column_dimensions.items():
+                    if dimension.min is None or dimension.min <= 5:
+                        ws.column_dimensions[key] = copy.copy(dimension)
+                ws.freeze_panes = source_ws.freeze_panes
+                ws.auto_filter.ref = source_ws.auto_filter.ref
+                path.parent.mkdir(parents=True, exist_ok=True)
+                wb.save(path)
+                wb.close()
+                return
+        finally:
+            source_wb.close()
 
     wb = Workbook()
     ws = wb.active

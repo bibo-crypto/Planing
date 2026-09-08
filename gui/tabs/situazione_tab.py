@@ -22,6 +22,7 @@ import pandas as pd
 import utility.situazione_db as db
 import parsers.situazione_loaders as data_loaders
 import calculate.situazione as business_logic
+import calculate.reports as reports
 from calculate.abbina_suggestions import build_suggestions
 from gui.tabs.yarn_shortage_tab import YarnShortageTab
 from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
@@ -218,11 +219,11 @@ class SituazioneTab(ttk.Frame):
 
     def _build_upload_panel(self):
         upload_area = ttk.Frame(self)
-        upload_area.pack(side="top", fill="x", anchor="w", padx=8, pady=(6, 2))
+        upload_area.pack(side="top", fill="x", anchor="w", padx=8, pady=(2, 0))
 
         panel = ttk.LabelFrame(upload_area, text="1) Required files", style="Upload.TLabelframe")
         panel.pack(side="left", anchor="nw")
-        panel.configure(padding=(5, 3))
+        panel.configure(padding=(5, 1))
 
         self.source_rows = {}
         for key in SOURCE_ORDER:
@@ -233,7 +234,7 @@ class SituazioneTab(ttk.Frame):
 
         codes_panel = ttk.LabelFrame(upload_area, text="Optional file", style="Upload.TLabelframe")
         codes_panel.pack(side="left", anchor="nw", padx=(8, 0), fill="y")
-        codes_panel.configure(padding=(5, 3))
+        codes_panel.configure(padding=(5, 1))
 
         codes_row = SourceRow(codes_panel, "codes", "Yarn codes (Articoli) - optional",
                                self._handle_codes_upload)
@@ -242,12 +243,12 @@ class SituazioneTab(ttk.Frame):
 
         listini_row = SourceRow(codes_panel, "listini", "Listini (Prezzi) - optional",
                                  self._handle_listini_upload)
-        listini_row.grid(row=1, column=0, padx=3, pady=1, sticky="nw")
+        listini_row.grid(row=0, column=1, padx=3, pady=1, sticky="nw")
         self.listini_row = listini_row
 
     def _build_toolbar(self):
         bar = ttk.Frame(self)
-        bar.pack(side="top", fill="x", padx=8, pady=(3, 4))
+        bar.pack(side="top", fill="x", padx=8, pady=(1, 2))
 
         self.refresh_btn = ttk.Button(bar, text="2) Refresh", command=self._on_refresh)
         self.refresh_btn.pack(side="left", padx=4)
@@ -266,6 +267,12 @@ class SituazioneTab(ttk.Frame):
 
         self.copertura_btn = ttk.Button(bar, text="Copertura", command=self._open_copertura)
         self.copertura_btn.pack(side="left", padx=4)
+
+        self.on_time_btn = ttk.Button(bar, text="On-Time Delivery", command=self._open_on_time_delivery)
+        self.on_time_btn.pack(side="left", padx=4)
+
+        self.timeline_btn = ttk.Button(bar, text="Partita Timeline", command=self._open_partita_timeline)
+        self.timeline_btn.pack(side="left", padx=4)
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
@@ -438,6 +445,173 @@ class SituazioneTab(ttk.Frame):
         refresh_filter_values()
         render()
 
+    def _open_on_time_delivery(self):
+        """Per-client on-time delivery score: Consegna (promised) vs Data
+        Uscita (actual), across every Partita persisted in the local DB --
+        not just what's currently loaded, so this reflects the full history
+        of shipped batches, not only today's snapshot."""
+        if self._focus_child_window("on_time"):
+            return
+        states = db.get_all_states()
+        summary = reports.compute_on_time_delivery(states)
+        if summary.empty:
+            messagebox.showinfo(
+                "On-Time Delivery",
+                "No shipped batches with both a Consegna and a Data Uscita date yet.",
+                parent=self,
+            )
+            return
+
+        window = tk.Toplevel(self)
+        self._child_windows["on_time"] = window
+        window.title("On-Time Delivery by Client")
+        window.geometry("780x480")
+        window.minsize(600, 350)
+        ttk.Label(
+            window, text="Share of shipped batches that left on or before the promised Consegna date",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w", padx=10, pady=(10, 6))
+
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("cliente", "shipped", "on_time", "late", "on_time_pct", "avg_delay_days")
+        labels = {
+            "cliente": "Cliente", "shipped": "Shipped", "on_time": "On Time",
+            "late": "Late", "on_time_pct": "On-Time %", "avg_delay_days": "Avg Delay (days, when late)",
+        }
+        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        widths = [160, 80, 80, 70, 90, 190]
+        for column, width in zip(columns, widths):
+            tree.heading(column, text=labels[column])
+            tree.column(column, width=width, anchor="center")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.tag_configure("bad", foreground="#b91c1c")
+        tree.tag_configure("good", foreground="#15803d")
+
+        for _, row in summary.iterrows():
+            tag = "bad" if row["on_time_pct"] < 70 else ("good" if row["on_time_pct"] >= 95 else "")
+            tree.insert("", "end", values=(
+                row["cliente"], int(row["shipped"]), int(row["on_time"]), int(row["late"]),
+                f"{row['on_time_pct']:.1f}%", f"{row['avg_delay_days']:.1f}",
+            ), tags=(tag,) if tag else ())
+
+        def export_summary():
+            path = filedialog.asksaveasfilename(
+                parent=window, title="Export On-Time Delivery", defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")], initialfile="on_time_delivery.xlsx",
+            )
+            if not path:
+                return
+            try:
+                summary.rename(columns=labels).to_excel(path, index=False, sheet_name="On-Time Delivery")
+                messagebox.showinfo("On-Time Delivery", f"Export completed:\n{path}", parent=window)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("On-Time Delivery", str(exc), parent=window)
+
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Export to Excel", command=export_summary).pack(side="right", padx=3)
+
+    def _open_partita_timeline(self, initial_partita: str = ""):
+        """Search a Partita and see every stage change recorded for it
+        (Bagno assigned, Tinto, Q.C., Uscita, status text), oldest first."""
+        if self._focus_child_window("timeline"):
+            window = self._child_windows["timeline"]
+            if initial_partita:
+                window._search_var.set(initial_partita)
+                window._do_search()
+            return
+
+        window = tk.Toplevel(self)
+        self._child_windows["timeline"] = window
+        window.title("Partita Timeline")
+        window.geometry("820x480")
+        window.minsize(620, 360)
+
+        search_row = ttk.Frame(window)
+        search_row.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Label(search_row, text="Partita:").pack(side="left", padx=(0, 6))
+        search_var = tk.StringVar(value=initial_partita)
+        window._search_var = search_var
+        entry = ttk.Entry(search_row, textvariable=search_var, width=24)
+        entry.pack(side="left")
+        status = ttk.Label(search_row, text="")
+        status.pack(side="left", padx=(10, 0))
+
+        frame = ttk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita")
+        labels = {
+            "changed_at": "When", "event": "Event", "comment": "Status", "bagno": "Bagno",
+            "tinto": "Tinto", "data_qualita": "Data Qualità", "data_uscita": "Data Uscita",
+        }
+        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        widths = [130, 260, 100, 70, 90, 100, 100]
+        for column, width in zip(columns, widths):
+            tree.heading(column, text=labels[column])
+            tree.column(column, width=width, anchor="w" if column == "event" else "center")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        current_timeline = {"df": pd.DataFrame()}
+
+        def do_search():
+            partita = search_var.get().strip()
+            tree.delete(*tree.get_children())
+            if not partita:
+                status.config(text="")
+                current_timeline["df"] = pd.DataFrame()
+                return
+            history = db.get_partita_history(partita)
+            timeline = reports.format_partita_timeline(history)
+            current_timeline["df"] = timeline
+            if timeline.empty:
+                status.config(text="No history recorded for this Partita.")
+                return
+            status.config(text=f"{len(timeline)} event(s)")
+            for _, row in timeline.iterrows():
+                tree.insert("", "end", values=tuple(row[c] for c in columns))
+
+        window._do_search = do_search
+        entry.bind("<Return>", lambda _event: do_search())
+        ttk.Button(search_row, text="Search", command=do_search).pack(side="left", padx=(10, 0))
+
+        def export_timeline():
+            timeline = current_timeline["df"]
+            if timeline.empty:
+                messagebox.showinfo("Partita Timeline", "Search for a Partita first.", parent=window)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=window, title="Export Timeline", defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")],
+                initialfile=f"timeline_{search_var.get().strip()}.xlsx",
+            )
+            if not path:
+                return
+            try:
+                timeline.rename(columns=labels).to_excel(path, index=False, sheet_name="Timeline")
+                messagebox.showinfo("Partita Timeline", f"Export completed:\n{path}", parent=window)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Partita Timeline", str(exc), parent=window)
+
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="Export to Excel", command=export_timeline).pack(side="right", padx=3)
+
+        if initial_partita:
+            do_search()
+        else:
+            entry.focus_set()
+
     def _focus_child_window(self, key):
         """Focus an already-open child window instead of opening a duplicate."""
         window = self._child_windows.get(key)
@@ -461,7 +635,7 @@ class SituazioneTab(ttk.Frame):
         self.columns = cols
 
         frame = ttk.Frame(self, borderwidth=1, relief="solid")
-        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(2, 8))
+        frame.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 6))
 
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse",
                                  style="Situazione.Treeview")
@@ -487,6 +661,18 @@ class SituazioneTab(ttk.Frame):
         self.tree.tag_configure("Ritinta", background="#d9c6f0")
         self.tree.tag_configure("stripe", background="#f3f6fa")
         self.tree.tag_configure("normal", background="#ffffff")
+
+        # Double-click a row -> open its Partita's timeline directly, so you
+        # don't have to retype the number you're already looking at.
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
+    def _on_tree_double_click(self, _event):
+        item_id = self.tree.focus()
+        if not item_id:
+            return
+        partita = self.tree.set(item_id, "partita")
+        if partita:
+            self._open_partita_timeline(initial_partita=partita)
 
     def _autosize_columns(self, df):
         """Fit columns to visible content while keeping the table usable."""
