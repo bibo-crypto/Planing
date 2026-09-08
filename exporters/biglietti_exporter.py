@@ -856,13 +856,16 @@ def enrich_records(
         compute_delivery_date(records)
 
 
-def _filato_rows(records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One row per raw batch (Partita GG), Rocche summed from the actual
-    order records -- not read off the small 'تحضير خيط خام' reference
-    sheet's own count, which can be stale/incomplete on its own (a real
-    case: a raw batch's order Rocche was 72 but that sheet's count showed
-    0 for it). Titolo/Peso still come from that sheet when available,
-    purely for context."""
+def _filato_rows(
+    records: list["OrderRecord"],
+    raw_rows: list[dict[str, Any]],
+    magazino_summary=None,
+) -> list[dict[str, Any]]:
+    """One row per raw batch, using warehouse Rocche when available.
+
+    The small ``تحضير خيط خام`` sheet is only descriptive.  Its Rocche value
+    can be stale or zero, so stock quantities must come from Magazino.
+    """
     raw_by_article = {_clean(_get(r, "Articolo")).upper(): r for r in raw_rows}
 
     totals: dict[str, float] = {}
@@ -871,6 +874,27 @@ def _filato_rows(records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -
         if not key:
             continue
         totals[key] = totals.get(key, 0) + (_number(rec.quantity_cones) or 0)
+
+    warehouse_totals = {}
+    warehouse_by_partita = {}
+
+    def stock_key(value: Any) -> str:
+        text = _clean(value)
+        number = _number(text)
+        return str(int(number)) if number is not None and float(number).is_integer() else text
+
+    if magazino_summary is not None:
+        for row in magazino_summary.itertuples(index=False):
+            article = _clean(getattr(row, "articolo", "")).upper()
+            partita = stock_key(getattr(row, "partita", ""))
+            if not article or not partita:
+                continue
+            try:
+                rocche = float(getattr(row, "mag_rocche", 0) or 0)
+            except (TypeError, ValueError):
+                rocche = 0.0
+            warehouse_totals[(article, partita)] = warehouse_totals.get((article, partita), 0) + rocche
+            warehouse_by_partita.setdefault(partita, set()).add((article, rocche))
 
     out = []
     seen: set[str] = set()
@@ -881,11 +905,21 @@ def _filato_rows(records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -
         seen.add(key)
         article_g = ("G" + rec.article[1:]) if rec.article[:1].upper() == "C" else rec.article
         raw = raw_by_article.get(article_g.upper(), {})
+        stock_partita = stock_key(key)
+        warehouse_rocche = warehouse_totals.get((article_g.upper(), stock_partita))
+        if warehouse_rocche is None:
+            # Some ERP exports contain a visually similar article code, e.g.
+            # G1300275 in the order and G130027S in Magazino.  A Partita is
+            # unique in the stock export, so use it only when it has one
+            # unambiguous warehouse article.
+            partita_matches = warehouse_by_partita.get(stock_partita, set())
+            if len(partita_matches) == 1:
+                warehouse_rocche = next(iter(partita_matches))[1]
         out.append({
             "Articolo": article_g,
             "Titolo": rec.title or _clean(_get(raw, "Titolo")),
             "Partita": key,
-            "Rocche": totals[key],
+            "Rocche": warehouse_rocche if warehouse_rocche is not None else totals[key],
             "Peso": _number(_get(raw, "وزن", "Peso")),
             "تحضير خام": _clean(_get(raw, "Custom", "تحضير خام")) or "تحضير خام",
         })
@@ -899,6 +933,7 @@ def export_workbook(
     include_filato: bool = True,
     stem: str = "",
     customer: str = "",
+    magazino_summary=None,
 ) -> None:
     customer = customer or ("ELVY" if records[0].customer_code == "3009" else "MED")
     wb = Workbook()
@@ -931,7 +966,7 @@ def export_workbook(
         fws = wb.create_sheet("Filato x Tinturia")
         fheaders = ["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"]
         fws.append(fheaders)
-        for r in _filato_rows(records, raw_rows):
+        for r in _filato_rows(records, raw_rows, magazino_summary):
             fws.append([r[h] for h in fheaders])
         _style_sheet(fws)
     _style_sheet(
@@ -945,14 +980,19 @@ def export_workbook(
     wb.close()
 
 
-def export_filato_workbook(path: Path, records: list["OrderRecord"], raw_rows: list[dict[str, Any]]) -> None:
+def export_filato_workbook(
+    path: Path,
+    records: list["OrderRecord"],
+    raw_rows: list[dict[str, Any]],
+    magazino_summary=None,
+) -> None:
     """Export only the optional ``Filato x Tinturia`` workbook."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Filato x Tinturia"
     headers = ["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"]
     ws.append(headers)
-    for r in _filato_rows(records, raw_rows):
+    for r in _filato_rows(records, raw_rows, magazino_summary):
         ws.append([r[h] for h in headers])
     _style_sheet(ws)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1073,6 +1113,9 @@ def export_word(path: Path, template_path: Path, records: list[OrderRecord], ste
     for idx, record in enumerate(records):
         new_tbl = copy.deepcopy(template_tbl)
         _fill_ticket_table(new_tbl, record, qn, OxmlElement, stem)
+        for row in new_tbl.findall(qn("w:tr")):
+            cant_split = OxmlElement("w:cantSplit")
+            row.get_or_add_trPr().append(cant_split)
         _insert(new_tbl)
         if idx != len(records) - 1:
             p = OxmlElement("w:p")
@@ -1102,6 +1145,16 @@ def _fill_ticket_table(tbl, r: OrderRecord, qn, OxmlElement, stem: str) -> None:
                 run.append(first)
                 p.append(run)
             first.text = _clean(text)
+            for run in p.findall(".//" + qn("w:r")):
+                r_pr = run.find(qn("w:rPr"))
+                if r_pr is None:
+                    r_pr = OxmlElement("w:rPr")
+                    run.insert(0, r_pr)
+                size = r_pr.find(qn("w:sz"))
+                if size is None:
+                    size = OxmlElement("w:sz")
+                    r_pr.append(size)
+                size.set(qn("w:val"), "28")
             break
 
     put(1, 2, _ticket_header(r, stem))

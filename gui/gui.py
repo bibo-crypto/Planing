@@ -122,10 +122,15 @@ class ConverterApp(tk.Tk):
         self._po_last_export_path: Path | None = None
         self._po_erp_export_dir: Path | None = None
         self._po_one_per_file = tk.BooleanVar(value=False)
-        self._po_update_erp_file = tk.BooleanVar(value=False)
+        self._po_update_erp_file = tk.BooleanVar(value=True)
+        self._po_update_filato_file = tk.BooleanVar(value=True)
         self._po_update_erp_file.trace_add(
             "write",
             lambda *_a: self._save_prefs(po_update_erp_file=self._po_update_erp_file.get()),
+        )
+        self._po_update_filato_file.trace_add(
+            "write",
+            lambda *_a: self._save_prefs(po_update_filato_file=self._po_update_filato_file.get()),
         )
         self._po_raw_yarn_path: Path | None = None
 
@@ -506,13 +511,8 @@ class ConverterApp(tk.Tk):
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(
-            erp_frame,
-            text="After converting, extract \"EXCEL PER ORDINE VENDITA EGITTO\" and "
-                 "\"Filato x Tinturia\" into the folder below — each file is (re)written "
-                 "fresh, fully formatted, every Convert",
-            variable=self._po_update_erp_file,
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(erp_frame, text="Extract ERP order file", variable=self._po_update_erp_file).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(erp_frame, text="Extract Filato x Tinturia", variable=self._po_update_filato_file).grid(row=0, column=1, sticky="w")
 
         ttk.Button(
             erp_frame, text="📁 Select ERP Files Folder…", command=self._on_po_select_erp_folder, width=22
@@ -1053,8 +1053,8 @@ class ConverterApp(tk.Tk):
         if erp_dir_str and Path(erp_dir_str).is_dir():
             self._po_erp_export_dir = Path(erp_dir_str)
             self._po_lbl_erp_dir.config(text=erp_dir_str, foreground="black")
-        if self._prefs.get("po_update_erp_file"):
-            self._po_update_erp_file.set(True)
+        self._po_update_erp_file.set(self._prefs.get("po_update_erp_file", True))
+        self._po_update_filato_file.set(self._prefs.get("po_update_filato_file", True))
 
     # ------------------------------------------------------------------
     # Purchase Orders — file/folder selection callbacks
@@ -1156,6 +1156,7 @@ class ConverterApp(tk.Tk):
                 self._po_output_dir,
                 self._po_one_per_file.get(),
                 self._po_update_erp_file.get(),
+                self._po_update_filato_file.get(),
                 self._po_erp_export_dir,
                 self._po_raw_yarn_path,
             ),
@@ -1173,17 +1174,11 @@ class ConverterApp(tk.Tk):
         output_dir: Path,
         one_per_file: bool,
         update_erp_file: bool,
+        update_filato_file: bool,
         erp_export_dir: Path | None,
         raw_yarn_path: Path | None = None,
     ) -> None:
-        """
-        Run in a background thread.
-
-        Abbina is mandatory and hybrid, not a user choice: a PDF's own
-        Machine annotation is kept exactly as extracted wherever present;
-        any same-colour group left without one is filled in automatically
-        (smallest machine that fits the group's combined Quantity/Cones).
-        """
+        """Run the Purchase Order conversion and optional ERP extracts."""
         from calculate.abbina_calculator import AbbinaCalculator
         from calculate import prezzi as prezzi_logic
         from exporters.excel_exporter import ExcelExporter
@@ -1291,7 +1286,7 @@ class ConverterApp(tk.Tk):
 
         # Extract both ERP files fresh into the saved folder, if configured
         # -- each file is fully rebuilt (not edited in place) every Convert.
-        if update_erp_file and all_rows:
+        if (update_erp_file or update_filato_file) and all_rows:
             if erp_export_dir is None:
                 msg = "ERP file extraction was enabled but no folder is selected."
                 logger.error(msg)
@@ -1299,21 +1294,22 @@ class ConverterApp(tk.Tk):
             else:
                 ordini_path = erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
                 filato_path = erp_export_dir / "Filato x Tinturia.xlsx"
-                try:
-                    ordini_rows = build_ordini_elvy_rows(all_rows)
-                    if magazino_summary is not None and not magazino_summary.empty:
-                        match_raw_yarn(ordini_rows, magazino_summary, codes_map)
-                    n = export_ordini_full(ordini_path, ordini_rows)
-                    logger.info("Extracted ERP file: %s (%d rows)", ordini_path.name, n)
-                except Exception as exc:  # noqa: BLE001
-                    msg = f"Error extracting {ordini_path.name}: {exc}"
-                    logger.error(msg)
-                    errors.append(msg)
+                if update_erp_file:
+                    try:
+                        ordini_rows = build_ordini_elvy_rows(all_rows)
+                        if magazino_summary is not None and not magazino_summary.empty:
+                            match_raw_yarn(ordini_rows, magazino_summary, codes_map)
+                        n = export_ordini_full(ordini_path, ordini_rows)
+                        logger.info("Extracted ERP file: %s (%d rows)", ordini_path.name, n)
+                    except Exception as exc:  # noqa: BLE001
+                        msg = f"Error extracting {ordini_path.name}: {exc}"
+                        logger.error(msg)
+                        errors.append(msg)
 
-                if last_export_path is not None:
+                if update_filato_file and last_export_path is not None:
                     try:
                         matches = read_filato_tinturia_sheet(last_export_path)
-                        n2 = export_filato_full(filato_path, matches)
+                        n2 = export_filato_full(filato_path, matches, source_path=last_export_path)
                         logger.info("Extracted Filato x Tinturia file: %s (%d rows)", filato_path.name, n2)
                     except Exception as exc:  # noqa: BLE001
                         msg = f"Error extracting {filato_path.name}: {exc}"

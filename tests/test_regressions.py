@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from calculate.abbina_calculator import _smallest_fitting_machine
 from calculate.abbina_suggestions import titles_compatible
-from exporters.biglietti_exporter import _machine_for_count
+from exporters.biglietti_exporter import _machine_for_count, _filato_rows
 from exporters.biglietti_exporter import _get, _read_sheet_rows
 from pipelines.master_import import find_files_in_directory
 import pipelines.master_import as master_import
@@ -16,6 +16,9 @@ from gui.tabs.overview_tab import _format_display_dates
 from gui.tabs.overview_tab import _write_typed_excel_table
 import openpyxl
 import utility.path_manager as path_manager
+import utility.situazione_db as db
+from calculate.reports import compute_on_time_delivery, format_partita_timeline
+from calculate.prezzi import detect_price_anomalies
 
 
 class PlanningRegressionTests(unittest.TestCase):
@@ -253,6 +256,67 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertTrue(hasattr(biglietti_exporter, "_PREZZO_LOOKUP_CACHE"))
         self.assertTrue(hasattr(biglietti_exporter, "_ARTICOLI_MARCA_CACHE"))
 
+    def test_filato_export_uses_magazino_rocche(self):
+        from types import SimpleNamespace
+        record = SimpleNamespace(raw_batch="158694", article="C1300275", title="100/2", quantity_cones=4)
+        raw_rows = [{"Articolo": "G1300275", "Peso": 245.32, "تحضير خام": "تحضير خام"}]
+        magazino = pd.DataFrame([{
+            "articolo": "G130027S", "partita": "158694.0", "mag_rocche": 12,
+            "mag_peso": 245.32,
+        }])
+        result = _filato_rows([record], raw_rows, magazino)
+        self.assertEqual(result[0]["Rocche"], 12)
+
+    def test_filato_extract_copies_source_sheet(self):
+        from pipelines.ordini_elvy import export_filato_full
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "ordine.xlsx"
+            target = Path(temp_dir) / "filato.xlsx"
+            workbook = openpyxl.Workbook()
+            workbook.active.title = "Ordine ELVY"
+            sheet = workbook.create_sheet("Filato x Tinturia")
+            sheet.append(["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"])
+            sheet.append(["G130027S", "100/2", "158694", 1108, 1029.6, "تحضير خام"])
+            sheet.column_dimensions["D"].width = 22
+            sheet.freeze_panes = "A2"
+            workbook.save(source)
+            workbook.close()
+
+            export_filato_full(target, [], source_path=source)
+            copied = openpyxl.load_workbook(target, data_only=True)
+            copied_sheet = copied["Filato x Tinturia"]
+            self.assertEqual(copied_sheet.cell(2, 4).value, 1108)
+            self.assertEqual(copied_sheet.column_dimensions["D"].width, 22)
+            self.assertEqual(copied_sheet.freeze_panes, "A2")
+            copied.close()
+
+    def test_filato_reader_handles_short_excel_rows(self):
+        from pipelines.ordini_elvy import read_filato_tinturia_sheet
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "short.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "Filato x Tinturia"
+            sheet.append(["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"])
+            sheet.append(["G130027S", "100/2", "158694", 1108])
+            workbook.save(source)
+            workbook.close()
+
+            rows = read_filato_tinturia_sheet(source)
+            self.assertEqual(rows[0].rocce, 1108)
+            self.assertEqual(rows[0].peso, 0)
+
+    def test_med_check_articolo_normalizes_article_prefix_and_colour(self):
+        from pipelines.ordine_med import OrdineMedRow, compute_check_articolo
+        record = OrdineMedRow(
+            riga=1, code_org="C130027S", titolo="", descr_col="", articolo="C130027S",
+            colore="324229.0", rocc=1, abbin="", consegna_input=None, pt_grg="",
+            pt_med="", polmoni="", cliente_note="", nota_grg="", nota_col="",
+            kg_note="", fabb=None, prezz_note=None,
+        )
+        compute_check_articolo([record], {("G130027S", "324229")})
+        self.assertEqual(record.check_articolo, "")
+
     def test_excel_export_keeps_yarn_waiting_comment(self):
         workbook = openpyxl.Workbook()
         worksheet = workbook.active
@@ -266,6 +330,65 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(worksheet.cell(row=2, column=1).value, "08/09/2026")
         self.assertEqual(worksheet.cell(row=2, column=1).data_type, "s")
         self.assertEqual(worksheet.cell(row=3, column=1).value, "Bending for yarn")
+
+    def test_on_time_delivery_scores_and_ranks_clients(self):
+        states = {
+            "P1": {"cliente": "ELVY", "partita": "P1", "consegna": "2026-09-01", "data_uscita": "2026-08-30"},
+            "P2": {"cliente": "ELVY", "partita": "P2", "consegna": "2026-09-01", "data_uscita": "2026-09-05"},
+            "P3": {"cliente": "MED", "partita": "P3", "consegna": "2026-09-01", "data_uscita": "2026-09-10"},
+            "P4": {"cliente": "MED", "partita": "P4", "consegna": "2026-09-01", "data_uscita": ""},  # still open
+        }
+        summary = compute_on_time_delivery(states)
+        med = summary[summary["cliente"] == "MED"].iloc[0]
+        elvy = summary[summary["cliente"] == "ELVY"].iloc[0]
+        self.assertEqual(med["shipped"], 1)  # P4 has no Data Uscita yet -- excluded
+        self.assertEqual(med["on_time_pct"], 0.0)
+        self.assertEqual(med["avg_delay_days"], 9.0)
+        self.assertEqual(elvy["shipped"], 2)
+        self.assertEqual(elvy["on_time_pct"], 50.0)
+        # Worst on-time % sorts first.
+        self.assertEqual(summary.iloc[0]["cliente"], "MED")
+
+    def test_partita_history_records_stage_changes_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(db, "DB_PATH", str(Path(temp_dir) / "test.db")):
+                db.init_db()
+                base = {"partita": "P900", "cliente": "ELVY", "articolo": "G130", "colore": "10",
+                        "comment": "C.Q", "bagno": "5", "tinto": "", "data_qualita": "",
+                        "data_uscita": "", "old_comment": "", "new_comment": "C.Q"}
+                db.upsert_states([base])
+                # Re-uploading identical data must NOT add a second history row.
+                db.upsert_states([dict(base)])
+                stage_2 = dict(base, tinto="2026-09-01", new_comment="Tinto")
+                db.upsert_states([stage_2])
+                stage_3 = dict(stage_2, data_uscita="2026-09-05", new_comment="Uscita")
+                db.upsert_states([stage_3])
+
+                history = db.get_partita_history("P900")
+                self.assertEqual(len(history), 3)  # added once, then 2 real stage changes
+
+                timeline = format_partita_timeline(history)
+                self.assertEqual(len(timeline), 3)
+                self.assertIn("First seen", timeline.iloc[0]["event"])
+                self.assertIn("Dyed on 2026-09-01", timeline.iloc[1]["event"])
+                self.assertIn("Shipped on 2026-09-05", timeline.iloc[2]["event"])
+
+    def test_price_anomaly_flags_large_jump_not_small_one(self):
+        df = pd.DataFrame([
+            {"CLARTICOLO": "G130", "CLCOLORE": "10", "CLDESCR": "Blue",
+             "PREZZOLPZ": 10.00, "_START_DATE": "2026-01-01"},
+            {"CLARTICOLO": "G130", "CLCOLORE": "10", "CLDESCR": "Blue",
+             "PREZZOLPZ": 15.00, "_START_DATE": "2026-06-01"},  # +50%, flagged
+            {"CLARTICOLO": "G170", "CLCOLORE": "20", "CLDESCR": "Red",
+             "PREZZOLPZ": 10.00, "_START_DATE": "2026-01-01"},
+            {"CLARTICOLO": "G170", "CLCOLORE": "20", "CLDESCR": "Red",
+             "PREZZOLPZ": 10.30, "_START_DATE": "2026-06-01"},  # +3%, not flagged
+        ])
+        anomalies = detect_price_anomalies(df, min_pct_change=10.0)
+        self.assertEqual(len(anomalies), 1)
+        row = anomalies.iloc[0]
+        self.assertEqual(row["CLARTICOLO"], "G130")
+        self.assertEqual(row["pct_change"], 50.0)
 
 
 if __name__ == "__main__":

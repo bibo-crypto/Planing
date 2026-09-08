@@ -270,8 +270,13 @@ class BigliettiTab(ttk.Frame):
         magazino_path = load_magazino_cache().get("source_path")
         if magazino_path and Path(magazino_path).is_file():
             vmm_ratio_map, _errors = load_vmm22_ratio_from_magazino(Path(magazino_path))
+        magazino_summary = None
+        if magazino_path and Path(magazino_path).is_file():
+            from calculate import magazino as magazino_logic
+            magazino_df, _errors = magazino_logic.load_magazino(Path(magazino_path), articolo_prefix=None)
+            magazino_summary = magazino_logic.summarize_by_partita(magazino_df)
         price_lookup, _price_source = load_prezzo_lookup()
-        return codes_map, densita_map, vmm_ratio_map, price_lookup
+        return codes_map, densita_map, vmm_ratio_map, price_lookup, magazino_summary
 
     def _run_convert(self):
         if not self.data_path or not self.data_path.is_file():
@@ -311,7 +316,7 @@ class BigliettiTab(ttk.Frame):
         created_items: list[str] = []
         try:
             order_format = detect_order_format(self.data_path)
-            codes_map, densita_map, vmm_ratio_map, price_lookup = self._load_common_sources()
+            codes_map, densita_map, vmm_ratio_map, price_lookup, magazino_summary = self._load_common_sources()
             template = self.template_path
             if not template or not template.is_file():
                 raise ValueError("Forma Biglietti not found. Select the Biglietti.docx template first.")
@@ -320,7 +325,7 @@ class BigliettiTab(ttk.Frame):
                 stem = build_el_kamal_stem(records); out_dir = Path(self.el_kamal_output_dir)
                 xlsx = out_dir / f"{stem}_EL_KAMAL.xlsx"; docx = out_dir / f"{stem}_EL_KAMAL_Biglietti.docx"
                 enrich_records(records, "EL_KAMAL", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
-                export_workbook(xlsx, records, raw, include_filato=False, stem=stem, customer="EL_KAMAL")
+                export_workbook(xlsx, records, raw, include_filato=False, stem=stem, customer="EL_KAMAL", magazino_summary=magazino_summary)
                 export_word(docx, template, records, stem=stem)
                 created_items.append(f"• EL KAMAL: {len(records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
             else:
@@ -330,7 +335,7 @@ class BigliettiTab(ttk.Frame):
                     out_dir = Path(self.elvy_output_dir); stem = build_output_stem(elvy_records, "ELVY")
                     xlsx = out_dir / f"{stem}_ELVY.xlsx"; docx = out_dir / f"{stem}_ELVY_Biglietti.docx"
                     enrich_records(elvy_records, "ELVY", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
-                    export_workbook(xlsx, elvy_records, raw, include_filato=False, stem=stem, customer="ELVY")
+                    export_workbook(xlsx, elvy_records, raw, include_filato=False, stem=stem, customer="ELVY", magazino_summary=magazino_summary)
                     export_word(docx, template, elvy_records, stem=stem)
                     created_items.append(f"• ELVY: {len(elvy_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
                 med_records = [r for r in records if r.customer_code == "3004"]
@@ -338,13 +343,13 @@ class BigliettiTab(ttk.Frame):
                     out_dir = Path(self.med_output_dir); stem = build_output_stem(med_records, "MED")
                     xlsx = out_dir / f"{stem}_MED.xlsx"; docx = out_dir / f"{stem}_MED_Biglietti.docx"
                     enrich_records(med_records, "MED", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
-                    export_workbook(xlsx, med_records, raw, include_filato=True, stem=stem, customer="MED")
+                    export_workbook(xlsx, med_records, raw, include_filato=True, stem=stem, customer="MED", magazino_summary=magazino_summary)
                     export_word(docx, template, med_records, stem=stem)
                     created_items.append(f"• MED: {len(med_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
                 if self.filato_enabled.get() and self.filato_output_dir and raw:
                     out_dir = Path(self.filato_output_dir); out_dir.mkdir(parents=True, exist_ok=True)
                     filato_file = out_dir / f"{self.data_path.stem}_Filato.xlsx"
-                    export_filato_workbook(filato_file, records, raw)
+                    export_filato_workbook(filato_file, records, raw, magazino_summary)
                     created_items.append(f"• Raw Yarn (Filato): {filato_file.name}\n   ↳ Saved to: {filato_file}")
             summary_text = "\n\n".join(created_items)
             self._set_status("Completed — All order workbooks and dyeing tickets generated successfully.")

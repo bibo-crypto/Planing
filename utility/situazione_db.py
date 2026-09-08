@@ -56,6 +56,25 @@ CREATE TABLE IF NOT EXISTS codes (
     titolo          TEXT
 );
 
+CREATE TABLE IF NOT EXISTS partita_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    partita         TEXT,
+    cliente         TEXT,
+    articolo        TEXT,
+    colore          TEXT,
+    data            TEXT,
+    consegna        TEXT,
+    comment         TEXT,
+    bagno           TEXT,
+    tinto           TEXT,
+    data_qualita    TEXT,
+    data_uscita     TEXT,
+    old_comment     TEXT,
+    new_comment     TEXT,
+    changed_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_partita_history_partita ON partita_history(partita);
+
 CREATE TABLE IF NOT EXISTS upload_log (
     source_name     TEXT PRIMARY KEY,
     file_name       TEXT,
@@ -166,6 +185,8 @@ def upsert_states(rows):
 
     added, updated, unchanged = 0, 0, 0
     now = datetime.now().isoformat(timespec="seconds")
+    history_rows = []
+    tracked_fields = ("comment", "bagno", "tinto", "data_qualita", "data_uscita", "new_comment")
 
     for row in rows:
         partita = row["partita"]
@@ -181,6 +202,20 @@ def upsert_states(rows):
             unchanged += 1
         else:
             updated += 1
+
+        # A timeline/audit-trail entry for this Partita: record a snapshot
+        # whenever any stage-relevant field actually changes (a new date
+        # filled in, the machine/bagno reassigned, the status text moving),
+        # not just when new_comment changes -- e.g. Data Uscita can be
+        # filled in on the same day the comment text stays "C.Q" for one
+        # more sync pass, and that's still a real, timeline-worthy event.
+        if prev is None or any(prev.get(field) != row.get(field, "") for field in tracked_fields):
+            history_rows.append((
+                partita, row.get("cliente", ""), row.get("articolo", ""), row.get("colore", ""),
+                row.get("data", ""), row.get("consegna", ""), row.get("comment", ""),
+                row.get("bagno", ""), row.get("tinto", ""), row.get("data_qualita", ""),
+                row.get("data_uscita", ""), old_comment, new_comment, now,
+            ))
 
         conn.execute(
             """INSERT INTO partita_state
@@ -209,9 +244,45 @@ def upsert_states(rows):
              row.get("row_hash", "")),
         )
 
+    if history_rows:
+        conn.executemany(
+            """INSERT INTO partita_history
+               (partita, cliente, articolo, colore, data, consegna, comment,
+                bagno, tinto, data_qualita, data_uscita, old_comment, new_comment, changed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            history_rows,
+        )
+
     conn.commit()
     conn.close()
     return added, updated, unchanged
+
+
+def get_partita_history(partita: str) -> list[dict]:
+    """Full timeline for one Partita, oldest first -- each row is a snapshot
+    taken the moment a stage-relevant field changed (see upsert_states)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM partita_history WHERE partita=? ORDER BY changed_at ASC, id ASC",
+        (str(partita).strip(),),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def search_partite(query: str, limit: int = 25) -> list[str]:
+    """Partita numbers matching a (partial) search string, most recent first."""
+    query = str(query).strip()
+    if not query:
+        return []
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT partita FROM partita_history WHERE partita LIKE ? "
+        "ORDER BY partita LIMIT ?",
+        (f"%{query}%", limit),
+    ).fetchall()
+    conn.close()
+    return [r["partita"] for r in rows]
 
 
 def remove_states_not_in(partite):
