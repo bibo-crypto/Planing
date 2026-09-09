@@ -31,6 +31,13 @@ def save_prod_cache(source_path: Path | str) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not save Produzione file cache: %s", exc)
 
+    try:
+        from utility.path_manager import save_source
+        save_source("data_prod", source_path)
+        save_source("produzione", source_path)
+    except Exception:
+        pass
+
 
 def load_prod_cache() -> dict[str, Any]:
     """
@@ -43,7 +50,31 @@ def load_prod_cache() -> dict[str, Any]:
         if CACHE_FILE.is_file():
             data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return data
+                sp = data.get("source_path", "")
+                if sp and Path(sp).is_file():
+                    return data
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not load Produzione file cache: %s", exc)
+
+    # Fallback 1: check centralized path_manager
+    try:
+        from utility.path_manager import source_path
+        for key in ("data_prod", "produzione", "prod"):
+            p = source_path(key, existing_only=True)
+            if p and p.is_file():
+                return {"source_file": p.name, "source_path": str(p), "loaded_at": ""}
+    except Exception:
+        pass
+
+    # Fallback 2: check SQLite upload_log
+    try:
+        import utility.situazione_db as db
+        for key in ("data_prod", "produzione"):
+            info = db.get_all_uploads().get(key, {})
+            fp = info.get("file_path", "")
+            if fp and Path(fp).is_file():
+                return {"source_file": Path(fp).name, "source_path": str(fp), "loaded_at": info.get("uploaded_at", "")}
+    except Exception:
+        pass
+
     return empty

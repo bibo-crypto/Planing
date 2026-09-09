@@ -321,6 +321,7 @@ def import_master_directory(
     biglietti_tab=None,
     prezzi_tab=None,
     skip_keys: set[str] | None = None,
+    settimana_tab=None,
 ) -> tuple[list[str], list[str]]:
     """Scan *dir_path* for all recognized factory files and route each to its
     respective loaders, caches, and GUI tabs.
@@ -344,7 +345,10 @@ def import_master_directory(
             skipped.append(f"{LABELS.get(key, key)} (Empty file: {file_path.name})")
             continue
         try:
-            _route(key, str(file_path), str(file_path), situazione_tab, magazino_tab, biglietti_tab, prezzi_tab)
+            _route(
+                key, str(file_path), str(file_path), situazione_tab, magazino_tab,
+                biglietti_tab, prezzi_tab, settimana_tab,
+            )
             loaded.append(f"{LABELS.get(key, key)} ({file_path.name})")
         except Exception as exc:
             skipped.append(f"{LABELS.get(key, key)} (Error: {exc})")
@@ -352,11 +356,22 @@ def import_master_directory(
     return loaded, skipped
 
 
-def _route(key: str, tmp_path: str, master_path: str, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None) -> None:
+def _route(
+    key: str,
+    tmp_path: str,
+    master_path: str,
+    situazione_tab,
+    magazino_tab,
+    biglietti_tab=None,
+    prezzi_tab=None,
+    settimana_tab=None,
+) -> None:
     """Route one file/source to its proper tab, database, and cache handlers."""
     if key in ("dfm", "copertura", "data_prod", "wincoint", "uscita", "qualita"):
         if situazione_tab is not None:
             situazione_tab._handle_upload(key, tmp_path, cache_path=master_path)
+        if key in ("dfm", "data_prod") and settimana_tab is not None:
+            settimana_tab._handle_upload(key, master_path)
 
     elif key == "codes":
         if situazione_tab is not None:

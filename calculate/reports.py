@@ -69,7 +69,9 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
     per event, with a plain-language description of what changed since the
     previous snapshot.
     """
-    columns = ["changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita"]
+    from calculate.situazione import compute_delay_days, _parse_delivery_date
+
+    columns = ["changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "ritardo"]
     if not history_rows:
         return pd.DataFrame(columns=columns)
 
@@ -81,6 +83,8 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
     ]
     out_rows = []
     prev: dict = {}
+    today = pd.Timestamp(datetime.now().date())
+
     for i, row in enumerate(history_rows):
         events = []
         if i == 0:
@@ -95,6 +99,19 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
                 events.append(f"Status -> {row.get('new_comment') or '(cleared)'}")
         if not events:
             events.append("Updated")
+
+        days_qc = str(row.get("days_in_qc") or "").strip()
+        if not days_qc:
+            tinto_dt = _parse_delivery_date(row.get("tinto"))
+            if tinto_dt is not None:
+                days_qc = str((today - tinto_dt).days)
+            else:
+                days_qc = ""
+
+        ritardo_val = str(row.get("ritardo_consegna") or row.get("ritardo") or "").strip()
+        if not ritardo_val:
+            ritardo_val = compute_delay_days(row)
+
         out_rows.append({
             "changed_at": row.get("changed_at"),
             "event": "; ".join(events),
@@ -103,6 +120,8 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
             "tinto": row.get("tinto"),
             "data_qualita": row.get("data_qualita"),
             "data_uscita": row.get("data_uscita"),
+            "days_in_qc": days_qc,
+            "ritardo": ritardo_val,
         })
         prev = row
     return pd.DataFrame(out_rows, columns=columns)

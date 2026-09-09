@@ -35,6 +35,127 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertTrue(titles_compatible(" 30/1 ", "30/1"))
         self.assertFalse(titles_compatible("30/1", "31/1"))
 
+    def test_elvy_reactive_client_colour_keeps_g_marker(self):
+        from parsers.dfm_lookup import _extract_colour_code
+
+        self.assertEqual(_extract_colour_code("R.G.4257"), ("4257", "", "G"))
+
+    def test_elvy_reactive_client_colour_matches_dfm(self):
+        from parsers.dfm_lookup import lookup_dfm_color
+
+        entries = [{
+            "articolo": "C130026S",
+            "coloredfm": "364257",
+            "cldescr": "EL-G-425711-DOUBLE REATTIVO",
+            "twist": "2",
+            "titolo": "80/2",
+            "date": "2026-09-09",
+        }]
+        self.assertEqual(
+            lookup_dfm_color(
+                "G130026S", "R.G.4257", "80/2", "Reactive", "100% Cotton", entries
+            ),
+            ("364257", "EL-G-425711-DOUBLE REATTIVO"),
+        )
+
+    def test_pdf_parser_keeps_multiline_article_description_fields(self):
+        from parsers.pdf_parser import PDFParser, ColumnSlot, _group_into_lines
+
+        def word(text, x0, top, width=12):
+            return {"text": text, "x0": x0, "x1": x0 + width, "top": top, "bottom": top + 8}
+
+        lines = _group_into_lines([
+            word("10", 10, 100),
+            word("800", 70, 100),
+            word("R.G.4257", 360, 100, 50),
+            word("100%", 70, 120, 28),
+            word("Cotton", 105, 120, 38),
+            word("Pima", 148, 120, 25),
+            word("Blend", 178, 120, 30),
+            word("Nm", 214, 120, 16),
+            word("135/2", 235, 120, 34),
+            word("Ne", 275, 120, 14),
+            word("80/2", 294, 120, 28),
+            word("Reactive", 328, 120, 45),
+            word("Griege", 70, 140, 38),
+            word("Lot", 114, 140, 18),
+            word(":", 136, 140, 5),
+            word("99_LOT", 146, 140, 42),
+            word("El.09092026", 192, 140, 60),
+        ], 4)
+        slots = {
+            "pos": ColumnSlot("pos", 0, 35),
+            "article_area": ColumnSlot("article_area", 35, 350),
+            "colour": ColumnSlot("colour", 350, 410),
+        }
+        rows, _, _ = PDFParser._lines_to_rows(
+            PDFParser.__new__(PDFParser), lines, slots, "1479", "9/9/2026", ""
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].article_no, "800")
+        self.assertEqual(rows[0].yarn, "100% Cotton Pima Blend")
+        self.assertEqual(rows[0].nm, "135/2")
+        self.assertEqual(rows[0].ne, "80/2")
+        self.assertEqual(rows[0].dye_type, "Reactive")
+        self.assertEqual(rows[0].lot, "99_LOT El.09092026")
+        self.assertEqual(rows[0].colour, "R.G.4257")
+
+    def test_pdf_parser_recovers_fields_on_first_row_continuation(self):
+        from parsers.pdf_parser import PDFParser, ColumnSlot, _group_into_lines
+
+        def word(text, x0, top, width=12):
+            return {"text": text, "x0": x0, "x1": x0 + width, "top": top, "bottom": top + 8}
+
+        lines = _group_into_lines([
+            word("10", 10, 100),
+            word("672.00", 490, 100, 35),
+            word("618.24", 610, 100, 35),
+            word("800", 70, 108),
+            word("R.G.4257", 360, 108, 50),
+            word("100%", 70, 120, 28),
+            word("Cotton", 105, 120, 38),
+            word("Pima", 148, 120, 25),
+            word("Blend", 178, 120, 30),
+            word("Nm", 214, 120, 16),
+            word("135/2", 235, 120, 34),
+            word("Ne", 275, 120, 14),
+            word("80/2", 294, 120, 28),
+            word("Reactive", 328, 120, 45),
+            word("Griege", 70, 140, 38),
+            word("Lot", 114, 140, 18),
+            word(":", 136, 140, 5),
+            word("99_LOT", 146, 140, 42),
+            word("El.09092026", 192, 140, 60),
+        ], 4)
+        slots = {
+            "pos": ColumnSlot("pos", 0, 35),
+            "article_area": ColumnSlot("article_area", 35, 350),
+            "colour": ColumnSlot("colour", 350, 410),
+            "qty_cones": ColumnSlot("qty_cones", 480, 550),
+            "qty_kg": ColumnSlot("qty_kg", 590, 660),
+        }
+        rows, _, _ = PDFParser._lines_to_rows(
+            PDFParser.__new__(PDFParser), lines, slots, "1479", "9/9/2026", ""
+        )
+
+        self.assertEqual(rows[0].article_no, "800")
+        self.assertEqual(rows[0].colour, "R.G.4257")
+        self.assertEqual(rows[0].quantity_cones, 672.0)
+        self.assertEqual(rows[0].quantity_kg, 618.24)
+
+    def test_data_start_includes_words_within_first_row_y_tolerance(self):
+        from parsers.pdf_parser import PDFParser
+
+        words = [
+            {"text": "Pos.", "x0": 10, "x1": 20, "top": 100, "bottom": 106},
+            {"text": "10", "x0": 10, "x1": 18, "top": 120.7, "bottom": 127},
+            {"text": "800", "x0": 40, "x1": 52, "top": 120.4, "bottom": 127},
+        ]
+        start = PDFParser._find_data_start(words, words[0])
+
+        self.assertEqual(start, 120.4)
+
     def test_shared_path_round_trip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "Produzione.xlsx"
@@ -267,28 +388,61 @@ class PlanningRegressionTests(unittest.TestCase):
         result = _filato_rows([record], raw_rows, magazino)
         self.assertEqual(result[0]["Rocche"], 12)
 
-    def test_filato_extract_copies_source_sheet(self):
-        from pipelines.ordini_elvy import export_filato_full
+    def test_filato_extract_replaces_previous_order_content(self):
+        # A shared "Filato x Tinturia.xlsx" (e.g. Ordine Kamal and Ordine
+        # ELVY both pointed at the same folder) must only ever reflect the
+        # MOST RECENT extraction -- an older order's raw yarn shouldn't
+        # linger next to a newer order's, since it may already be pulled
+        # and irrelevant.
+        from pipelines.ordini_elvy import export_filato_full, read_filato_tinturia_sheet, RawYarnMatch
         with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / "ordine.xlsx"
             target = Path(temp_dir) / "filato.xlsx"
-            workbook = openpyxl.Workbook()
-            workbook.active.title = "Ordine ELVY"
-            sheet = workbook.create_sheet("Filato x Tinturia")
-            sheet.append(["Articolo", "Titolo", "Partita", "Rocche", "Peso", "تحضير خام"])
-            sheet.append(["G130027S", "100/2", "158694", 1108, 1029.6, "تحضير خام"])
-            sheet.column_dimensions["D"].width = 22
-            sheet.freeze_panes = "A2"
-            workbook.save(source)
-            workbook.close()
+            older_order = [RawYarnMatch(articolo="G130027S", titolo="100/2", partita="158694", rocce=10, peso=100.0)]
+            export_filato_full(target, older_order)
 
-            export_filato_full(target, [], source_path=source)
-            copied = openpyxl.load_workbook(target, data_only=True)
-            copied_sheet = copied["Filato x Tinturia"]
-            self.assertEqual(copied_sheet.cell(2, 4).value, 1108)
-            self.assertEqual(copied_sheet.column_dimensions["D"].width, 22)
-            self.assertEqual(copied_sheet.freeze_panes, "A2")
-            copied.close()
+            newer_order = [RawYarnMatch(articolo="G999999S", titolo="60/1", partita="222111", rocce=5, peso=50.0)]
+            export_filato_full(target, newer_order)
+
+            rows = read_filato_tinturia_sheet(target)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].partita, "222111")  # only the newer order's row remains
+
+    def test_ordini_full_replaces_previous_order_content(self):
+        from pipelines.ordini_elvy import export_ordini_full, OrdiniElvyRow
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "ordini.xlsx"
+            export_ordini_full(target, [OrdiniElvyRow(articolo_delta="C100", coloredfm=5, quantity_cones=10)])
+            export_ordini_full(target, [OrdiniElvyRow(articolo_delta="C200", coloredfm=7, quantity_cones=20)])
+
+            wb = openpyxl.load_workbook(target)
+            ws = wb["ORDINE VENDITA EGITTO"]
+            values = [ws.cell(row=r, column=c).value for r in range(2, ws.max_row + 1) for c in range(1, ws.max_column + 1)]
+            wb.close()
+            self.assertNotIn("C100", values)  # the older order's row is gone
+            self.assertIn("C200", values)
+
+    def test_med_erp_export_replaces_previous_content(self):
+        from pipelines.ordine_med import OrdineMedRow, export_erp_order_workbook
+
+        def record(article):
+            return OrdineMedRow(
+                riga=1, code_org="", titolo="", descr_col="", articolo=article,
+                colore="", rocc=1, abbin="", consegna_input="", pt_grg="",
+                pt_med="", polmoni="", cliente_note="", nota_grg="", nota_col="",
+                kg_note="", fabb="", prezz_note="",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
+            export_erp_order_workbook(target, [record("C100")])
+            export_erp_order_workbook(target, [record("C200")])
+
+            wb = openpyxl.load_workbook(target, data_only=True)
+            ws = wb["Dati sistema (B-N)"]
+            values = [cell.value for row in ws.iter_rows(min_row=2) for cell in row]
+            wb.close()
+            self.assertNotIn("C100", values)
+            self.assertIn("C200", values)
 
     def test_filato_reader_handles_short_excel_rows(self):
         from pipelines.ordini_elvy import read_filato_tinturia_sheet
@@ -369,6 +523,8 @@ class PlanningRegressionTests(unittest.TestCase):
 
                 timeline = format_partita_timeline(history)
                 self.assertEqual(len(timeline), 3)
+                self.assertIn("days_in_qc", timeline.columns)
+                self.assertIn("ritardo", timeline.columns)
                 self.assertIn("First seen", timeline.iloc[0]["event"])
                 self.assertIn("Dyed on 2026-09-01", timeline.iloc[1]["event"])
                 self.assertIn("Shipped on 2026-09-05", timeline.iloc[2]["event"])
@@ -389,6 +545,58 @@ class PlanningRegressionTests(unittest.TestCase):
         row = anomalies.iloc[0]
         self.assertEqual(row["CLARTICOLO"], "G130")
         self.assertEqual(row["pct_change"], 50.0)
+
+    def test_compute_delay_days_rules(self):
+        from calculate.situazione import compute_delay_days
+
+        # 1. Missing data_qualita -> must be blank
+        row_no_qualita = {
+            "cliente": "MED", "consegna": "2026-09-10", "data_qualita": "",
+            "data_uscita": "2026-09-15",
+        }
+        self.assertEqual(compute_delay_days(row_no_qualita), "")
+
+        # 2. Missing data_uscita -> must be blank
+        row_no_uscita = {
+            "cliente": "MED", "consegna": "2026-09-10", "data_qualita": "2026-09-08",
+            "data_uscita": "",
+        }
+        self.assertEqual(compute_delay_days(row_no_uscita), "")
+
+        # 3. Non-Elvy customer: late delivery (5 days late -> "5")
+        row_med_late = {
+            "cliente": "MED", "consegna": "2026-09-10", "data_qualita": "2026-09-08",
+            "data_uscita": "2026-09-15",
+        }
+        self.assertEqual(compute_delay_days(row_med_late), "5")
+
+        # 4. Non-Elvy customer: early delivery (3 days early -> "-3")
+        row_med_early = {
+            "cliente": "MED", "consegna": "2026-09-10", "data_qualita": "2026-09-05",
+            "data_uscita": "2026-09-07",
+        }
+        self.assertEqual(compute_delay_days(row_med_early), "-3")
+
+        # 5. Non-Elvy customer: on-time delivery (0 days -> "0")
+        row_med_ontime = {
+            "cliente": "MED", "consegna": "2026-09-10", "data_qualita": "2026-09-08",
+            "data_uscita": "2026-09-10",
+        }
+        self.assertEqual(compute_delay_days(row_med_ontime), "0")
+
+        # 6. ELVY customer: compares against Delivery Date (late 4 days -> "4")
+        row_elvy_late = {
+            "cliente": "ELVY", "consegna": "2026-09-01", "delivery_date": "2026-09-10",
+            "data_qualita": "2026-09-08", "data_uscita": "2026-09-14",
+        }
+        self.assertEqual(compute_delay_days(row_elvy_late), "4")
+
+        # 7. ELVY customer: early delivery (early 2 days -> "-2")
+        row_elvy_early = {
+            "cliente": "3009", "consegna": "2026-09-01", "delivery_date": "2026-09-10",
+            "data_qualita": "2026-09-06", "data_uscita": "2026-09-08",
+        }
+        self.assertEqual(compute_delay_days(row_elvy_early), "-2")
 
 
 if __name__ == "__main__":

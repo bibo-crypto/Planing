@@ -121,7 +121,7 @@ class ConverterApp(tk.Tk):
         self._po_output_dir: Path | None = None
         self._po_last_export_path: Path | None = None
         self._po_erp_export_dir: Path | None = None
-        self._po_one_per_file = tk.BooleanVar(value=False)
+        self._po_filato_export_dir: Path | None = None
         self._po_update_erp_file = tk.BooleanVar(value=True)
         self._po_update_filato_file = tk.BooleanVar(value=True)
         self._po_update_erp_file.trace_add(
@@ -372,6 +372,7 @@ class ConverterApp(tk.Tk):
             save_prefs=self._save_prefs,
             prefs=self._prefs,
             on_shared_cache_changed=self._on_shared_cache_changed,
+            settimana_tab=self._settimana_tab,
         )
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
@@ -511,35 +512,35 @@ class ConverterApp(tk.Tk):
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(erp_frame, text="Extract ERP order file", variable=self._po_update_erp_file).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(erp_frame, text="Extract Filato x Tinturia", variable=self._po_update_filato_file).grid(row=0, column=1, sticky="w")
-
         ttk.Button(
             erp_frame, text="📁 Select ERP Files Folder…", command=self._on_po_select_erp_folder, width=22
-        ).grid(row=1, column=0, padx=(0, 6), pady=(3, 0), sticky="w")
+        ).grid(row=0, column=0, padx=(0, 6), pady=(2, 4), sticky="w")
+        ttk.Checkbutton(
+            erp_frame, text="Extract ERP order file", variable=self._po_update_erp_file
+        ).grid(row=0, column=1, sticky="w", pady=(2, 4))
+        self._po_lbl_erp_dir = ttk.Label(erp_frame, text="No folder selected", foreground="grey", anchor="w")
+        self._po_lbl_erp_dir.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
-        self._po_lbl_erp_dir = ttk.Label(
-            erp_frame, text="No folder selected", foreground="grey", anchor="w"
-        )
-        self._po_lbl_erp_dir.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            erp_frame, text="📁 Select Filato Folder…", command=self._on_po_select_filato_folder, width=22
+        ).grid(row=2, column=0, padx=(0, 6), pady=(4, 2), sticky="w")
+        ttk.Checkbutton(
+            erp_frame, text="Extract Filato x Tinturia.xlsx", variable=self._po_update_filato_file
+        ).grid(row=2, column=1, sticky="w", pady=(4, 2))
+        self._po_lbl_filato_dir = ttk.Label(erp_frame, text="No folder selected", foreground="grey", anchor="w")
+        self._po_lbl_filato_dir.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 2))
 
         erp_warning = ttk.Label(
             erp_frame,
             text="⚠ Close these files in Excel before converting, or saving will fail.",
             foreground="#8a6d00", anchor="w",
         )
-        erp_warning.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        erp_warning.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
         # ── Options + Convert ────────────────────────────────────────
         opt_frame = ttk.Frame(parent, padding=(6, 3))
         opt_frame.grid(row=4, column=0, sticky="ew", padx=4, pady=1)
         opt_frame.columnconfigure(0, weight=1)
-
-        ttk.Checkbutton(
-            opt_frame,
-            text="One Excel file per PDF  (otherwise merge all into one workbook)",
-            variable=self._po_one_per_file,
-        ).grid(row=0, column=0, sticky="w")
 
         self._po_btn_convert = ttk.Button(
             opt_frame,
@@ -548,7 +549,7 @@ class ConverterApp(tk.Tk):
             style="Accent.TButton",
             width=12,
         )
-        self._po_btn_convert.grid(row=0, column=1, sticky="e", padx=(8, 0), pady=(0, 1))
+        self._po_btn_convert.grid(row=0, column=0, sticky="w", pady=(0, 1))
 
         # ── Progress + status ────────────────────────────────────────
         prog_frame = ttk.Frame(parent, padding=(4, 2))
@@ -1053,8 +1054,24 @@ class ConverterApp(tk.Tk):
         if erp_dir_str and Path(erp_dir_str).is_dir():
             self._po_erp_export_dir = Path(erp_dir_str)
             self._po_lbl_erp_dir.config(text=erp_dir_str, foreground="black")
+
+        # po_filato_export_dir is new (Filato used to share the ERP folder)
+        # -- fall back to the old shared folder on first run after
+        # upgrading, so existing users keep working without reconfiguring.
+        filato_dir_str = self._prefs.get("po_filato_export_dir") or erp_dir_str
+        if filato_dir_str and Path(filato_dir_str).is_dir():
+            self._po_filato_export_dir = Path(filato_dir_str)
+            self._po_lbl_filato_dir.config(text=filato_dir_str, foreground="black")
+
         self._po_update_erp_file.set(self._prefs.get("po_update_erp_file", True))
         self._po_update_filato_file.set(self._prefs.get("po_update_filato_file", True))
+
+        if getattr(self, "_situazione_tab", None):
+            self.after_idle(self._situazione_tab.sync_shared_async)
+            if hasattr(self._situazione_tab, "sync_remaining_shared_sources"):
+                self.after_idle(self._situazione_tab.sync_remaining_shared_sources)
+        if getattr(self, "_settimana_tab", None):
+            self.after_idle(self._settimana_tab.sync_shared_async)
 
     # ------------------------------------------------------------------
     # Purchase Orders — file/folder selection callbacks
@@ -1099,13 +1116,23 @@ class ConverterApp(tk.Tk):
 
     def _on_po_select_erp_folder(self) -> None:
         path = filedialog.askdirectory(
-            title="Select the folder for the ERP export files",
+            title="Select ERP file folder",
             initialdir=self._prefs.get("po_erp_export_dir") or None,
         )
         if path:
             self._po_erp_export_dir = Path(path)
             self._po_lbl_erp_dir.config(text=str(self._po_erp_export_dir), foreground="black")
             self._save_prefs(po_erp_export_dir=str(self._po_erp_export_dir))
+
+    def _on_po_select_filato_folder(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select Filato x Tinturia output folder",
+            initialdir=self._prefs.get("po_filato_export_dir") or None,
+        )
+        if path:
+            self._po_filato_export_dir = Path(path)
+            self._po_lbl_filato_dir.config(text=str(self._po_filato_export_dir), foreground="black")
+            self._save_prefs(po_filato_export_dir=str(self._po_filato_export_dir))
 
     def _on_po_select_raw_yarn(self) -> None:
         path = filedialog.askopenfilename(
@@ -1154,10 +1181,11 @@ class ConverterApp(tk.Tk):
             args=(
                 pdf_list,
                 self._po_output_dir,
-                self._po_one_per_file.get(),
+                False,
                 self._po_update_erp_file.get(),
                 self._po_update_filato_file.get(),
                 self._po_erp_export_dir,
+                self._po_filato_export_dir,
                 self._po_raw_yarn_path,
             ),
             daemon=True,
@@ -1176,6 +1204,7 @@ class ConverterApp(tk.Tk):
         update_erp_file: bool,
         update_filato_file: bool,
         erp_export_dir: Path | None,
+        filato_export_dir: Path | None,
         raw_yarn_path: Path | None = None,
     ) -> None:
         """Run the Purchase Order conversion and optional ERP extracts."""
@@ -1284,37 +1313,44 @@ class ConverterApp(tk.Tk):
                 logger.error(msg)
                 errors.append(msg)
 
-        # Extract both ERP files fresh into the saved folder, if configured
-        # -- each file is fully rebuilt (not edited in place) every Convert.
-        if (update_erp_file or update_filato_file) and all_rows:
+        # Extract both ERP files into their saved folders, if configured --
+        # each write replaces whatever was already at that path (see
+        # export_ordini_full/export_filato_full) so a shared destination
+        # always reflects only the order that was just extracted, never a
+        # mix of an old order's rows with a new one's.
+        if update_erp_file and all_rows:
             if erp_export_dir is None:
-                msg = "ERP file extraction was enabled but no folder is selected."
+                msg = "ERP file extraction was enabled but no ERP folder is selected."
                 logger.error(msg)
                 errors.append(msg)
             else:
                 ordini_path = erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
-                filato_path = erp_export_dir / "Filato x Tinturia.xlsx"
-                if update_erp_file:
-                    try:
-                        ordini_rows = build_ordini_elvy_rows(all_rows)
-                        if magazino_summary is not None and not magazino_summary.empty:
-                            match_raw_yarn(ordini_rows, magazino_summary, codes_map)
-                        n = export_ordini_full(ordini_path, ordini_rows)
-                        logger.info("Extracted ERP file: %s (%d rows)", ordini_path.name, n)
-                    except Exception as exc:  # noqa: BLE001
-                        msg = f"Error extracting {ordini_path.name}: {exc}"
-                        logger.error(msg)
-                        errors.append(msg)
+                try:
+                    ordini_rows = build_ordini_elvy_rows(all_rows)
+                    if magazino_summary is not None and not magazino_summary.empty:
+                        match_raw_yarn(ordini_rows, magazino_summary, codes_map)
+                    n = export_ordini_full(ordini_path, ordini_rows)
+                    logger.info("Extracted ERP file: %s (%d rows)", ordini_path.name, n)
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"Error extracting {ordini_path.name}: {exc}"
+                    logger.error(msg)
+                    errors.append(msg)
 
-                if update_filato_file and last_export_path is not None:
-                    try:
-                        matches = read_filato_tinturia_sheet(last_export_path)
-                        n2 = export_filato_full(filato_path, matches, source_path=last_export_path)
-                        logger.info("Extracted Filato x Tinturia file: %s (%d rows)", filato_path.name, n2)
-                    except Exception as exc:  # noqa: BLE001
-                        msg = f"Error extracting {filato_path.name}: {exc}"
-                        logger.error(msg)
-                        errors.append(msg)
+        if update_filato_file and all_rows:
+            if filato_export_dir is None:
+                msg = "Filato x Tinturia extraction was enabled but no Filato folder is selected."
+                logger.error(msg)
+                errors.append(msg)
+            elif last_export_path is not None:
+                filato_path = filato_export_dir / "Filato x Tinturia.xlsx"
+                try:
+                    matches = read_filato_tinturia_sheet(last_export_path)
+                    n2 = export_filato_full(filato_path, matches)
+                    logger.info("Extracted Filato x Tinturia file: %s (%d rows)", filato_path.name, n2)
+                except Exception as exc:  # noqa: BLE001
+                    msg = f"Error extracting {filato_path.name}: {exc}"
+                    logger.error(msg)
+                    errors.append(msg)
 
         self._po_last_export_path = last_export_path
         self.after(0, self._on_po_conversion_done, errors, total)

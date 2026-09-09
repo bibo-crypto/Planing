@@ -371,7 +371,18 @@ class PDFParser:
             if RE_POS_NUMBER.match(w["text"]):
                 candidates.append(w["top"])
 
-        return min(candidates) if candidates else None
+        if not candidates:
+            return None
+
+        # PDF text objects on one visual row can have slightly different
+        # top values (for example POS/quantities at 192.77 and article text
+        # at 192.53). Return the top of the whole visual row, otherwise the
+        # later data-word filter drops the article and colour cells.
+        first_top = min(candidates)
+        return min(
+            w["top"] for w in words
+            if abs(w["top"] - first_top) <= LINE_Y_TOLERANCE
+        )
 
     # ------------------------------------------------------------------
     # Step 5 — column slot detection
@@ -521,11 +532,35 @@ class PDFParser:
             """Words that belong to the article area (not colour-overlapping)."""
             if art_slot is None:
                 return []
+            colour_left = colour_slot.x_left if colour_slot is not None else art_slot.x_right
             return sorted(
                 [w for w in line_words
-                 if _in_slot(w, art_slot) and not _is_colour_word(w)],
+                 if art_slot.x_left <= w["x0"] < art_slot.x_right
+                 and not (
+                     colour_slot is not None
+                     and w["x0"] >= colour_left - 12
+                     and _is_colour_word(w)
+                 )],
                 key=lambda w: w["x0"],
             )
+
+        def _reference_words(line_words: list[Word], ref_slot: ColumnSlot) -> list[Word]:
+            """Keep actual reference text, excluding ship-date spillover."""
+            has_week_note = any(
+                word["text"].strip().upper().startswith("C.W")
+                for word in line_words
+            )
+            result: list[Word] = []
+            for word in line_words:
+                if not _in_slot(word, ref_slot):
+                    continue
+                text = word["text"].strip()
+                if RE_DATE_VALUE.fullmatch(text) or text.upper().startswith("C.W"):
+                    continue
+                if has_week_note and text.isdigit():
+                    continue
+                result.append(word)
+            return result
 
         for line in lines:
             line_text = " ".join(w["text"] for w in line)
@@ -583,6 +618,11 @@ class PDFParser:
                         if field_name == "colour":
                             if _is_colour_word(w):
                                 acc[field_name].append(w["text"])
+                        elif field_name == "reference_to":
+                            acc[field_name].extend(
+                                w["text"] for w in _reference_words(line, slot)
+                            )
+                            break
                         else:
                             if _in_slot(w, slot):
                                 acc[field_name].append(w["text"])
@@ -595,16 +635,52 @@ class PDFParser:
                 # header, same as Ship. Date's own week note ('C.W 34').
                 # Same colour-overlap exclusion applies.
                 art_words = _article_area_words(line)
-                acc["article_description"].extend(
-                    w["text"] for w in art_words
-                )
+                if not acc.get("article_no") and art_words:
+                    first_word = art_words[0]["text"]
+                    if re.fullmatch(r"\d+", first_word):
+                        acc["article_no"].append(first_word)
+                        art_words = art_words[1:]
+                acc["article_description"].extend(w["text"] for w in art_words)
+
+                # Some PDF producers place the first row's article/colour
+                # cells a few points lower than its POS and quantity cells.
+                # Treat values on that continuation line as row fields only
+                # when the corresponding field is still empty.
+                for field_name in ("colour", "qty_cones", "qty_kg", "price_usd", "value_usd", "ship_date"):
+                    if acc.get(field_name):
+                        continue
+                    slot = slots.get(field_name)
+                    if not slot:
+                        continue
+                    if field_name == "colour":
+                        values = [w["text"] for w in line if _is_colour_word(w)]
+                    else:
+                        values = [w["text"] for w in line if _in_slot(w, slot)]
+                    acc[field_name].extend(values)
+
                 ref_slot = slots.get("reference_to")
                 if ref_slot:
-                    for w in line:
-                        if _in_slot(w, ref_slot):
-                            acc["reference_to"].append(w["text"])
+                    acc["reference_to"].extend(
+                        w["text"] for w in _reference_words(line, ref_slot)
+                    )
 
         flush()
+        # Some PDFs omit the first repeated article number from the text
+        # layer even though it is visibly printed. Recover it only when the
+        # row has the exact same description as another parsed row, so this
+        # cannot invent a code for a genuinely different article.
+        for row in rows:
+            if row.article_no:
+                continue
+            matching = next(
+                (other.article_no for other in rows
+                 if other is not row
+                 and other.article_no
+                 and other.article_description == row.article_description),
+                "",
+            )
+            if matching:
+                row.article_no = matching
         return rows, current_abbina, row_tops
 
     # ------------------------------------------------------------------

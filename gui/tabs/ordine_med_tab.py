@@ -265,7 +265,7 @@ class OrdineMedTab(ttk.Frame):
                 if not self.erp_folder or not self.erp_folder.is_dir():
                     raise ValueError("ERP extraction is enabled but no ERP Files Folder is selected.")
                 ordine_med.export_erp_order_workbook(
-                    self.erp_folder / "Ordine_MED_ERP.xlsx", records
+                    self.erp_folder / "EXCEL PER ORDINE VENDITA EGITTO.xlsx", records
                 )
             if self.filato_enabled.get():
                 if not self.filato_folder or not self.filato_folder.is_dir():

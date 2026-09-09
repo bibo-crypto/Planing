@@ -273,9 +273,14 @@ def _extract_colour_code(colour: str) -> tuple[str, str, str]:
     marker of its own). Returns ("", "", "") if no digits are found.
     """
     text = clean_text(colour)
-    prefix_match = _COLOUR_PREFIX_RE.match(text)
     marker = ""
-    if prefix_match:
+    # Reactive colours can carry the dye marker and the client marker
+    # together, e.g. ``R.G.4257``. Consume all leading markers so the
+    # meaningful client marker (G/MO) is retained for CLDESCR matching.
+    while True:
+        prefix_match = _COLOUR_PREFIX_RE.match(text)
+        if not prefix_match:
+            break
         found = prefix_match.group("marker").upper()
         if found in ("G", "MO"):
             marker = found

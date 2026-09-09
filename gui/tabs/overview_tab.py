@@ -64,6 +64,7 @@ HEADERS_IT = {
     "data_uscita": "Data Uscita", "custom": "Controllo",
     "days_in_qc": "Giorni in C.Q",
     "days_to_delivery": "Giorni alla consegna",
+    "ritardo_consegna": "Ritardo (gg)",
     "prezzo": "Prezzo", "issue": "Problema",
 }
 CHECK_COLUMNS = [
@@ -230,12 +231,13 @@ class OverviewTab(ttk.Frame):
     AUTO_REFRESH_MS = 5000
     CARD_GRID_COLUMNS = 20
 
-    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None, on_shared_cache_changed=None):
+    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None, on_shared_cache_changed=None, settimana_tab=None):
         super().__init__(master)
         self.situazione_tab = situazione_tab
         self.magazino_tab = magazino_tab
         self.biglietti_tab = biglietti_tab
         self.prezzi_tab = prezzi_tab
+        self.settimana_tab = settimana_tab
         self._save_prefs = save_prefs
         self._prefs = prefs or {}
         self._on_shared_cache_changed = on_shared_cache_changed
@@ -431,6 +433,7 @@ class OverviewTab(ttk.Frame):
                     # Order input files belong to Create (EXCEL+Biglietti)
                     # and must never be auto-selected by Overview.
                     skip_keys={"data_ordine", "dispo_bagno"},
+                    settimana_tab=self.settimana_tab,
                 )
                 err = None
             except Exception as exc:  # noqa: BLE001
