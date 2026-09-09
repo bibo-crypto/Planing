@@ -92,6 +92,7 @@ COLUMN_SPEC = [
     ("data_uscita", "Data Uscita", "date"),
     ("custom", "Custom", "text"),
     ("days_in_qc", "Days in Q.C", "number"),
+    ("ritardo_consegna", "Ritardo (gg)", "number"),
 ]
 COLUMN_LABELS = {key: header for key, header, _ in COLUMN_SPEC}
 COLUMN_TYPES = {key: ctype for key, _, ctype in COLUMN_SPEC}
@@ -276,8 +277,11 @@ class SituazioneTab(ttk.Frame):
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
-        ttk.Label(bar, text="Search:").pack(side="left", padx=(18, 4))
-        ttk.Entry(bar, textvariable=self.search_var, width=30).pack(side="left")
+        ttk.Label(bar, text="Search:").pack(side="left", padx=(14, 4))
+        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=28)
+        self.search_entry.pack(side="left")
+        self.clear_btn = ttk.Button(bar, text="Clear", command=self._on_clear_search)
+        self.clear_btn.pack(side="left", padx=(4, 6))
 
         self.summary_lbl = ttk.Label(bar, text="")
         self.summary_lbl.pack(side="right", padx=8)
@@ -530,8 +534,8 @@ class SituazioneTab(ttk.Frame):
         window = tk.Toplevel(self)
         self._child_windows["timeline"] = window
         window.title("Partita Timeline")
-        window.geometry("820x480")
-        window.minsize(620, 360)
+        window.geometry("960x500")
+        window.minsize(750, 360)
 
         search_row = ttk.Frame(window)
         search_row.pack(fill="x", padx=10, pady=(10, 6))
@@ -545,13 +549,14 @@ class SituazioneTab(ttk.Frame):
 
         frame = ttk.Frame(window)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita")
+        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "ritardo")
         labels = {
             "changed_at": "When", "event": "Event", "comment": "Status", "bagno": "Bagno",
             "tinto": "Tinto", "data_qualita": "Data Qualità", "data_uscita": "Data Uscita",
+            "days_in_qc": "Days in C.Q", "ritardo": "Ritardo",
         }
         tree = ttk.Treeview(frame, columns=columns, show="headings")
-        widths = [130, 260, 100, 70, 90, 100, 100]
+        widths = [125, 230, 95, 60, 85, 90, 90, 80, 75]
         for column, width in zip(columns, widths):
             tree.heading(column, text=labels[column])
             tree.column(column, width=width, anchor="w" if column == "event" else "center")
@@ -1088,9 +1093,7 @@ class SituazioneTab(ttk.Frame):
         if key == "data_prod":
             self._save_shared_prod(display_path)
         # Every successful individual upload becomes available to all pages.
-        # DFM/Produzione retain their specialized lookup caches as well.
-        if key not in ("dfm", "data_prod"):
-            save_source(key, display_path)
+        save_source(key, display_path)
         logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(display_path))
 
     def _handle_codes_upload(self, _key, path, cache_path=None):
@@ -1495,6 +1498,20 @@ class SituazioneTab(ttk.Frame):
         mask = searchable.apply(lambda col: col.str.contains(q, case=False, regex=False)).any(axis=1)
         self._render_tree(self.current_df[mask], autosize=False)
 
+    def _on_clear_search(self):
+        """Clear search input and restore default treeview display/sorting."""
+        if self._filter_after_id is not None:
+            self.after_cancel(self._filter_after_id)
+            self._filter_after_id = None
+        self.search_var.set("")
+        if not self.current_df.empty and "bagno" in self.current_df.columns:
+            self.sort_state.clear()
+            self.current_df = self.current_df.sort_values(
+                by="bagno", ascending=True, key=lambda s: s.astype(str)
+            )
+            self.sort_state["bagno"] = False
+        self._render_tree(self.current_df)
+
     def _sort_by(self, col):
         ascending = self.sort_state.get(col, True)
         if self.current_df.empty:
@@ -1798,6 +1815,10 @@ class SituazioneTab(ttk.Frame):
             first = f"{col_letter['densita']}2"
             formula = f'AND({first}<>"",OR({first}<360,{first}>390))'
             ws.conditional_formatting.add(rng, FormulaRule(formula=[formula], fill=red_fill))
+
+            # Ritardo (gg) > 0 (delivery delay) -> red
+            rng = f"{col_letter['ritardo_consegna']}2:{col_letter['ritardo_consegna']}{last_row}"
+            ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["0"], fill=red_fill))
 
         for key, header, _ctype in COLUMN_SPEC:
             letter = col_letter[key]

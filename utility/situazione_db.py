@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS partita_state (
     data_uscita     TEXT,
     custom          TEXT,
     days_in_qc      TEXT,
+    ritardo_consegna TEXT,
     old_comment     TEXT,
     new_comment     TEXT,
     last_seen_at    TEXT,
@@ -69,6 +70,8 @@ CREATE TABLE IF NOT EXISTS partita_history (
     tinto           TEXT,
     data_qualita    TEXT,
     data_uscita     TEXT,
+    days_in_qc      TEXT,
+    ritardo_consegna TEXT,
     old_comment     TEXT,
     new_comment     TEXT,
     changed_at      TEXT
@@ -100,6 +103,21 @@ def init_db():
     conn.commit()
     try:
         conn.execute("ALTER TABLE partita_state ADD COLUMN custom TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE partita_state ADD COLUMN ritardo_consegna TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE partita_history ADD COLUMN days_in_qc TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE partita_history ADD COLUMN ritardo_consegna TEXT")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
@@ -214,15 +232,16 @@ def upsert_states(rows):
                 partita, row.get("cliente", ""), row.get("articolo", ""), row.get("colore", ""),
                 row.get("data", ""), row.get("consegna", ""), row.get("comment", ""),
                 row.get("bagno", ""), row.get("tinto", ""), row.get("data_qualita", ""),
-                row.get("data_uscita", ""), old_comment, new_comment, now,
+                row.get("data_uscita", ""), row.get("days_in_qc", ""), row.get("ritardo_consegna", ""),
+                old_comment, new_comment, now,
             ))
 
         conn.execute(
             """INSERT INTO partita_state
                (partita, cliente, articolo, titolo, codice, colore, ordine, riga, data, consegna,
                 rocche, mc, comment, cq, bagno, tinto, planedate, data_qualita, data_uscita, custom,
-                days_in_qc, old_comment, new_comment, last_seen_at, row_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                days_in_qc, ritardo_consegna, old_comment, new_comment, last_seen_at, row_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(partita) DO UPDATE SET
                  cliente=excluded.cliente, articolo=excluded.articolo, titolo=excluded.titolo,
                  codice=excluded.codice, colore=excluded.colore, ordine=excluded.ordine,
@@ -232,6 +251,7 @@ def upsert_states(rows):
                  planedate=excluded.planedate, data_qualita=excluded.data_qualita,
                  data_uscita=excluded.data_uscita, custom=excluded.custom,
                  days_in_qc=excluded.days_in_qc,
+                 ritardo_consegna=excluded.ritardo_consegna,
                  old_comment=excluded.old_comment, new_comment=excluded.new_comment,
                  last_seen_at=excluded.last_seen_at, row_hash=excluded.row_hash
             """,
@@ -240,16 +260,17 @@ def upsert_states(rows):
              row.get("data", ""), row.get("consegna", ""), row.get("rocche", ""), row.get("mc", ""),
              row.get("comment", ""), row.get("cq", ""), row.get("bagno", ""), row.get("tinto", ""),
              row.get("planedate", ""), row.get("data_qualita", ""), row.get("data_uscita", ""),
-             row.get("custom", ""), row.get("days_in_qc", ""), old_comment, new_comment, now,
-             row.get("row_hash", "")),
+             row.get("custom", ""), row.get("days_in_qc", ""), row.get("ritardo_consegna", ""),
+             old_comment, new_comment, now, row.get("row_hash", "")),
         )
 
     if history_rows:
         conn.executemany(
             """INSERT INTO partita_history
                (partita, cliente, articolo, colore, data, consegna, comment,
-                bagno, tinto, data_qualita, data_uscita, old_comment, new_comment, changed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                bagno, tinto, data_qualita, data_uscita, days_in_qc, ritardo_consegna,
+                old_comment, new_comment, changed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             history_rows,
         )
 

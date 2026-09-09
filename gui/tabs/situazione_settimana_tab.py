@@ -18,6 +18,7 @@ from calculate import situazione_settimana as logic
 from gui.tabs.situazione_tab import SourceRow
 from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from parsers.prod_lookup import load_prod_cache, save_prod_cache
+from utility.path_manager import source_path, save_source
 from utility.utils import logger
 
 SOURCE_LABELS = {"dfm": "Machine data (DFM)", "data_prod": "Production data"}
@@ -42,9 +43,11 @@ class SettimanaTab(ttk.Frame):
         self._build_upload_panel()
         self._build_toolbar()
         self._build_treeview()
+        self._refresh_source_labels_from_cache()
+        self.after_idle(self.sync_shared_async)
 
     def on_shown(self) -> None:
-        """Load shared weekly sources only when this page is opened."""
+        """Load shared weekly sources when this page is opened."""
         self.after_idle(self.sync_shared_async)
 
     # ------------------------------------------------------------------ UI
@@ -130,29 +133,44 @@ class SettimanaTab(ttk.Frame):
         self._auto_calculate_if_ready()
 
     # ---------------------------------------------------- shared DFM / Prod
+    def _refresh_source_labels_from_cache(self):
+        """Immediately display remembered file names on startup before async load."""
+        dfm_cache = load_dfm_cache()
+        dfm_path = dfm_cache.get("source_path") or str(source_path("dfm", existing_only=True) or "")
+        if dfm_path and Path(dfm_path).is_file():
+            self.source_rows["dfm"].set_status(True, f"● {Path(dfm_path).name}")
+
+        prod_cache = load_prod_cache()
+        prod_path = prod_cache.get("source_path") or str(source_path("data_prod", existing_only=True) or "")
+        if prod_path and Path(prod_path).is_file():
+            self.source_rows["data_prod"].set_status(True, f"● {Path(prod_path).name}")
+
     def sync_shared_dfm(self):
         """Load the DFM selected in either page from the shared persistent cache."""
         cache = load_dfm_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        if not source_path.is_file() or self._shared_dfm_path == str(source_path):
+        dfm_path = cache.get("source_path") or str(source_path("dfm", existing_only=True) or "")
+        source_path_obj = Path(str(dfm_path))
+        if not source_path_obj.is_file() or self._shared_dfm_path == str(source_path_obj):
             return
         try:
-            df, errors = data_loaders.load_dfm(str(source_path))
+            df, errors = data_loaders.load_dfm(str(source_path_obj))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not restore shared DFM file: %s", exc)
             return
         if errors or df is None or df.empty:
             return
         self.loaded_frames["dfm"] = df
-        self._shared_dfm_path = str(source_path)
+        self._shared_dfm_path = str(source_path_obj)
         self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
 
     def sync_shared_async(self):
         """Restore shared DFM/Produzione in a worker so startup stays responsive."""
         if self._shared_syncing:
             return
-        dfm_path = str(load_dfm_cache().get("source_path", ""))
-        prod_path = str(load_prod_cache().get("source_path", ""))
+        dfm_cache = load_dfm_cache()
+        dfm_path = str(dfm_cache.get("source_path") or source_path("dfm", existing_only=True) or "")
+        prod_cache = load_prod_cache()
+        prod_path = str(prod_cache.get("source_path") or source_path("data_prod", existing_only=True) or "")
         needs_dfm = bool(dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path)
         needs_prod = bool(prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path)
         if not (needs_dfm or needs_prod):
@@ -198,6 +216,7 @@ class SettimanaTab(ttk.Frame):
             entries = build_dfm_lookup(Path(path))
             if entries:
                 save_dfm_cache(entries, Path(path).name, Path(path))
+                save_source("dfm", path)
                 self._shared_dfm_path = str(Path(path))
                 if self._on_shared_cache_changed:
                     self._on_shared_cache_changed()
@@ -207,23 +226,26 @@ class SettimanaTab(ttk.Frame):
     def sync_shared_prod(self):
         """Load the Produzione file selected in either page from the shared cache."""
         cache = load_prod_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        if not source_path.is_file() or self._shared_prod_path == str(source_path):
+        prod_path = cache.get("source_path") or str(source_path("data_prod", existing_only=True) or "")
+        source_path_obj = Path(str(prod_path))
+        if not source_path_obj.is_file() or self._shared_prod_path == str(source_path_obj):
             return
         try:
-            df, errors = data_loaders.load_produzione(str(source_path))
+            df, errors = data_loaders.load_produzione(str(source_path_obj))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not restore shared Produzione file: %s", exc)
             return
         if errors or df is None or df.empty:
             return
         self.loaded_frames["data_prod"] = df
-        self._shared_prod_path = str(source_path)
+        self._shared_prod_path = str(source_path_obj)
         self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
 
     def _save_shared_prod(self, path):
         try:
             save_prod_cache(Path(path))
+            save_source("data_prod", path)
+            save_source("produzione", path)
             self._shared_prod_path = str(Path(path))
             if self._on_shared_cache_changed:
                 self._on_shared_cache_changed()

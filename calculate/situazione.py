@@ -32,7 +32,7 @@ def _is_elvy_client(value) -> bool:
     normalized = clean_text(value).upper()
     if normalized.endswith(".0"):
         normalized = normalized[:-2]
-    return normalized in ELVY_CLIENT_CODES
+    return normalized in ELVY_CLIENT_CODES or "ELVY" in normalized
 
 
 def _parse_delivery_date(value):
@@ -88,15 +88,60 @@ def compute_delivery_date(row, today=None):
     return _add_delivery_days(start_date, days).strftime("%Y-%m-%d")
 
 
+def compute_delay_days(row) -> str:
+    """
+    Calculate delivery delay in days = (Data Uscita - Delivery Date).
+    - If Data Qualita is missing/blank, leave empty "" (as requested).
+    - If Data Uscita is missing/blank, leave empty "".
+    - For ELVY client: compares against 'delivery_date' (calculated if missing).
+    - For other clients: compares against 'consegna'.
+    - If delivery date is missing/invalid, leave empty "".
+    - Returns integer days as string:
+      positive = late delivery (Data Uscita > delivery date)
+      negative = early delivery (Data Uscita < delivery date)
+      0 = on-time delivery
+    """
+    dq_val = row.get("data_qualita")
+    if _blank(dq_val) or pd.isna(dq_val):
+        return ""
+    dq = _parse_delivery_date(dq_val)
+    if dq is None:
+        return ""
+
+    du_val = row.get("data_uscita")
+    if _blank(du_val) or pd.isna(du_val):
+        return ""
+    du = _parse_delivery_date(du_val)
+    if du is None:
+        return ""
+
+    cliente = row.get("cliente", "")
+    if _is_elvy_client(cliente):
+        deliv_val = row.get("delivery_date")
+        if _blank(deliv_val):
+            deliv_val = compute_delivery_date(row)
+        target_date = _parse_delivery_date(deliv_val)
+    else:
+        target_date = _parse_delivery_date(row.get("consegna"))
+
+    if target_date is None:
+        return ""
+
+    diff_days = (du - target_date).days
+    return str(diff_days)
+
+
 def compute_delivery_dates(df, today=None):
-    """Add the derived ``delivery_date`` column without changing other rows."""
+    """Add the derived ``delivery_date`` and ``ritardo_consegna`` columns without changing other rows."""
     result = df.copy()
     if result.empty:
         result["delivery_date"] = pd.Series(dtype=str)
+        result["ritardo_consegna"] = pd.Series(dtype=str)
         return result
     result["delivery_date"] = result.apply(
         lambda row: compute_delivery_date(row, today=today), axis=1
     )
+    result["ritardo_consegna"] = result.apply(compute_delay_days, axis=1)
     return result
 
 
@@ -334,11 +379,12 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     df["tinto"] = df["tinto"].dt.strftime("%Y-%m-%d").fillna("")
     df["data_qualita"] = df["data_qualita"].dt.strftime("%Y-%m-%d").fillna("")
     df["data_uscita"] = df["data_uscita"].dt.strftime("%Y-%m-%d").fillna("")
-    df["days_in_qc"] = df["days_in_qc"].fillna("").astype(str)
+    df["delivery_date"] = df.apply(lambda row: compute_delivery_date(row, today=today), axis=1)
+    df["ritardo_consegna"] = df.apply(compute_delay_days, axis=1)
 
     keep = ["partita", "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
-            "data", "consegna", "rocche", "mc", "comment", "cq", "bagno", "tinto",
-            "planedate", "data_qualita", "data_uscita", "custom", "days_in_qc",
+            "data", "delivery_date", "consegna", "rocche", "mc", "comment", "cq", "bagno", "tinto",
+            "planedate", "data_qualita", "data_uscita", "custom", "days_in_qc", "ritardo_consegna",
             "old_comment", "new_comment"]
     for c in keep:
         if c not in df.columns:

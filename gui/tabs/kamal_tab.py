@@ -40,6 +40,7 @@ class KamalTab(ttk.Frame):
         self._lotti_path: Path | None = None
         self._output_path: Path | None = None
         self._kamal_erp_export_dir: Path | None = None
+        self._kamal_filato_export_dir: Path | None = None
         self._kamal_update_erp_file = tk.BooleanVar(value=True)
         self._kamal_update_filato_file = tk.BooleanVar(value=True)
         self._shared_dfm_path = ""
@@ -91,17 +92,23 @@ class KamalTab(ttk.Frame):
         erp_frame.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 2))
         erp_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(erp_frame, text="Extract ERP order file", variable=self._kamal_update_erp_file).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(erp_frame, text="Extract Filato x Tinturia", variable=self._kamal_update_filato_file).grid(row=0, column=1, sticky="w")
-
         ttk.Button(
             erp_frame, text="📁 Select ERP Files Folder…", command=self._on_select_erp_folder, width=22
-        ).grid(row=1, column=0, padx=(0, 6), pady=(4, 0), sticky="w")
+        ).grid(row=0, column=0, padx=(0, 6), pady=(2, 4), sticky="w")
+        ttk.Checkbutton(
+            erp_frame, text="Extract ERP order file", variable=self._kamal_update_erp_file
+        ).grid(row=0, column=1, sticky="w", pady=(2, 4))
+        self._lbl_erp_dir = ttk.Label(erp_frame, text="No folder selected", foreground="grey", anchor="w")
+        self._lbl_erp_dir.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
-        self._lbl_erp_dir = ttk.Label(
-            erp_frame, text="No folder selected", foreground="grey", anchor="w"
-        )
-        self._lbl_erp_dir.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            erp_frame, text="📁 Select Filato Folder…", command=self._on_select_filato_folder, width=22
+        ).grid(row=2, column=0, padx=(0, 6), pady=(4, 2), sticky="w")
+        ttk.Checkbutton(
+            erp_frame, text="Extract Filato x Tinturia.xlsx", variable=self._kamal_update_filato_file
+        ).grid(row=2, column=1, sticky="w", pady=(4, 2))
+        self._lbl_filato_dir = ttk.Label(erp_frame, text="No folder selected", foreground="grey", anchor="w")
+        self._lbl_filato_dir.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 2))
 
         self._kamal_update_erp_file.trace_add(
             "write",
@@ -171,13 +178,23 @@ class KamalTab(ttk.Frame):
 
     def _on_select_erp_folder(self):
         path = filedialog.askdirectory(
-            title="Select the folder for the ERP export files",
+            title="Select ERP file folder",
             initialdir=self._prefs.get("kamal_erp_export_dir") or self._prefs.get("kamal_last_dir") or None,
         )
         if path:
             self._kamal_erp_export_dir = Path(path)
             self._lbl_erp_dir.config(text=str(self._kamal_erp_export_dir), foreground="black")
             self._save_prefs(kamal_erp_export_dir=str(self._kamal_erp_export_dir), kamal_last_dir=str(path))
+
+    def _on_select_filato_folder(self):
+        path = filedialog.askdirectory(
+            title="Select Filato x Tinturia output folder",
+            initialdir=self._prefs.get("kamal_filato_export_dir") or self._prefs.get("kamal_last_dir") or None,
+        )
+        if path:
+            self._kamal_filato_export_dir = Path(path)
+            self._lbl_filato_dir.config(text=str(self._kamal_filato_export_dir), foreground="black")
+            self._save_prefs(kamal_filato_export_dir=str(self._kamal_filato_export_dir), kamal_last_dir=str(path))
 
     def _save_prefs(self, **kwargs: object) -> None:
         self._prefs.update(kwargs)
@@ -215,6 +232,14 @@ class KamalTab(ttk.Frame):
         if erp_dir_str and Path(erp_dir_str).is_dir():
             self._kamal_erp_export_dir = Path(erp_dir_str)
             self._lbl_erp_dir.config(text=erp_dir_str, foreground="black")
+
+        # kamal_filato_export_dir is new (Filato used to share the ERP
+        # folder) -- fall back to the old shared folder on first run after
+        # upgrading, so existing users keep working without reconfiguring.
+        filato_dir_str = self._prefs.get("kamal_filato_export_dir") or erp_dir_str
+        if filato_dir_str and Path(filato_dir_str).is_dir():
+            self._kamal_filato_export_dir = Path(filato_dir_str)
+            self._lbl_filato_dir.config(text=filato_dir_str, foreground="black")
 
     def sync_shared_dfm(self):
         """Reflect the DFM file uploaded on Data Elvy/Situazione, if any."""
@@ -345,32 +370,34 @@ class KamalTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Error exporting: {exc}")
 
-            if self._kamal_update_erp_file.get() or self._kamal_update_filato_file.get():
+            if self._kamal_update_erp_file.get():
                 if self._kamal_erp_export_dir is None:
-                    errors.append("ERP file extraction was enabled but no folder is selected.")
+                    errors.append("ERP file extraction was enabled but no ERP folder is selected.")
                 else:
                     ordini_path = self._kamal_erp_export_dir / "EXCEL PER ORDINE VENDITA EGITTO.xlsx"
-                    filato_path = self._kamal_erp_export_dir / "Filato x Tinturia.xlsx"
-                    if self._kamal_update_erp_file.get():
-                        try:
-                            ordini_rows = build_ordine_kamal_rows(all_rows, dfm_c170_entries)
-                            assign_ordine_kamal_machines(ordini_rows)
-                            if lotti_summary is not None and not lotti_summary.empty:
-                                match_by_lotto(ordini_rows, lotti_summary)
-                            if magazino_summary is not None and not magazino_summary.empty:
-                                match_raw_yarn(ordini_rows, magazino_summary, codes_map, quantity_attr="peso_kg")
-                            n = export_ordini_full(ordini_path, ordini_rows)
-                            logger.info("Ordine Kamal: extracted ERP file %s (%d rows)", ordini_path.name, n)
-                        except Exception as exc:  # noqa: BLE001
-                            errors.append(f"Error extracting {ordini_path.name}: {exc}")
+                    try:
+                        ordini_rows = build_ordine_kamal_rows(all_rows, dfm_c170_entries)
+                        assign_ordine_kamal_machines(ordini_rows)
+                        if lotti_summary is not None and not lotti_summary.empty:
+                            match_by_lotto(ordini_rows, lotti_summary)
+                        if magazino_summary is not None and not magazino_summary.empty:
+                            match_raw_yarn(ordini_rows, magazino_summary, codes_map, quantity_attr="peso_kg")
+                        n = export_ordini_full(ordini_path, ordini_rows)
+                        logger.info("Ordine Kamal: extracted ERP file %s (%d rows)", ordini_path.name, n)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"Error extracting {ordini_path.name}: {exc}")
 
-                    if self._kamal_update_filato_file.get():
-                        try:
-                            matches = read_filato_tinturia_sheet(self._output_path)
-                            n2 = export_filato_full(filato_path, matches, source_path=self._output_path)
-                            logger.info("Filato x Tinturia: extracted %s (%d rows)", filato_path.name, n2)
-                        except Exception as exc:  # noqa: BLE001
-                            errors.append(f"Error extracting {filato_path.name}: {exc}")
+            if self._kamal_update_filato_file.get():
+                if self._kamal_filato_export_dir is None:
+                    errors.append("Filato x Tinturia extraction was enabled but no Filato folder is selected.")
+                else:
+                    filato_path = self._kamal_filato_export_dir / "Filato x Tinturia.xlsx"
+                    try:
+                        matches = read_filato_tinturia_sheet(self._output_path)
+                        n2 = export_filato_full(filato_path, matches)
+                        logger.info("Filato x Tinturia: extracted %s (%d rows)", filato_path.name, n2)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"Error extracting {filato_path.name}: {exc}")
 
         self.after(0, self._on_conversion_done, errors, len(all_rows))
 
