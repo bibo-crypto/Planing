@@ -239,12 +239,26 @@ def compute_prezzo_plus2(records: list[OrdineMedRow]) -> None:
         r.prezzo_plus2 = apply_machine_surcharge(r.prezzo, r.mc)
 
 
+_DFM_PAIRS_CACHE: tuple[str, int, int, set] | None = None
+
+
 def load_dfm_articolo_colore(path: Path) -> set[tuple[str, str]]:
     """{(ARTICOLODFM, COLOREDFM)} pairs seen historically in the DFM
     export -- read from the raw DFM sheet directly (not the simplified
     situazione_loaders.load_dfm, which drops the color column), so 'Check
     Articolo' can tell a genuinely new Articolo+Colore combination from one
-    that's simply missing a color code."""
+    that's simply missing a color code.
+
+    Result is cached by (path, mtime_ns, size) so that the 20 000+ row DFM
+    file is only re-read when it actually changes on disk -- identical to the
+    pattern used by _ARTICOLI_MARCA_CACHE and _PREZZO_LOOKUP_CACHE in
+    biglietti_exporter.py."""
+    global _DFM_PAIRS_CACHE
+    stat = path.stat()
+    cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _DFM_PAIRS_CACHE and _DFM_PAIRS_CACHE[:3] == cache_key:
+        return _DFM_PAIRS_CACHE[3]
+
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         sheet = "DFM" if "DFM" in wb.sheetnames else wb.sheetnames[0]
@@ -257,7 +271,10 @@ def load_dfm_articolo_colore(path: Path) -> set[tuple[str, str]]:
         col = _clean(_get(row, "COLOREDFM", "Colore"))
         if art:
             pairs.add((art, col))
+
+    _DFM_PAIRS_CACHE = (*cache_key, pairs)
     return pairs
+
 
 
 def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str, str]]) -> None:
@@ -289,6 +306,9 @@ def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str
 # Disponibile's Mag. Rocche, compute Manca / Disponibilita'.
 # ---------------------------------------------------------------------------
 
+_FILATO_DISPONIBILE_CACHE: tuple[str, int, int, dict] | None = None
+
+
 def load_filato_disponibile(path: Path) -> dict[int, int]:
     """{PARTITA: Mag.Rocche} -- filters to MAGAZZINO in {900160, 900910},
     excludes committed stock (MAGAZZINO=900160 and ORDINE=0), sums COLLI
@@ -298,7 +318,16 @@ def load_filato_disponibile(path: Path) -> dict[int, int]:
     (this is commonly a multi-sheet workbook shared with other tabs, e.g.
     ORDINE_MED-MACRO.xlsm bundles DFM/ORDINE/Filato Disponibile/etc. in
     one file) -- wb.active is whichever sheet was open when the file was
-    last saved, not necessarily this one, so it's only the last resort."""
+    last saved, not necessarily this one, so it's only the last resort.
+
+    Result is cached by (path, mtime_ns, size) so repeated Convert clicks
+    with the same file skip the Excel parse entirely."""
+    global _FILATO_DISPONIBILE_CACHE
+    stat = path.stat()
+    cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if _FILATO_DISPONIBILE_CACHE and _FILATO_DISPONIBILE_CACHE[:3] == cache_key:
+        return _FILATO_DISPONIBILE_CACHE[3]
+
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
         sheet_name = next(
@@ -323,7 +352,10 @@ def load_filato_disponibile(path: Path) -> dict[int, int]:
         if colli is None:
             continue
         totals[int(partita)] = totals.get(int(partita), 0) + int(colli)
+
+    _FILATO_DISPONIBILE_CACHE = (*cache_key, totals)
     return totals
+
 
 
 @dataclass
@@ -343,9 +375,12 @@ def compute_filato_availability(
     densita_map: dict[int, dict[str, Any]] | None,
     stock_map: dict[int, int],
 ) -> list[FilatoAvailabilityRow]:
-    """Groups by (ARTICOLO with C->G swap, TITOLO, PT GRG), sums Rocche,
-    computes Kg via Densita' Query's peso_net when available (same source
-    Biglietti's KG uses), joins Mag.Rocche from Filato Disponibile."""
+    """Groups by (ARTICOLO with C->G swap, PT GRG) -- Titolo intentionally
+    excluded from the key so that minor Titolo variations across rows for the
+    same raw-yarn batch never split that batch into two separate groups.
+    The first-seen Titolo for each (art_g, pt_grg) pair is kept for display.
+    Sums Rocche, computes Kg via Densita' Query's peso_net when available
+    (same source Biglietti's KG uses), joins Mag.Rocche from Filato Disponibile."""
     densita_map = densita_map or {}
     groups: dict[tuple, dict[str, Any]] = {}
     for r in records:
@@ -354,13 +389,18 @@ def compute_filato_availability(
         except (TypeError, ValueError):
             continue
         art_g = ("G" + r.articolo[1:]) if r.articolo[:1] == "C" else r.articolo
-        key = (art_g, r.titolo, pt_grg)
-        g = groups.setdefault(key, {"rocche": 0})
-        g["rocche"] += r.rocc + _polmoni_multiplier(r.polmoni)
+        # Key: (art_g, pt_grg) only -- Titolo is stored on first-seen and NOT
+        # used as a discriminator, preventing the same batch from being counted
+        # twice when different order rows carry slightly different Titolo text.
+        key = (art_g, pt_grg)
+        if key not in groups:
+            groups[key] = {"rocche": 0, "titolo": r.titolo}
+        groups[key]["rocche"] += r.rocc  # Q.TA only — POLMONI is machine overhead, not raw-yarn demand
 
     out: list[FilatoAvailabilityRow] = []
-    for (art_g, titolo, pt_grg), g in groups.items():
+    for (art_g, pt_grg), g in groups.items():
         rocche = g["rocche"]
+        titolo = g["titolo"]
         peso_net = densita_map.get(pt_grg, {}).get("peso_net")
         kg = round(peso_net * rocche, 2) if peso_net is not None else None
         mag_rocche = stock_map.get(pt_grg)

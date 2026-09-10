@@ -598,6 +598,43 @@ class PlanningRegressionTests(unittest.TestCase):
         }
         self.assertEqual(compute_delay_days(row_elvy_early), "-2")
 
+    def test_lazy_module_delegates_to_real_module(self):
+        from utility.utils import LazyModule, lazy_call
+        import pipelines.ordine_med as real_ordine_med
+
+        proxy = LazyModule("pipelines.ordine_med")
+        self.assertTrue(callable(proxy.load_ordine))
+        self.assertIs(proxy.load_ordine, real_ordine_med.load_ordine)
+
+        wrapped = lazy_call("pipelines.ordine_med", "load_ordine")
+        self.assertTrue(callable(wrapped))
+
+    def test_kamal_tab_lazy_names_resolve_to_real_targets(self):
+        # Regression guard for the startup-performance fix: kamal_tab.py's
+        # heavy names (pandas/openpyxl/pdfplumber-backed) must still
+        # actually delegate to the real functions/classes/constants when
+        # called, not just avoid crashing at import time.
+        import gui.tabs.kamal_tab as kt
+        import pipelines.ordine_kamal as real_ordine_kamal
+        import calculate.lotti as real_lotti
+
+        self.assertEqual(kt.KAMAL_ARTICLE_PREFIX, real_ordine_kamal.KAMAL_ARTICLE_PREFIX)
+        self.assertTrue(callable(kt.load_dfm_cache))
+        self.assertIsInstance(kt.load_dfm_cache(), dict)
+        self.assertEqual(kt.lotti_logic.RAW_ARTICOLO_PREFIXES, real_lotti.RAW_ARTICOLO_PREFIXES)
+        self.assertTrue(callable(kt.build_ordine_kamal_rows))
+        self.assertTrue(callable(kt.export_ordini_full))
+
+    def test_days_in_qc_formats_as_clean_integer_no_trailing_zero(self):
+        # compute_situation() derives days_in_qc from a float64 column
+        # (dt.days on a Timedelta series with some NaT rows upcasts to
+        # float) -- naively fillna("").astype(str) on that turns a real
+        # value like 3 into the string "3.0" instead of "3".
+        import pandas as pd
+        col = pd.Series([3.0, float("nan"), 7.0])
+        formatted = col.apply(lambda v: str(int(v)) if pd.notna(v) else "")
+        self.assertEqual(formatted.tolist(), ["3", "", "7"])
+
 
 if __name__ == "__main__":
     unittest.main()

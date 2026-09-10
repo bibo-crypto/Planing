@@ -379,6 +379,7 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     df["tinto"] = df["tinto"].dt.strftime("%Y-%m-%d").fillna("")
     df["data_qualita"] = df["data_qualita"].dt.strftime("%Y-%m-%d").fillna("")
     df["data_uscita"] = df["data_uscita"].dt.strftime("%Y-%m-%d").fillna("")
+    df["days_in_qc"] = df["days_in_qc"].apply(lambda v: str(int(v)) if pd.notna(v) else "")
     df["delivery_date"] = df.apply(lambda row: compute_delivery_date(row, today=today), axis=1)
     df["ritardo_consegna"] = df.apply(compute_delay_days, axis=1)
 

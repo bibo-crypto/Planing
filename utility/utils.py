@@ -276,3 +276,39 @@ def save_settings(settings: dict[str, object]) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not save settings: %s", exc)
+
+
+def lazy_call(module_path: str, function_name: str):
+    """Return a callable that imports `module_path` on first use and then
+    calls `function_name` from it, instead of importing it eagerly.
+
+    Several tabs (Ordine Kamal, Ordine MED, ...) only need their heavy
+    pipeline/exporter modules -- which transitively pull in pandas,
+    openpyxl, pdfplumber -- once the user actually clicks Convert, not to
+    draw the tab's widgets. Importing those eagerly at module load time
+    means building the tab pays that cost during app startup instead of
+    when the work is actually requested; wrapping each name with this
+    (or LazyModule below, for `module.func()`-style access) defers it to
+    first real use.
+    """
+    def call(*args, **kwargs):
+        import importlib
+        module = importlib.import_module(module_path)
+        return getattr(module, function_name)(*args, **kwargs)
+    return call
+
+
+class LazyModule:
+    """Attribute-access proxy that imports `module_path` on first attribute
+    access and caches it -- for code that uses `module.func(...)` or a
+    plain `module.CONSTANT` rather than importing individual names. See
+    lazy_call() above for the reasoning."""
+    def __init__(self, module_path: str):
+        self._module_path = module_path
+        self._module = None
+
+    def __getattr__(self, name):
+        if self._module is None:
+            import importlib
+            self._module = importlib.import_module(self._module_path)
+        return getattr(self._module, name)

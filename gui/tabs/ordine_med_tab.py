@@ -11,7 +11,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import pipelines.ordine_med as ordine_med
+# ordine_med.py's real work (Excel parsing/export) pulls in pandas +
+# openpyxl transitively -- deferred to first real use (Convert click)
+# rather than paid at tab-construction time. See utility.utils.LazyModule
+# and the matching note in gui/tabs/kamal_tab.py for the full reasoning;
+# this tab showed up as its own ~0.16s block in the same startup profile.
+from utility.utils import LazyModule
+ordine_med = LazyModule("pipelines.ordine_med")
+
 from utility.densita_cache import load_densita_cache, save_densita_cache
 from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.path_manager import save_source, source_path
