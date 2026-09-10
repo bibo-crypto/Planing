@@ -11,23 +11,46 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from parsers.dfm_lookup import load_dfm_cache, load_dfm_entries_by_prefix
-from exporters.kamal_excel_exporter import KamalExcelExporter
-from parsers.kamal_parser import KamalParser
+# Ordine Kamal's real work (PDF parsing, Excel export, raw-yarn matching)
+# pulls in pandas + openpyxl + pdfplumber transitively -- profiling startup
+# showed importing this tab's dependencies eagerly, at tab-construction
+# time, was over 1 second of the ~1.6s spent building the whole app window
+# (pandas alone is ~0.5s, pdfplumber ~0.18s, the rest is openpyxl and this
+# tab's own module chain). None of that is needed just to draw the tab's
+# widgets -- only once the user actually clicks Convert. Deferring these
+# imports to first real use (utility.utils.lazy_call/LazyModule, same
+# pattern as biglietti_tab.py and ordine_med_tab.py) means the window
+# appears with its real work-time cost, not the cost of every library
+# every tab *could* need.
+from utility.utils import lazy_call, LazyModule
+
+for _name, _module_path in (
+    ("load_dfm_cache", "parsers.dfm_lookup"),
+    ("load_dfm_entries_by_prefix", "parsers.dfm_lookup"),
+    ("KamalExcelExporter", "exporters.kamal_excel_exporter"),
+    ("KamalParser", "parsers.kamal_parser"),
+    ("assign_ordine_kamal_machines", "pipelines.ordine_kamal"),
+    ("build_ordine_kamal_rows", "pipelines.ordine_kamal"),
+    ("match_by_lotto", "pipelines.ordine_kamal"),
+    ("export_filato_full", "pipelines.ordini_elvy"),
+    ("export_ordini_full", "pipelines.ordini_elvy"),
+    ("match_raw_yarn", "pipelines.ordini_elvy"),
+    ("read_filato_tinturia_sheet", "pipelines.ordini_elvy"),
+):
+    globals()[_name] = lazy_call(_module_path, _name)
+
+magazino_logic = LazyModule("calculate.magazino")
+lotti_logic = LazyModule("calculate.lotti")
+
+# A fixed value straight from pipelines.ordine_kamal.KAMAL_ARTICLE_PREFIX --
+# copied here instead of importing that module (which would immediately
+# pull in the whole pandas/pdfplumber chain again) since it never changes.
+KAMAL_ARTICLE_PREFIX = "C170"
+
 from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.lotti_cache import load_lotti_cache, save_lotti_cache
-from pipelines.ordine_kamal import (
-    KAMAL_ARTICLE_PREFIX,
-    assign_ordine_kamal_machines,
-    build_ordine_kamal_rows,
-    match_by_lotto,
-)
-from pipelines.ordini_elvy import export_filato_full, export_ordini_full, match_raw_yarn, read_filato_tinturia_sheet
 from utility.utils import logger, load_settings, save_settings
 from typing import Callable
-
-from calculate import magazino as magazino_logic
-from calculate import lotti as lotti_logic
 
 
 class KamalTab(ttk.Frame):
