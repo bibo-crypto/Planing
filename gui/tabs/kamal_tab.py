@@ -104,10 +104,10 @@ class KamalTab(ttk.Frame):
         lotti_frame = ttk.LabelFrame(self, text="Raw Yarn Matching", padding=6)
         lotti_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         lotti_frame.columnconfigure(1, weight=1)
-        ttk.Button(lotti_frame, text="📦 Select LOTTI File", command=self._on_select_lotti, width=20).grid(row=0, column=0, padx=4, pady=3, sticky="w")
+        ttk.Button(lotti_frame, text="📦 Select LOTTI File…", command=self._on_select_lotti, width=20).grid(row=0, column=0, padx=4, pady=3, sticky="w")
         self._lbl_lotti = ttk.Label(lotti_frame, text="No LOTTI file selected", foreground="grey", anchor="w")
         self._lbl_lotti.grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(lotti_frame, text="📦 Select Magazino File", command=self._on_select_raw_yarn, width=20).grid(row=1, column=0, padx=4, pady=3, sticky="w")
+        ttk.Button(lotti_frame, text="📦 Select Magazino File…", command=self._on_select_raw_yarn, width=20).grid(row=1, column=0, padx=4, pady=3, sticky="w")
         self._lbl_raw_yarn = ttk.Label(lotti_frame, text="No Magazino file selected", foreground="grey", anchor="w")
         self._lbl_raw_yarn.grid(row=1, column=1, sticky="ew", padx=4)
 

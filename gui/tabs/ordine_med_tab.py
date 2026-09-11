@@ -67,7 +67,7 @@ class OrdineMedTab(ttk.Frame):
         yarn_frame = ttk.LabelFrame(self, text="Raw Yarn Matching", padding=6)
         yarn_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         yarn_frame.columnconfigure(1, weight=1)
-        ttk.Button(yarn_frame, text="📦 Select Magazino File", command=self._on_select_magazino, width=20).grid(row=0, column=0, padx=4, pady=3, sticky="w")
+        ttk.Button(yarn_frame, text="📦 Select Magazino File…", command=self._on_select_magazino, width=20).grid(row=0, column=0, padx=4, pady=3, sticky="w")
         self._lbl_magazino = ttk.Label(yarn_frame, text="No Magazino file selected", foreground="grey", anchor="w")
         self._lbl_magazino.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(yarn_frame, text="📦 Select Densita Query", command=self._on_select_densita, width=20).grid(row=1, column=0, padx=4, pady=3, sticky="w")

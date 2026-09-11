@@ -87,7 +87,7 @@ class PrezziTab(ttk.Frame):
 
         ttk.Button(row_search, text="Clear", command=self._clear_filters).pack(side="left", padx=4)
 
-        self._btn_export = ttk.Button(row_search, text="📤 Extract Excel", command=self._on_export)
+        self._btn_export = ttk.Button(row_search, text="📤 Export to Excel", command=self._on_export)
         self._btn_export.pack(side="right")
 
         self._btn_price_changes = ttk.Button(
@@ -423,4 +423,4 @@ class PrezziTab(ttk.Frame):
 
         buttons = ttk.Frame(window)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Export to Excel", command=export_anomalies).pack(side="right", padx=3)
+        ttk.Button(buttons, text="📤 Export to Excel", command=export_anomalies).pack(side="right", padx=3)

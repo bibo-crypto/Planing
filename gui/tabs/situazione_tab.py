@@ -257,7 +257,7 @@ class SituazioneTab(ttk.Frame):
         self.upload_data_btn = ttk.Button(bar, text="Upload Data", command=self._on_upload_data)
         self.upload_data_btn.pack(side="left", padx=4)
 
-        self.export_btn = ttk.Button(bar, text="Export to Excel", command=self._on_export)
+        self.export_btn = ttk.Button(bar, text="📤 Export to Excel", command=self._on_export)
         self.export_btn.pack(side="left", padx=4)
 
         self.abbina_btn = ttk.Button(bar, text="Da abbinare", command=self._open_abbina)
@@ -445,7 +445,7 @@ class SituazioneTab(ttk.Frame):
         value_combo.bind("<<ComboboxSelected>>", lambda _event: render())
         buttons = ttk.Frame(window)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Estrai Excel", command=export_summary).pack(side="right", padx=3)
+        ttk.Button(buttons, text="📤 Export to Excel", command=export_summary).pack(side="right", padx=3)
         refresh_filter_values()
         render()
 
@@ -519,7 +519,7 @@ class SituazioneTab(ttk.Frame):
 
         buttons = ttk.Frame(window)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Export to Excel", command=export_summary).pack(side="right", padx=3)
+        ttk.Button(buttons, text="📤 Export to Excel", command=export_summary).pack(side="right", padx=3)
 
     def _open_partita_timeline(self, initial_partita: str = ""):
         """Search a Partita and see every stage change recorded for it
@@ -610,7 +610,7 @@ class SituazioneTab(ttk.Frame):
 
         buttons = ttk.Frame(window)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="Export to Excel", command=export_timeline).pack(side="right", padx=3)
+        ttk.Button(buttons, text="📤 Export to Excel", command=export_timeline).pack(side="right", padx=3)
 
         if initial_partita:
             do_search()

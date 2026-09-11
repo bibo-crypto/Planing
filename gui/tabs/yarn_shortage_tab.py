@@ -44,7 +44,7 @@ class YarnShortageTab(ttk.Frame):
         bar = ttk.Frame(self)
         bar.pack(side="top", fill="x", padx=8, pady=(8, 4))
         ttk.Button(bar, text="Refresh from Situazione", command=self.refresh).pack(side="left", padx=4)
-        ttk.Button(bar, text="Export to Excel", command=self.export).pack(side="left", padx=4)
+        ttk.Button(bar, text="📤 Export to Excel", command=self.export).pack(side="left", padx=4)
 
         ttk.Label(bar, text="Cliente:").pack(side="left", padx=(18, 4))
         self.client_var = tk.StringVar(value="Tutti")
@@ -55,7 +55,8 @@ class YarnShortageTab(ttk.Frame):
         ttk.Label(bar, text="Search:").pack(side="left", padx=(18, 4))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
-        ttk.Entry(bar, textvariable=self.search_var, width=28).pack(side="left")
+        ttk.Entry(bar, textvariable=self.search_var, width=28).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="Clear", width=6, command=lambda: self.search_var.set("")).pack(side="left")
         self.summary_lbl = ttk.Label(bar, text="")
         self.summary_lbl.pack(side="right", padx=8)
 
