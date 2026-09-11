@@ -91,12 +91,12 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
     """Export a Treeview's currently displayed rows/columns to a new .xlsx file."""
     df = treeview_to_dataframe(tree)
     if df.empty:
-        messagebox.showinfo("Nessun dato", "Non ci sono dati da esportare.", parent=parent)
+        messagebox.showinfo("No Data", "There is no data to export.", parent=parent)
         return
     path = filedialog.asksaveasfilename(
-        title="Esporta in Excel",
+        title="Export to Excel",
         defaultextension=".xlsx",
-        filetypes=[("File Excel", "*.xlsx")],
+        filetypes=[("Excel files", "*.xlsx")],
         initialfile=default_filename,
     )
     if not path:
@@ -110,9 +110,9 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
         wb.save(path)
         wb.close()
     except Exception as exc:  # noqa: BLE001
-        messagebox.showerror("Esportazione non riuscita", str(exc), parent=parent)
+        messagebox.showerror("Export Failed", str(exc), parent=parent)
         return
-    messagebox.showinfo("Completato", f"Esportato in:\n{path}", parent=parent)
+    messagebox.showinfo("Export Completed", f"Exported to:\n{path}", parent=parent)
 
 
 def _write_typed_excel_table(ws, df: pd.DataFrame) -> None:
@@ -199,7 +199,7 @@ def attach_excel_export(tree: ttk.Treeview, default_filename: str) -> None:
     """Right-click on any row of *tree* -> "Export to Excel"."""
     menu = tk.Menu(tree, tearoff=0)
     menu.add_command(
-        label="📤 Esporta in Excel",
+        label="📤 Export to Excel",
         command=lambda: export_treeview_to_excel(tree, default_filename, parent=tree),
     )
 
@@ -770,9 +770,10 @@ class OverviewTab(ttk.Frame):
         display_df = _format_display_dates(df, ["data", "consegna", "delivery_date", "tinto", "data_qualita", "data_uscita"])
         available_cols = [c for c in cols if display_df.empty or c in display_df.columns] or cols
         search_var = tk.StringVar()
-        ttk.Label(header, text="Cerca:").pack(side="left", padx=(2, 5))
+        ttk.Label(header, text="Search:").pack(side="left", padx=(2, 5))
         search_entry = ttk.Entry(header, textvariable=search_var, width=28)
-        search_entry.pack(side="left", padx=(0, 8))
+        search_entry.pack(side="left", padx=(0, 4))
+        ttk.Button(header, text="Clear", width=6, command=lambda: search_var.set("")).pack(side="left", padx=(0, 8))
         count_label = None
         if count_column:
             count_label = ttk.Label(header, text="", foreground="#667085")
@@ -807,7 +808,7 @@ class OverviewTab(ttk.Frame):
             if count_label is not None:
                 count = int(visible[count_column].nunique()) if count_column in visible.columns else len(visible)
                 count_label.config(
-                    text=f"Colori visualizzati: {count}",
+                    text=f"Colors shown: {count}",
                     foreground="#C62828" if count > 0 else "#667085",
                     font=("Segoe UI", 9, "bold") if count > 0 else ("Segoe UI", 9),
                 )
@@ -817,7 +818,7 @@ class OverviewTab(ttk.Frame):
         render_filtered_rows()
 
         ttk.Button(
-            header, text="📤 Esporta in Excel",
+            header, text="📤 Export to Excel",
             command=lambda: export_treeview_to_excel(tree, export_filename, parent=self),
         ).pack(side="right")
         attach_excel_export(tree, export_filename)

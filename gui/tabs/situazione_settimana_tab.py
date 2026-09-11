@@ -68,7 +68,7 @@ class SettimanaTab(ttk.Frame):
         self.refresh_btn = ttk.Button(bar, text="2) Calculate", command=self._on_refresh)
         self.refresh_btn.pack(side="left", padx=4)
 
-        self.export_btn = ttk.Button(bar, text="Export Excel", command=self._on_export)
+        self.export_btn = ttk.Button(bar, text="📤 Export to Excel", command=self._on_export)
         self.export_btn.pack(side="left", padx=4)
 
         ttk.Label(bar, text="Week:").pack(side="left", padx=(16, 4))

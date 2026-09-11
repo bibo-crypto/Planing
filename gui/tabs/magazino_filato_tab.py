@@ -167,26 +167,27 @@ class MagazinoFilatoTab(ttk.Frame):
         row = ttk.Frame(panel)
         row.pack(fill="x", padx=4, pady=4)
         self.status_var = tk.StringVar(value="No Magazino file uploaded")
-        self._btn_magazino = ttk.Button(row, text="Select Magazino file...", command=self._on_upload_magazino)
+        self._btn_magazino = ttk.Button(row, text="📦 Select Magazino File…", command=self._on_upload_magazino)
         self._btn_magazino.pack(side="left")
         ttk.Label(row, textvariable=self.status_var, foreground="#666666").pack(side="left", padx=8)
 
         row2 = ttk.Frame(panel)
         row2.pack(fill="x", padx=4, pady=4)
         self.lotti_status_var = tk.StringVar(value="No LOTTI file uploaded (optional)")
-        ttk.Button(row2, text="Select LOTTI file...", command=self._on_upload_lotti).pack(side="left")
+        ttk.Button(row2, text="📦 Select LOTTI File…", command=self._on_upload_lotti).pack(side="left")
         ttk.Label(row2, textvariable=self.lotti_status_var, foreground="#666666").pack(side="left", padx=8)
 
         row_search = ttk.Frame(panel)
         row_search.pack(fill="x", padx=4, pady=4)
         ttk.Label(row_search, text="Search:").pack(side="left", padx=(0, 8))
         search_entry = ttk.Entry(row_search, textvariable=self._search_var, width=36)
-        search_entry.pack(side="left", padx=(0, 8))
+        search_entry.pack(side="left", padx=(0, 4))
+        ttk.Button(row_search, text="Clear", width=6, command=lambda: self._search_var.set("")).pack(side="left")
         self._search_var.trace_add("write", lambda *_: self._on_search_changed())
 
         row3 = ttk.Frame(panel)
         row3.pack(fill="x", padx=4, pady=4)
-        ttk.Button(row3, text="Export Excel", command=self._on_export).pack(side="right")
+        ttk.Button(row3, text="📤 Export to Excel", command=self._on_export).pack(side="right")
 
     def _build_treeview(self):
         summary_bar = ttk.Frame(self)
