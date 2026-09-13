@@ -24,7 +24,6 @@ from parsers.kamal_parser import KamalOrderRow
 from pipelines.ordine_kamal import assign_ordine_kamal_machines, build_ordine_kamal_rows, match_by_lotto
 from pipelines.ordini_elvy import RawYarnMatch, match_raw_yarn
 from utility.utils import logger
-from calculate.abbina_calculator import _smallest_fitting_machine, MACHINE_CODES
 
 RAW_KAMAL_COLUMNS: list[tuple[str, str, str]] = [
     ("Reply No",       "reply_no",       "text"),

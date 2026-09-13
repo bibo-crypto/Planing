@@ -17,7 +17,7 @@ import pandas as pd
 from calculate import prezzi as logic
 from utility.prezzi_cache import load_prezzi_cache, save_prezzi_cache
 from utility.path_manager import save_source
-from utility.utils import logger
+from utility.utils import keep_window_on_top, logger
 
 COLUMNS = logic.DISPLAY_COLUMNS
 HEADERS = logic.HEADERS
@@ -363,6 +363,7 @@ class PrezziTab(ttk.Frame):
         anomalies = logic.detect_price_anomalies(self._base_df, min_pct_change=10.0)
 
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._anomalies_window = window
         window.title("Listini — Price Changes (10%+)")
         window.geometry("760x460")

@@ -147,6 +147,15 @@ def _ne_twist_digit(ne: str) -> str:
 # Building / caching the filtered reference
 # ---------------------------------------------------------------------------
 
+def _dfm_header_key(value) -> str:
+    """Case/whitespace-insensitive header match -- an ERP export changing
+    "ARTICOLODFM" to "Articolodfm " (or similar cosmetic drift) between
+    versions must not break the whole lookup; a genuinely different/missing
+    column should still raise the clear error below, not silently misread
+    a column."""
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
 def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list[dict[str, str]]:
     """
     Read *xlsx_path* (a DFM.xlsx-style export) and return the list of rows
@@ -158,7 +167,7 @@ def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list
     ws = wb.active
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-    headers = [str(h) if h is not None else "" for h in header_row]
+    headers = [_dfm_header_key(h) for h in header_row]
 
     missing = [c for c in REQUIRED_COLUMNS if c not in headers]
     if missing:

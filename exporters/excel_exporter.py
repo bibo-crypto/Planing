@@ -31,7 +31,7 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 from parsers.pdf_parser import OrderRow
-from pipelines.ordini_elvy import OrdiniElvyRow, build_ordini_elvy_rows, match_raw_yarn
+from pipelines.ordini_elvy import build_ordini_elvy_rows, match_raw_yarn
 from utility.utils import logger
 
 # ---------------------------------------------------------------------------

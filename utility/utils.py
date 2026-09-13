@@ -278,6 +278,19 @@ def save_settings(settings: dict[str, object]) -> None:
         logger.warning("Could not save settings: %s", exc)
 
 
+def keep_window_on_top(window) -> None:
+    """Keep a Tk child window above the main application until it is closed."""
+    try:
+        window.attributes("-topmost", True)
+        window.lift()
+    except Exception:  # noqa: BLE001
+        # Some non-Windows window managers do not support ``-topmost``.
+        try:
+            window.lift()
+        except Exception:
+            pass
+
+
 def lazy_call(module_path: str, function_name: str):
     """Return a callable that imports `module_path` on first use and then
     calls `function_name` from it, instead of importing it eagerly.

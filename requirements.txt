@@ -6,3 +6,4 @@ numpy>=1.24,<3
 pandas>=2.0,<3
 pyinstaller>=6,<7
 xlrd>=2.0.1
+pywin32>=306; sys_platform == "win32"

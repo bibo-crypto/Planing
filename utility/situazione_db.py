@@ -12,8 +12,6 @@ Tables:
   green/red status per source tab and know what "no changes" means.
 """
 import sqlite3
-import json
-import os
 from datetime import datetime
 
 from utility.utils import APP_DATA_DIR

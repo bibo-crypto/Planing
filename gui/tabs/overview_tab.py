@@ -378,7 +378,6 @@ class OverviewTab(ttk.Frame):
         )
 
     def _on_choose_data_folder(self) -> None:
-        from tkinter import filedialog, messagebox
         initial = str(self._data_folder) if self._data_folder else None
         path = filedialog.askdirectory(
             title="Select Data Folder containing factory files (Articoli, DFM, WINCOINT, etc.)",

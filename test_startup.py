@@ -1,5 +1,4 @@
 import traceback
-import tkinter as tk
 
 from gui.gui import ConverterApp
 

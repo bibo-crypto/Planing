@@ -28,6 +28,7 @@ for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy"):
 # app is running — the exe icon alone only affects the file's icon in
 # Explorer, not the running window.
 datas += [('icon.ico', '.')]
+datas += [('version.txt', '.')]
 
 a = Analysis(
     ['main.py'],

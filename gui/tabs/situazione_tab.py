@@ -8,8 +8,6 @@ a local SQLite database (see situazione_db.py) instead of copy-pasted
 sheets.
 """
 import os
-import json
-import re
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -27,9 +25,9 @@ from calculate.abbina_suggestions import build_suggestions
 from gui.tabs.yarn_shortage_tab import YarnShortageTab
 from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from parsers.prod_lookup import load_prod_cache, save_prod_cache
-from utility.utils import logger
+from utility.utils import keep_window_on_top, logger
 from utility.densita_cache import load_densita_cache
-from utility.path_manager import load_source, save_source, source_path
+from utility.path_manager import save_source, source_path
 
 STATUS_COLORS = {
     "Filato": "#e0e0e0",
@@ -300,13 +298,9 @@ class SituazioneTab(ttk.Frame):
 
         situation = self.current_df.copy()
 
-        def bagno_key(value):
-            digits = re.sub(r"\D", "", str(value or "")).lstrip("0")
-            return digits or str(value or "").strip().casefold()
-
         for frame in (situation, copertura):
             frame["bagno"] = frame["bagno"].fillna("").astype(str).str.strip()
-            frame["bagno_key"] = frame["bagno"].map(bagno_key)
+            frame["bagno_key"] = frame["bagno"].map(business_logic.bagno_key)
         merged = situation.merge(
             copertura[["bagno_key", "machine"]].drop_duplicates("bagno_key"),
             on="bagno_key", how="inner",
@@ -335,6 +329,7 @@ class SituazioneTab(ttk.Frame):
             return summary
 
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._child_windows["copertura"] = window
         window.title("Copertura — macchine 3–12")
         window.geometry("1050x600")
@@ -467,6 +462,7 @@ class SituazioneTab(ttk.Frame):
             return
 
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._child_windows["on_time"] = window
         window.title("On-Time Delivery by Client")
         window.geometry("780x480")
@@ -532,6 +528,7 @@ class SituazioneTab(ttk.Frame):
             return
 
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._child_windows["timeline"] = window
         window.title("Partita Timeline")
         window.geometry("960x500")
@@ -549,14 +546,14 @@ class SituazioneTab(ttk.Frame):
 
         frame = ttk.Frame(window)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "ritardo")
+        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "consegna", "ritardo")
         labels = {
             "changed_at": "When", "event": "Event", "comment": "Status", "bagno": "Bagno",
             "tinto": "Tinto", "data_qualita": "Data Qualità", "data_uscita": "Data Uscita",
-            "days_in_qc": "Days in C.Q", "ritardo": "Ritardo",
+            "days_in_qc": "Days in C.Q", "consegna": "Consegna", "ritardo": "Ritardo",
         }
         tree = ttk.Treeview(frame, columns=columns, show="headings")
-        widths = [125, 230, 95, 60, 85, 90, 90, 80, 75]
+        widths = [125, 230, 95, 60, 85, 90, 90, 80, 85, 75]
         for column, width in zip(columns, widths):
             tree.heading(column, text=labels[column])
             tree.column(column, width=width, anchor="w" if column == "event" else "center")
@@ -1525,6 +1522,7 @@ class SituazioneTab(ttk.Frame):
             return
         suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._child_windows["abbina"] = window
         window.title("Da abbinare")
         window.geometry("1250x600")
@@ -1665,6 +1663,7 @@ class SituazioneTab(ttk.Frame):
         if self._focus_child_window("yarn_shortage"):
             return
         window = tk.Toplevel(self)
+        keep_window_on_top(window)
         self._child_windows["yarn_shortage"] = window
         window.title("Mancanza Filato")
         window.geometry("1100x650")
