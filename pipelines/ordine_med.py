@@ -83,6 +83,29 @@ class OrdineMedRow:
     prezzo_plus2: Any = ""
 
 
+def _normalize_abbin(value: Any) -> Any:
+    """ABBIN 0 means "not paired with anything" -- it must never be
+    treated as a real group key, or every ABBIN=0 row in the order would
+    get grouped (and dyed) together as if they were meant to share a
+    batch. Converted to None here, before compute_mc_and_gruppo() ever
+    groups by it, so it's handled exactly like a blank ABBIN. Any other
+    value, including two different rows that genuinely share the same
+    non-zero number, is left untouched -- that's still a real pairing.
+
+    Deliberately not using _number()/_clean() here: _clean() does
+    ``str(v or "")``, so a genuine numeric 0 comes back as "" and then
+    _number("") is None -- indistinguishable from an already-blank cell,
+    which would make this always return the *original* value unchanged
+    instead of catching zero.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return None if float(value) == 0 else value
+    except (TypeError, ValueError):
+        return value
+
+
 def load_ordine(path: Path) -> list[OrdineMedRow]:
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
@@ -104,7 +127,7 @@ def load_ordine(path: Path) -> list[OrdineMedRow]:
             articolo=articolo,
             colore=_clean(_get(row, "COLORE")),
             rocc=int(_number(_get(row, "ROCC")) or 0),
-            abbin=_get(row, "ABBIN"),
+            abbin=_normalize_abbin(_get(row, "ABBIN")),
             consegna_input=_get(row, "CONSEGNA"),
             pt_grg=_clean(_get(row, "PT GRG")),
             pt_med=_clean(_get(row, "PT MED")),

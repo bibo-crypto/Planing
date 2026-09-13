@@ -33,7 +33,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.utils import find_pdfs, load_settings, logger, make_output_path, save_settings
+from utility.updater import APP_VERSION, ReleaseInfo, check_for_updates_async, download_installer, install_update
 from gui.modern_widgets import RoundedButton
+from utility.utils import keep_window_on_top
 
 # Keep the existing button call sites and their commands, but render them as
 # rounded pill controls throughout the application.
@@ -85,7 +87,7 @@ class ConverterApp(tk.Tk):
     Business logic is dispatched to background threads to keep the UI responsive.
     """
 
-    WINDOW_TITLE = "Planing"
+    WINDOW_TITLE = f"Planing v{APP_VERSION}"
     WINDOW_MIN_W = 1000
     WINDOW_MIN_H = 760
 
@@ -174,6 +176,90 @@ class ConverterApp(tk.Tk):
         self._attach_log_handler()
         self._poll_log_queue()
         self._startup_label.destroy()
+        self._check_for_updates()
+
+    def _check_for_updates(self) -> None:
+        """Check GitHub without delaying startup, then ask before updating."""
+        if not getattr(sys, "frozen", False):
+            return
+        check_for_updates_async(
+            lambda release: self.after(0, self._show_update_prompt, release),
+            logger=logger,
+        )
+
+    def _show_update_prompt(self, release: ReleaseInfo | None) -> None:
+        if release is None or not self.winfo_exists():
+            return
+        notes = release.notes[:800] + ("…" if len(release.notes) > 800 else "")
+        if not release.installer_url:
+            return
+        answer = messagebox.askyesno(
+            "Planing update available",
+            f"A new version of Planing is available.\n\n"
+            f"Current version: {APP_VERSION}\nNew version: {release.version}\n\n"
+            f"{notes}\n\nDownload and install it now?",
+            parent=self,
+        )
+        if answer:
+            self._start_update(release)
+
+    def _start_update(self, release: ReleaseInfo) -> None:
+        self._pending_update_version = release.version
+        update_window = tk.Toplevel(self)
+        self._update_window = update_window
+        keep_window_on_top(update_window)
+        update_window.title("Updating Planing")
+        update_window.geometry("430x150")
+        update_window.resizable(False, False)
+        update_window.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(update_window, text="Downloading Planing update…", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=18, pady=(18, 8)
+        )
+        self._update_status = ttk.Label(update_window, text="Downloaded: 0%")
+        self._update_status.pack(anchor="w", padx=18)
+        self._update_progress_bar = ttk.Progressbar(update_window, mode="determinate", maximum=100)
+        self._update_progress_bar.pack(fill="x", padx=18, pady=(8, 18))
+
+        def worker() -> None:
+            try:
+                installer = download_installer(
+                    release,
+                    progress=lambda percent: self.after(0, self._update_download_progress, percent),
+                )
+                self.after(0, self._finish_update, installer)
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, lambda: self._update_failed(str(exc)))
+
+        import threading
+        threading.Thread(target=worker, name="planing-update-download", daemon=True).start()
+
+    def _update_download_progress(self, percent: int) -> None:
+        if not getattr(self, "_update_window", None) or not self._update_window.winfo_exists():
+            return
+        percent = max(0, min(100, int(percent)))
+        self._update_progress_bar["value"] = percent
+        self._update_status.config(text=f"Downloaded: {percent}%")
+
+    def _update_failed(self, error: str) -> None:
+        if getattr(self, "_update_window", None) and self._update_window.winfo_exists():
+            self._update_window.destroy()
+        messagebox.showerror("Planing update", error, parent=self)
+
+    def _finish_update(self, installer: Path) -> None:
+        try:
+            self._update_status.config(text="Installing update…")
+            self._update_progress_bar["value"] = 100
+            self.update_idletasks()
+            install_update(
+                installer,
+                Path(sys.executable).resolve().parent,
+                self._pending_update_version,
+            )
+            self.destroy()
+        except Exception as exc:  # noqa: BLE001
+            if getattr(self, "_update_window", None) and self._update_window.winfo_exists():
+                self._update_window.destroy()
+            messagebox.showerror("Planing update", str(exc), parent=self)
 
     # ------------------------------------------------------------------
     # Window / taskbar icon

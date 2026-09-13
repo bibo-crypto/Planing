@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from datetime import date
 import tempfile
 import pandas as pd
 from unittest.mock import patch
@@ -57,6 +58,37 @@ class PlanningRegressionTests(unittest.TestCase):
             ),
             ("364257", "EL-G-425711-DOUBLE REATTIVO"),
         )
+
+    def test_build_dfm_lookup_tolerates_header_case_and_whitespace_drift(self):
+        # An ERP export changing "ARTICOLODFM" to " Articolodfm" (case or
+        # stray whitespace) between versions must not break the lookup --
+        # only a genuinely missing/renamed column should raise an error.
+        from parsers.dfm_lookup import build_dfm_lookup
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "DFM.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append([" Articolodfm", "coloredfm", "CLDESCR ", "descrizarticololi", "DataIns"])
+            ws.append(["C130027S", "364257", "EL-44011-DOUBLEYARN", "0070  100.00 2", "01/01/2026"])
+            wb.save(path)
+
+            entries = build_dfm_lookup(path, prefix="C130")
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["articolo"], "C130027S")
+            self.assertEqual(entries[0]["coloredfm"], "364257")
+
+    def test_build_dfm_lookup_still_errors_on_genuinely_missing_column(self):
+        from parsers.dfm_lookup import build_dfm_lookup
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "DFM.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["ARTICOLODFM", "COLOREDFM", "CLDESCR", "DESCRIZARTICOLOLI"])  # DATAINS missing
+            ws.append(["C130027S", "364257", "EL-44011-DOUBLEYARN", "0070  100.00 2"])
+            wb.save(path)
+
+            with self.assertRaises(ValueError):
+                build_dfm_lookup(path, prefix="C130")
 
     def test_pdf_parser_keeps_multiline_article_description_fields(self):
         from parsers.pdf_parser import PDFParser, ColumnSlot, _group_into_lines
@@ -377,16 +409,82 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertTrue(hasattr(biglietti_exporter, "_PREZZO_LOOKUP_CACHE"))
         self.assertTrue(hasattr(biglietti_exporter, "_ARTICOLI_MARCA_CACHE"))
 
-    def test_filato_export_uses_magazino_rocche(self):
+    def test_filato_rows_uses_order_total_rocche_and_scaled_magazino_peso(self):
+        # Rocche always comes from the order itself now -- stock was
+        # already verified earlier, on the Ordine page, before the order
+        # went into the system. Peso is the warehouse's per-cone weight
+        # rate scaled to how many cones THIS order needs (4), not the
+        # warehouse's own stock quantity (12).
         from types import SimpleNamespace
         record = SimpleNamespace(raw_batch="158694", article="C1300275", title="100/2", quantity_cones=4)
-        raw_rows = [{"Articolo": "G1300275", "Peso": 245.32, "تحضير خام": "تحضير خام"}]
+        raw_rows = [{"articolo": "G1300275", "peso": 245.32, "تحضير خام": "تحضير خام"}]
         magazino = pd.DataFrame([{
             "articolo": "G130027S", "partita": "158694.0", "mag_rocche": 12,
-            "mag_peso": 245.32,
+            "mag_peso": 240.0,
         }])
         result = _filato_rows([record], raw_rows, magazino)
-        self.assertEqual(result[0]["Rocche"], 12)
+        self.assertEqual(result[0]["Rocche"], 4)
+        self.assertEqual(result[0]["Peso"], 80.0)  # (240.0 / 12) * 4
+
+    def test_filato_rows_falls_back_to_raw_sheet_peso_without_magazino(self):
+        from types import SimpleNamespace
+        record = SimpleNamespace(raw_batch="158694", article="C1300275", title="100/2", quantity_cones=4)
+        raw_rows = [{"articolo": "G1300275", "peso": 245.32, "تحضير خام": "تحضير خام"}]
+        result = _filato_rows([record], raw_rows, magazino_summary=None)
+        self.assertEqual(result[0]["Rocche"], 4)
+        self.assertEqual(result[0]["Peso"], 245.32)
+
+    def test_biglietti_filato_uses_fixed_filename_and_shared_writer(self):
+        # Create (EXCEL+Biglietti)'s Filato output must follow the same
+        # convention as Ordine Kamal/Ordine ELVY: a fixed "Filato x
+        # Tinturia.xlsx" name, written via export_filato_full (clear +
+        # rewrite each run), not a per-order-named snapshot file.
+        from types import SimpleNamespace
+        from pipelines.ordini_elvy import RawYarnMatch, export_filato_full, read_filato_tinturia_sheet
+
+        record = SimpleNamespace(raw_batch="158694", article="C1300275", title="100/2", quantity_cones=4)
+        raw_rows = [{"articolo": "G1300275", "peso": 245.32, "تحضير خام": "تحضير خام"}]
+        magazino = pd.DataFrame([{
+            "articolo": "G130027S", "partita": "158694.0", "mag_rocche": 12, "mag_peso": 245.32,
+        }])
+        filato_rows = _filato_rows([record], raw_rows, magazino)
+        matches = [
+            RawYarnMatch(
+                articolo=r["Articolo"], titolo=r["Titolo"], partita=r["Partita"],
+                rocce=r["Rocche"], peso=r["Peso"], label=r["تحضير خام"],
+            )
+            for r in filato_rows
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "Filato x Tinturia.xlsx"
+            n = export_filato_full(target, matches)
+            self.assertEqual(n, 1)
+            self.assertTrue(target.is_file())
+            rows = read_filato_tinturia_sheet(target)
+            self.assertEqual(rows[0].rocce, 4)  # order total, not Magazino's stock count (12)
+
+    def test_elvy_and_el_kamal_workbooks_embed_filato_sheet_like_med(self):
+        # Every client's own extract-excel gets a "Filato x Tinturia" tab,
+        # not just MED's -- regression guard for the ELVY/EL KAMAL asymmetry
+        # where include_filato was left False while MED already had it True.
+        from exporters.biglietti_exporter import OrderRecord, export_workbook
+
+        record = OrderRecord(
+            customer_code="3009", customer_name="ELVY WEAVING", article="C130027S",
+            description="", additional_raw="", color_code="5305", color_name="EL-281311",
+            order_no="7777", order_row="1", colored_batch="322813", raw_batch="158694",
+            quantity_cones=32, raw_weight=30, dispo="D-00505450-001", bagno="S940",
+            title="100/2",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for customer in ("ELVY", "EL_KAMAL"):
+                path = Path(temp_dir) / f"{customer}.xlsx"
+                export_workbook(path, [record], [], include_filato=True, customer=customer)
+                wb = openpyxl.load_workbook(path)
+                try:
+                    self.assertIn("Filato x Tinturia", wb.sheetnames, customer)
+                finally:
+                    wb.close()
 
     def test_filato_extract_replaces_previous_order_content(self):
         # A shared "Filato x Tinturia.xlsx" (e.g. Ordine Kamal and Ordine
@@ -420,6 +518,38 @@ class PlanningRegressionTests(unittest.TestCase):
             wb.close()
             self.assertNotIn("C100", values)  # the older order's row is gone
             self.assertIn("C200", values)
+
+    def test_abbin_zero_normalizes_to_none_and_never_groups(self):
+        from pipelines.ordine_med import OrdineMedRow, _normalize_abbin, compute_mc_and_gruppo
+
+        self.assertIsNone(_normalize_abbin(0))
+        self.assertIsNone(_normalize_abbin("0"))
+        self.assertIsNone(_normalize_abbin(0.0))
+        self.assertIsNone(_normalize_abbin(None))
+        self.assertIsNone(_normalize_abbin(""))
+        self.assertEqual(_normalize_abbin(5), 5)
+        self.assertEqual(_normalize_abbin("7"), "7")
+
+        def record(rocc, abbin):
+            return OrdineMedRow(
+                riga=1, code_org="", titolo="", descr_col="", articolo="C100",
+                colore="", rocc=rocc, abbin=_normalize_abbin(abbin), consegna_input="", pt_grg="",
+                pt_med="", polmoni="", cliente_note="", nota_grg="", nota_col="",
+                kg_note="", fabb="", prezz_note="",
+            )
+
+        # Two rows that both had raw ABBIN 0 must NOT be grouped together --
+        # each keeps its own Rocche as its M/C, same as a genuinely blank ABBIN.
+        zero_a, zero_b = record(10, 0), record(20, 0)
+        # Two rows that share a real, non-zero ABBIN must still be grouped
+        # and dyed together, combining their Rocche.
+        paired_a, paired_b = record(6, 5), record(6, 5)
+        compute_mc_and_gruppo([zero_a, zero_b, paired_a, paired_b])
+
+        self.assertEqual(zero_a.mc, 10)
+        self.assertEqual(zero_b.mc, 20)
+        self.assertEqual(paired_a.mc, 12)
+        self.assertEqual(paired_b.mc, 12)
 
     def test_med_erp_export_replaces_previous_content(self):
         from pipelines.ordine_med import OrdineMedRow, export_erp_order_workbook
@@ -509,7 +639,7 @@ class PlanningRegressionTests(unittest.TestCase):
                 db.init_db()
                 base = {"partita": "P900", "cliente": "ELVY", "articolo": "G130", "colore": "10",
                         "comment": "C.Q", "bagno": "5", "tinto": "", "data_qualita": "",
-                        "data_uscita": "", "old_comment": "", "new_comment": "C.Q"}
+                        "data_uscita": "", "consegna": "2026-09-10", "old_comment": "", "new_comment": "C.Q"}
                 db.upsert_states([base])
                 # Re-uploading identical data must NOT add a second history row.
                 db.upsert_states([dict(base)])
@@ -524,7 +654,9 @@ class PlanningRegressionTests(unittest.TestCase):
                 timeline = format_partita_timeline(history)
                 self.assertEqual(len(timeline), 3)
                 self.assertIn("days_in_qc", timeline.columns)
+                self.assertIn("consegna", timeline.columns)
                 self.assertIn("ritardo", timeline.columns)
+                self.assertTrue((timeline["consegna"] == "2026-09-10").all())
                 self.assertIn("First seen", timeline.iloc[0]["event"])
                 self.assertIn("Dyed on 2026-09-01", timeline.iloc[1]["event"])
                 self.assertIn("Shipped on 2026-09-05", timeline.iloc[2]["event"])
@@ -634,6 +766,115 @@ class PlanningRegressionTests(unittest.TestCase):
         col = pd.Series([3.0, float("nan"), 7.0])
         formatted = col.apply(lambda v: str(int(v)) if pd.notna(v) else "")
         self.assertEqual(formatted.tolist(), ["3", "", "7"])
+
+    def test_delivery_date_highlight_flags_dates_under_threshold(self):
+        from exporters.biglietti_exporter import _style_sheet
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Articolo", "Delivery Date"])
+        ws.append(["G130", date(2026, 9, 10)])
+        ws.append(["G140", "Bending for yarn"])
+        _style_sheet(ws, days_until_highlight_columns={"Delivery Date": 4})
+
+        rules = list(ws.conditional_formatting)
+        formulas = [rule.sqref for rule in rules]
+        self.assertTrue(any(str(f) == "B2:B3" for f in formulas), formulas)
+        matching = [r for r in rules if str(r.sqref) == "B2:B3"]
+        self.assertEqual(len(matching), 1)
+        formula_text = list(matching[0].rules[0].formula)[0]
+        self.assertIn("ISNUMBER(B2)", formula_text)
+        self.assertIn("TODAY()", formula_text)
+        self.assertIn("<4", formula_text)
+
+    def test_delivery_date_highlight_absent_when_column_missing(self):
+        # MED/EL_KAMAL sheets don't have a "Delivery Date" column -- passing
+        # the threshold unconditionally must simply no-op for them.
+        from exporters.biglietti_exporter import _style_sheet
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Articolo", "Consegna"])
+        ws.append(["G130", date(2026, 9, 10)])
+        _style_sheet(ws, days_until_highlight_columns={"Delivery Date": 4})
+        self.assertEqual(len(list(ws.conditional_formatting)), 0)
+
+    def test_email_template_round_trips_through_dict(self):
+        from utility.email_compose import EmailTemplate
+        original = EmailTemplate(to="a@x.com; b@y.com", cc="c@z.com", subject="Order ready", body="Please find attached.")
+        restored = EmailTemplate.from_dict(original.to_dict())
+        self.assertEqual(restored, original)
+        self.assertFalse(restored.is_blank())
+
+    def test_email_template_blank_detection(self):
+        from utility.email_compose import EmailTemplate
+        self.assertTrue(EmailTemplate().is_blank())
+        self.assertTrue(EmailTemplate.from_dict(None).is_blank())
+        self.assertTrue(EmailTemplate.from_dict({}).is_blank())
+        self.assertFalse(EmailTemplate(subject="hi").is_blank())
+
+    def test_open_outlook_email_raises_clear_error_without_outlook(self):
+        # On this (non-Windows / no-Outlook) test environment, win32com
+        # simply isn't importable -- confirm that surfaces as a clean,
+        # user-facing RuntimeError rather than an unhandled ImportError.
+        from utility.email_compose import EmailTemplate, open_outlook_email
+        try:
+            import win32com.client  # noqa: F401
+            self.skipTest("win32com is available in this environment")
+        except ImportError:
+            pass
+        with self.assertRaises(RuntimeError):
+            open_outlook_email(EmailTemplate(to="a@x.com", subject="hi"), [])
+
+    def test_open_outlook_email_prefers_already_running_instance(self):
+        # Regression guard for the "Welcome to Outlook" setup-wizard bug:
+        # GetActiveObject (attach to Outlook that's already open and signed
+        # in) must be tried before Dispatch (which can spin up a fresh,
+        # unconfigured instance and land on the account-setup wizard).
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        fake_mail = MagicMock()
+        fake_outlook = MagicMock()
+        fake_outlook.CreateItem.return_value = fake_mail
+
+        fake_client = types.ModuleType("win32com.client")
+        fake_client.GetActiveObject = MagicMock(return_value=fake_outlook)
+        fake_client.Dispatch = MagicMock(side_effect=AssertionError("Dispatch should not be called when GetActiveObject succeeds"))
+        fake_win32com = types.ModuleType("win32com")
+        fake_win32com.client = fake_client
+
+        with patch.dict(sys.modules, {"win32com": fake_win32com, "win32com.client": fake_client}):
+            from utility.email_compose import EmailTemplate, open_outlook_email
+            template = EmailTemplate(to="a@x.com", cc="b@x.com", subject="Order Ready", body="See attached.")
+            open_outlook_email(template, [])
+
+        fake_client.GetActiveObject.assert_called_once_with("Outlook.Application")
+        fake_outlook.CreateItem.assert_called_once_with(0)
+        self.assertEqual(fake_mail.To, "a@x.com")
+        self.assertEqual(fake_mail.Subject, "Order Ready")
+        fake_mail.Display.assert_called_once()
+
+    def test_open_outlook_email_falls_back_to_dispatch_when_not_running(self):
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        fake_mail = MagicMock()
+        fake_outlook = MagicMock()
+        fake_outlook.CreateItem.return_value = fake_mail
+
+        fake_client = types.ModuleType("win32com.client")
+        fake_client.GetActiveObject = MagicMock(side_effect=Exception("no running instance"))
+        fake_client.Dispatch = MagicMock(return_value=fake_outlook)
+        fake_win32com = types.ModuleType("win32com")
+        fake_win32com.client = fake_client
+
+        with patch.dict(sys.modules, {"win32com": fake_win32com, "win32com.client": fake_client}):
+            from utility.email_compose import EmailTemplate, open_outlook_email
+            open_outlook_email(EmailTemplate(to="a@x.com", subject="hi"), [])
+
+        fake_client.Dispatch.assert_called_once_with("Outlook.Application")
+        fake_mail.Display.assert_called_once()
 
 
 if __name__ == "__main__":

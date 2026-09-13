@@ -861,10 +861,14 @@ def _filato_rows(
     raw_rows: list[dict[str, Any]],
     magazino_summary=None,
 ) -> list[dict[str, Any]]:
-    """One row per raw batch, using warehouse Rocche when available.
-
-    The small ``تحضير خيط خام`` sheet is only descriptive.  Its Rocche value
-    can be stale or zero, so stock quantities must come from Magazino.
+    """One row per raw batch, for the post-ERP-entry (Create EXCEL+Biglietti)
+    stage: stock availability was already checked earlier, on the Ordine
+    page, before the order went into the system -- so Rocche here is simply
+    the order's own total cone count for that batch, not a fresh warehouse
+    lookup. Peso is still derived from Magazino, but scaled to that same
+    order quantity: (warehouse weight / warehouse cones) for the batch,
+    times how many cones THIS order actually needs, i.e. the total weight
+    for the cones being pulled -- not the warehouse's full stock weight.
     """
     raw_by_article = {_clean(_get(r, "Articolo")).upper(): r for r in raw_rows}
 
@@ -875,8 +879,8 @@ def _filato_rows(
             continue
         totals[key] = totals.get(key, 0) + (_number(rec.quantity_cones) or 0)
 
-    warehouse_totals = {}
-    warehouse_by_partita = {}
+    warehouse_rate = {}
+    rate_by_partita = {}
 
     def stock_key(value: Any) -> str:
         text = _clean(value)
@@ -890,11 +894,15 @@ def _filato_rows(
             if not article or not partita:
                 continue
             try:
-                rocche = float(getattr(row, "mag_rocche", 0) or 0)
+                mag_rocche = float(getattr(row, "mag_rocche", 0) or 0)
+                mag_peso = float(getattr(row, "mag_peso", 0) or 0)
             except (TypeError, ValueError):
-                rocche = 0.0
-            warehouse_totals[(article, partita)] = warehouse_totals.get((article, partita), 0) + rocche
-            warehouse_by_partita.setdefault(partita, set()).add((article, rocche))
+                continue
+            if mag_rocche <= 0:
+                continue
+            rate = mag_peso / mag_rocche
+            warehouse_rate[(article, partita)] = rate
+            rate_by_partita.setdefault(partita, set()).add((article, rate))
 
     out = []
     seen: set[str] = set()
@@ -906,21 +914,23 @@ def _filato_rows(
         article_g = ("G" + rec.article[1:]) if rec.article[:1].upper() == "C" else rec.article
         raw = raw_by_article.get(article_g.upper(), {})
         stock_partita = stock_key(key)
-        warehouse_rocche = warehouse_totals.get((article_g.upper(), stock_partita))
-        if warehouse_rocche is None:
+        order_rocche = totals[key]
+        per_cone_rate = warehouse_rate.get((article_g.upper(), stock_partita))
+        if per_cone_rate is None:
             # Some ERP exports contain a visually similar article code, e.g.
             # G1300275 in the order and G130027S in Magazino.  A Partita is
             # unique in the stock export, so use it only when it has one
             # unambiguous warehouse article.
-            partita_matches = warehouse_by_partita.get(stock_partita, set())
+            partita_matches = rate_by_partita.get(stock_partita, set())
             if len(partita_matches) == 1:
-                warehouse_rocche = next(iter(partita_matches))[1]
+                per_cone_rate = next(iter(partita_matches))[1]
+        peso = round(per_cone_rate * order_rocche, 2) if per_cone_rate is not None else _number(_get(raw, "وزن", "Peso"))
         out.append({
             "Articolo": article_g,
             "Titolo": rec.title or _clean(_get(raw, "Titolo")),
             "Partita": key,
-            "Rocche": warehouse_rocche if warehouse_rocche is not None else totals[key],
-            "Peso": _number(_get(raw, "وزن", "Peso")),
+            "Rocche": order_rocche,
+            "Peso": peso,
             "تحضير خام": _clean(_get(raw, "Custom", "تحضير خام")) or "تحضير خام",
         })
     return out
@@ -936,6 +946,16 @@ def export_workbook(
     magazino_summary=None,
 ) -> None:
     customer = customer or ("ELVY" if records[0].customer_code == "3009" else "MED")
+    # The Create (EXCEL+Biglietti) extract is consumed in Partita Col order.
+    # Sort numerically (not lexicographically, so 20 comes after 3) and keep
+    # rows with an empty/non-numeric Partita Col at the end.
+    records = sorted(
+        records,
+        key=lambda record: (
+            _number(record.colored_batch) is None,
+            _number(record.colored_batch) if _number(record.colored_batch) is not None else 0,
+        ),
+    )
     wb = Workbook()
     ws = wb.active
     ws.title = customer
@@ -974,6 +994,7 @@ def export_workbook(
         date_columns=("Consegna", "Delivery Date"),
         duplicate_highlight_columns=("Bagno",),
         range_highlight_columns={"Densita` (360-390)": (360, 390)},
+        days_until_highlight_columns={"Delivery Date": 4},
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
@@ -1005,12 +1026,15 @@ def _style_sheet(
     date_columns: tuple[str, ...] = (),
     duplicate_highlight_columns: tuple[str, ...] = (),
     range_highlight_columns: dict[str, tuple[float, float]] | None = None,
+    days_until_highlight_columns: dict[str, int] | None = None,
 ) -> None:
     """Bold/blue header, every cell (not just the header) centered, optional
     date-only number format for the given columns, optional red highlight
-    for duplicate values in the given columns (e.g. Bagno), and optional
-    red highlight for numbers outside a (min, max) range in the given
-    columns (e.g. Densita`(360-390))."""
+    for duplicate values in the given columns (e.g. Bagno), optional red
+    highlight for numbers outside a (min, max) range in the given columns
+    (e.g. Densita`(360-390)), and optional red highlight for a date column
+    where fewer than N days remain until that date (e.g. Delivery Date),
+    recalculated live against today's date every time the file is opened."""
     fill = PatternFill("solid", fgColor="FF1F4E78")
     header = [c.value for c in ws[1]]
     last_row = ws.max_row
@@ -1062,6 +1086,18 @@ def _style_sheet(
                 rng = f"{col_letter}2:{col_letter}{last_row}"
                 first = f"{col_letter}2"
                 formula = f'AND({first}<>"",OR({first}<{lo},{first}>{hi}))'
+                ws.conditional_formatting.add(rng, FormulaRule(formula=[formula], fill=red_fill, stopIfTrue=False))
+
+        for col_name, days_threshold in (days_until_highlight_columns or {}).items():
+            if col_name in header:
+                col_letter = ws.cell(row=1, column=header.index(col_name) + 1).column_letter
+                rng = f"{col_letter}2:{col_letter}{last_row}"
+                first = f"{col_letter}2"
+                # ISNUMBER guards against text placeholders (e.g. "Bending
+                # for yarn" when the delivery date can't be computed yet)
+                # -- those aren't a real date, so they must never be
+                # subtracted from TODAY() or Excel shows a #VALUE! error.
+                formula = f'AND(ISNUMBER({first}),({first}-TODAY())<{days_threshold})'
                 ws.conditional_formatting.add(rng, FormulaRule(formula=[formula], fill=red_fill, stopIfTrue=False))
 
     ws.freeze_panes = "A2"

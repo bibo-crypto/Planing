@@ -4,7 +4,6 @@ kamal_tab.py
 colour's Articolo via DFM (shared with Data Elvy) and optionally match raw
 yarn stock (Magazino), then export an Excel workbook.
 """
-import os
 import threading
 from pathlib import Path
 

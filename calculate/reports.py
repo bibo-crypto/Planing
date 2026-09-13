@@ -71,7 +71,7 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
     """
     from calculate.situazione import compute_delay_days, _parse_delivery_date
 
-    columns = ["changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "ritardo"]
+    columns = ["changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "consegna", "ritardo"]
     if not history_rows:
         return pd.DataFrame(columns=columns)
 
@@ -121,6 +121,7 @@ def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
             "data_qualita": row.get("data_qualita"),
             "data_uscita": row.get("data_uscita"),
             "days_in_qc": days_qc,
+            "consegna": row.get("consegna"),
             "ritardo": ritardo_val,
         })
         prev = row
