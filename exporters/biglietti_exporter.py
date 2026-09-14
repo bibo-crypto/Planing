@@ -1001,6 +1001,353 @@ def export_workbook(
     wb.close()
 
 
+# ---------------------------------------------------------------------------
+# Shared Create (Excel + Biglietti) workbook
+# ---------------------------------------------------------------------------
+
+CREATE_EXCEL_HEADERS = [
+    "Dispo/Riga", "Cliente", "Articolo", "Titolo", "Formato", "Ordine", "Codice",
+    "Colore", "Rocche", "KG", "M/C", "Partita Col", "Consegna",
+    "Commento", "Bagno", "Partita GG", "Delivery Date", "Partita MED",
+    "Cliente MED", "POLMON", "Color Tube", "VMM22", "Prezzo",
+    "Densita` (360-390)",
+]
+
+
+def _create_excel_row(record: OrderRecord, customer: str) -> list[Any]:
+    """Return the stable superset row used by the shared order workbook."""
+    polmon = _polmoni_segment(record.additional_raw) if customer == "MED" else ""
+    return [
+        record.dispo, record.customer_name or customer,
+        record.article, record.title, record.formato, record.order_no,
+        record.color_code, record.color_name, record.quantity_cones,
+        record.kg, record.machine, record.colored_batch, record.delivery,
+        record.commento, record.bagno, record.raw_batch, record.delivery_date,
+        record.partita_med, record.cliente_med, polmon, record.color_tube,
+        record.vmm22, record.prezzo, record.densita,
+    ]
+
+
+def _partita_key(value: Any) -> str:
+    value = _clean(value)
+    number = _number(value)
+    if number is not None:
+        return str(int(number)) if float(number).is_integer() else str(number)
+    return value.casefold()
+
+
+def _is_pg_x(value: Any) -> bool:
+    text = _clean(value).upper().replace(" ", "")
+    return not text or text in {"X", "PG-X", "PGX"}
+
+
+def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -> dict[str, Any]:
+    """Create or append the shared workbook used by the dyeing review flow.
+
+    ``Partita Col`` is the business key: rows whose key already exists in the
+    workbook are skipped.  The complete data set is then sorted numerically by
+    that column, with blank/non-numeric values at the end.
+    """
+    from openpyxl import Workbook, load_workbook
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        wb = load_workbook(path)
+        ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
+        headers = [_clean(c.value) for c in ws[1]]
+        if "Partita Col" not in headers:
+            wb.close()
+            raise ValueError("The selected Excel file has no 'Partita Col' column.")
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Orders"
+        headers = list(CREATE_EXCEL_HEADERS)
+        ws.append(headers)
+
+    pg_ws = wb["PG-X"] if "PG-X" in wb.sheetnames else wb.create_sheet("PG-X")
+    if pg_ws.max_row == 1 and all(c.value is None for c in pg_ws[1]):
+        pg_ws.delete_rows(1)
+    if pg_ws.max_row == 0:
+        pg_ws.append(headers)
+    pg_headers = [_clean(c.value) for c in pg_ws[1]]
+    if not pg_headers or "Partita Col" not in pg_headers:
+        if pg_ws.max_row > 0:
+            pg_ws.delete_rows(1, pg_ws.max_row)
+        pg_headers = list(headers)
+        pg_ws.append(pg_headers)
+
+    # Migrate legacy shared files: rows without Partita GG belong on PG-X.
+    raw_col = next((i + 1 for i, h in enumerate(headers) if _key(h) == _key("Partita GG")), None)
+    if raw_col and ws.max_row > 1:
+        move_rows = []
+        for row_idx in range(2, ws.max_row + 1):
+            if _is_pg_x(ws.cell(row=row_idx, column=raw_col).value):
+                move_rows.append([ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)])
+        for row in move_rows:
+            pg_ws.append([dict(zip(headers, row)).get(header, "") for header in pg_headers])
+        for row_idx in range(ws.max_row, 1, -1):
+            if _is_pg_x(ws.cell(row=row_idx, column=raw_col).value):
+                ws.delete_rows(row_idx, 1)
+
+    def col(name: str) -> int | None:
+        wanted = _key(name)
+        for idx, header in enumerate(headers, start=1):
+            if _key(header) == wanted:
+                return idx
+        return None
+
+    partita_col = col("Partita Col")
+    existing = set()
+    for candidate_ws, candidate_headers in ((ws, headers), (pg_ws, pg_headers)):
+        candidate_col = next((i + 1 for i, h in enumerate(candidate_headers) if _key(h) == _key("Partita Col")), None)
+        if candidate_col:
+            existing.update(
+                _partita_key(candidate_ws.cell(row=row, column=candidate_col).value)
+                for row in range(2, candidate_ws.max_row + 1)
+                if _partita_key(candidate_ws.cell(row=row, column=candidate_col).value)
+            )
+    added = 0
+    skipped = 0
+    for record in records:
+        key = _partita_key(record.colored_batch)
+        if not key or key in existing:
+            skipped += 1
+            continue
+        values = dict(zip(CREATE_EXCEL_HEADERS, _create_excel_row(record, customer)))
+        target_ws = pg_ws if _is_pg_x(record.raw_batch) else ws
+        target_headers = pg_headers if target_ws is pg_ws else headers
+        target_ws.append([values.get(header, "") for header in target_headers])
+        existing.add(key)
+        added += 1
+
+    def sort_sheet(target_ws, target_headers):
+        target_col = next(i + 1 for i, h in enumerate(target_headers) if _key(h) == _key("Partita Col"))
+        rows = list(target_ws.iter_rows(min_row=2, values_only=True))
+        rows.sort(key=lambda row: (
+            _number(row[target_col - 1]) is None,
+            _number(row[target_col - 1]) if _number(row[target_col - 1]) is not None else 0,
+        ))
+        if target_ws.max_row > 1:
+            target_ws.delete_rows(2, target_ws.max_row - 1)
+        for row in rows:
+            target_ws.append(list(row))
+        _style_sheet(target_ws, date_columns=("Consegna", "Delivery Date"))
+
+    sort_sheet(ws, headers)
+    sort_sheet(pg_ws, pg_headers)
+    wb.save(path)
+    wb.close()
+    return {"added": added, "skipped": skipped, "total": ws.max_row - 1 + pg_ws.max_row - 1}
+
+
+def load_create_excel_records(path: Path, partita_gg: str = "", sheet_name: str = "Orders") -> list[OrderRecord]:
+    """Read shared-workbook rows, optionally filtered by ``Partita GG``."""
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        elif sheet_name == "Orders":
+            ws = wb.active
+        else:
+            return []
+        rows = _read_sheet_rows(ws)
+    finally:
+        wb.close()
+    wanted = _partita_key(partita_gg) if _clean(partita_gg) else ""
+    out: list[OrderRecord] = []
+    for row in rows:
+        if wanted and _partita_key(_get(row, "Partita GG")) != wanted:
+            continue
+        customer = _clean(_get(row, "Cliente")) or "ELVY"
+        code = "3004" if customer.upper().startswith("MED") else "3009"
+        out.append(OrderRecord(
+            customer_code=code, customer_name=customer,
+            article=_clean(_get(row, "Articolo")),
+            description=_clean(_get(row, "Titolo")), additional_raw=_clean(_get(row, "Commento")),
+            color_code=_clean(_get(row, "Codice")), color_name=_clean(_get(row, "Colore")),
+            order_no=_clean(_get(row, "Ordine")), order_row="",
+            colored_batch=_clean(_get(row, "Partita Col")), raw_batch=_clean(_get(row, "Partita GG")),
+            quantity_cones=_number(_get(row, "Rocche")), raw_weight=_number(_get(row, "KG")),
+            dispo=_clean(_get(row, "Dispo/Riga")), bagno=_clean(_get(row, "Bagno")),
+            delivery=_get(row, "Consegna"), machine=_clean(_get(row, "M/C")),
+            title=_clean(_get(row, "Titolo")), commento=_clean(_get(row, "Commento")),
+            partita_med=_clean(_get(row, "Partita MED")), cliente_med=_clean(_get(row, "Cliente MED")),
+            kg=_number(_get(row, "KG")), color_tube=_clean(_get(row, "Color Tube")),
+            vmm22=_number(_get(row, "VMM22")), prezzo=_get(row, "Prezzo"),
+            densita=_get(row, "Densita` (360-390)"), delivery_date=_get(row, "Delivery Date"),
+        ))
+    if not out and not _clean(partita_gg):
+        return []
+    if not out:
+        raise ValueError(f"No rows were found for Partita GG '{partita_gg}'.")
+    return out
+
+
+def save_pg_x_partita(
+    path: Path,
+    partita_col: str,
+    partita_gg: str,
+    densita_map: dict[int, dict[str, Any]] | None = None,
+    vmm_ratio_map: dict[int, float] | None = None,
+    magazino_summary=None,
+    allow_article_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Assign raw yarn to a PG-X color, enrich it, and move it to Orders."""
+    from openpyxl import load_workbook
+
+    densita_map = densita_map or {}
+    vmm_ratio_map = vmm_ratio_map or {}
+    wb = load_workbook(path)
+    if "PG-X" not in wb.sheetnames:
+        wb.close()
+        raise ValueError("The shared Excel has no PG-X sheet.")
+    pg_ws = wb["PG-X"]
+    orders_ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
+    pg_headers = [_clean(c.value) for c in pg_ws[1]]
+    order_headers = [_clean(c.value) for c in orders_ws[1]]
+
+    def header_col(headers, name):
+        wanted = _key(name)
+        return next((i + 1 for i, value in enumerate(headers) if _key(value) == wanted), None)
+
+    col_partita_col = header_col(pg_headers, "Partita Col")
+    col_partita_gg = header_col(pg_headers, "Partita GG")
+    if not col_partita_col or not col_partita_gg:
+        wb.close()
+        raise ValueError("PG-X is missing Partita Col or Partita GG columns.")
+    wanted_col = _partita_key(partita_col)
+    matching_rows = [
+        row_idx for row_idx in range(2, pg_ws.max_row + 1)
+        if _partita_key(pg_ws.cell(row=row_idx, column=col_partita_col).value) == wanted_col
+    ]
+    if not matching_rows:
+        wb.close()
+        raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+
+    source_map = {header: index + 1 for index, header in enumerate(pg_headers)}
+    updates = {"Partita GG": partita_gg}
+    batch_number = _number(partita_gg)
+    density_entry = densita_map.get(int(batch_number)) if batch_number is not None else None
+    if density_entry:
+        updates["KG"] = [
+            _number(pg_ws.cell(row=row_idx, column=header_col(pg_headers, "Rocche")).value) or 0
+            for row_idx in matching_rows
+        ]
+    moved_rows = []
+    available_total = 0.0
+    for row_idx in matching_rows:
+        rocche_col = header_col(pg_headers, "Rocche")
+        rocche = _number(pg_ws.cell(row=row_idx, column=rocche_col).value) if rocche_col else 0
+        values = {header: pg_ws.cell(row=row_idx, column=col_idx).value for header, col_idx in source_map.items()}
+        values["Partita GG"] = partita_gg
+        if magazino_summary is not None:
+            color_article = _clean(values.get("Articolo")).upper()
+            expected_raw_article = "G" + color_article[1:] if color_article.startswith("C") else color_article
+            batch_key = str(int(batch_number)) if batch_number is not None else _clean(partita_gg)
+            matching_stock = magazino_summary[
+                (magazino_summary["articolo"].astype(str).str.strip().str.upper() == expected_raw_article)
+                & (magazino_summary["partita"].map(_partita_key) == batch_key)
+            ]
+            if matching_stock.empty:
+                if not allow_article_mismatch:
+                    wb.close()
+                    raise ValueError(
+                        f"Partita GG {partita_gg} does not belong to article {expected_raw_article} "
+                        f"required by color article {color_article}."
+                    )
+            if not matching_stock.empty:
+                available_total += float(matching_stock.iloc[0].get("mag_rocche", 0) or 0)
+        if density_entry:
+            if density_entry.get("peso_net") is not None:
+                values["KG"] = int(round(density_entry["peso_net"] * (rocche or 0)))
+            values["Densita` (360-390)"] = density_entry.get("densita", "")
+            values["Color Tube"] = density_entry.get("color_tube", "")
+        if batch_number is not None and int(batch_number) in vmm_ratio_map:
+            values["VMM22"] = round(vmm_ratio_map[int(batch_number)] * (rocche or 0), 2)
+        moved_rows.append([values.get(header, "") for header in order_headers])
+
+    for row_idx, row in zip(matching_rows, moved_rows):
+        values = dict(zip(order_headers, row))
+        for header, col_idx in ((header, index + 1) for index, header in enumerate(pg_headers)):
+            pg_ws.cell(row=row_idx, column=col_idx).value = values.get(header, "")
+
+    def sort_sheet(ws, headers):
+        col_idx = header_col(headers, "Partita Col")
+        rows = list(ws.iter_rows(min_row=2, values_only=True))
+        rows.sort(key=lambda row: (_number(row[col_idx - 1]) is None, _number(row[col_idx - 1]) or 0))
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row - 1)
+        for row in rows:
+            ws.append(list(row))
+        _style_sheet(ws, date_columns=("Consegna", "Delivery Date"))
+
+    sort_sheet(pg_ws, pg_headers)
+    sort_sheet(orders_ws, order_headers)
+    wb.save(path)
+    wb.close()
+    return {"updated": len(matching_rows), "partita_gg": partita_gg, "available": available_total}
+
+
+def move_pg_x_to_orders(path: Path, partita_col: str) -> int:
+    """Move the selected PG-X color row to Orders."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    if "PG-X" not in wb.sheetnames or "Orders" not in wb.sheetnames:
+        wb.close()
+        raise ValueError("The shared Excel must contain Orders and PG-X sheets.")
+    pg_ws, orders_ws = wb["PG-X"], wb["Orders"]
+    pg_headers = [_clean(c.value) for c in pg_ws[1]]
+    order_headers = [_clean(c.value) for c in orders_ws[1]]
+    pg_col = next((i + 1 for i, h in enumerate(pg_headers) if _key(h) == _key("Partita Col")), None)
+    order_col = next((i + 1 for i, h in enumerate(order_headers) if _key(h) == _key("Partita Col")), None)
+    if not pg_col or not order_col:
+        wb.close()
+        raise ValueError("Partita Col column is missing.")
+    wanted = _partita_key(partita_col)
+    matches = [r for r in range(2, pg_ws.max_row + 1) if _partita_key(pg_ws.cell(r, pg_col).value) == wanted]
+    if not matches:
+        wb.close()
+        raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+    existing = {_partita_key(orders_ws.cell(r, order_col).value) for r in range(2, orders_ws.max_row + 1)}
+    for row_idx in matches:
+        values = {header: pg_ws.cell(row_idx, idx + 1).value for idx, header in enumerate(pg_headers)}
+        row = [values.get(header, "") for header in order_headers]
+        if _partita_key(row[order_col - 1]) not in existing:
+            orders_ws.append(row)
+            existing.add(_partita_key(row[order_col - 1]))
+    for row_idx in reversed(matches):
+        pg_ws.delete_rows(row_idx, 1)
+    wb.save(path)
+    wb.close()
+    return len(matches)
+
+
+def delete_pg_x_row(path: Path, partita_col: str) -> int:
+    """Delete the selected PG-X color row."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    if "PG-X" not in wb.sheetnames:
+        wb.close()
+        raise ValueError("The shared Excel has no PG-X sheet.")
+    ws = wb["PG-X"]
+    headers = [_clean(c.value) for c in ws[1]]
+    col_idx = next((i + 1 for i, h in enumerate(headers) if _key(h) == _key("Partita Col")), None)
+    if not col_idx:
+        wb.close()
+        raise ValueError("Partita Col column is missing.")
+    wanted = _partita_key(partita_col)
+    matches = [r for r in range(2, ws.max_row + 1) if _partita_key(ws.cell(r, col_idx).value) == wanted]
+    if not matches:
+        wb.close()
+        raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+    for row_idx in reversed(matches):
+        ws.delete_rows(row_idx, 1)
+    wb.save(path)
+    wb.close()
+    return len(matches)
+
+
 def export_filato_workbook(
     path: Path,
     records: list["OrderRecord"],
