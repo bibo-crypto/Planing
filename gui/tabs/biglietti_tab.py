@@ -20,6 +20,8 @@ for _exporter_function in (
     "export_word", "export_workbook", "load_articoli_marca_lookup",
     "load_articoli_titolo_map", "load_densita_query", "load_el_kamal_order", "load_order",
     "load_prezzo_lookup", "load_vmm22_ratio_from_magazino", "_filato_rows",
+    "append_create_excel", "load_create_excel_records", "save_pg_x_partita",
+    "move_pg_x_to_orders", "delete_pg_x_row",
 ):
     globals()[_exporter_function] = _lazy_exporter_call(_exporter_function)
 from utility.articoli_cache import load_articoli_cache, save_articoli_cache
@@ -59,6 +61,7 @@ class BigliettiTab(ttk.Frame):
         self.med_output_dir: Path | None = None
         self.el_kamal_output_dir: Path | None = None
         self.filato_output_dir: Path | None = None
+        self.shared_excel_path: Path | None = None
         self.articoli_path: Path | None = None
         self.densita_path: Path | None = None
         self.filato_enabled = tk.BooleanVar(value=False)
@@ -71,15 +74,28 @@ class BigliettiTab(ttk.Frame):
         self._restore()
 
     def _build(self):
-        self.columnconfigure(0, weight=1)
+        # This page is taller than the available client area on smaller
+        # screens. Keep the page itself scrollable so the lower controls are
+        # reachable without forcing the whole application to a fixed size.
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._scrollbar.pack(side="right", fill="y")
+        content = ttk.Frame(self._canvas, padding=12)
+        self._canvas_window = self._canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda event: self._canvas.itemconfigure(self._canvas_window, width=event.width))
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        content.columnconfigure(0, weight=1)
         style = ttk.Style(self)
         style.configure("Bold.TButton", font=("Segoe UI", 10, "bold"))
-        header_frame = ttk.Frame(self)
+        header_frame = ttk.Frame(content)
         header_frame.pack(fill="x", padx=4, pady=(0, 10))
         ttk.Label(header_frame, text="Order Extraction & Dyeing Tickets", font=("Segoe UI", 15, "bold")).pack(anchor="w")
         ttk.Label(header_frame, text="Single Order Data + Dispo-Bagno for all clients (ELVY, MED, EL KAMAL) — format is automatically recognized.", foreground="#666666", wraplength=950).pack(anchor="w", pady=(2, 0))
 
-        input_box = ttk.LabelFrame(self, text=" 📁 Main Input Files (Required) ", padding=10)
+        input_box = ttk.LabelFrame(content, text=" 📁 Main Input Files (Required) ", padding=10)
         input_box.pack(fill="x", padx=4, pady=(0, 10))
         input_box.columnconfigure(1, weight=1)
         ttk.Button(input_box, text="📂  Select Order Data", command=self._pick_data, width=24).grid(row=0, column=0, sticky="w", pady=4)
@@ -89,14 +105,14 @@ class BigliettiTab(ttk.Frame):
         self.biglietti_dispo_path_label = ttk.Label(input_box, text="No file selected (optional if embedded)", foreground="grey", anchor="w")
         self.biglietti_dispo_path_label.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
 
-        template_box = ttk.LabelFrame(self, text=" 📝 Select Forma Biglietti ", padding=10)
+        template_box = ttk.LabelFrame(content, text=" 📝 Select Forma Biglietti ", padding=10)
         template_box.pack(fill="x", padx=4, pady=(0, 10))
         template_box.columnconfigure(1, weight=1)
         ttk.Button(template_box, text="📄  Select Forma Biglietti", command=self._pick_template, width=24).grid(row=0, column=0, sticky="w", pady=4)
         self.template_path_label = ttk.Label(template_box, text="Searching for Biglietti.docx...", foreground="grey", anchor="w")
         self.template_path_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
 
-        opt_box = ttk.LabelFrame(self, text=" ⚙️ Optional Data Sources (Shared across all clients) ", padding=10)
+        opt_box = ttk.LabelFrame(content, text=" ⚙️ Optional Data Sources (Shared across all clients) ", padding=10)
         opt_box.pack(fill="x", padx=4, pady=(0, 10))
         opt_box.columnconfigure(1, weight=1)
         self.articoli_btn = ttk.Button(opt_box, text="📂  Articles (Titolo)", command=self._pick_articoli, width=24)
@@ -116,7 +132,7 @@ class BigliettiTab(ttk.Frame):
         self.prezzi_label = ttk.Label(info_frame, text="• Price: Uses Price List (Listini) loaded in Prices / Situation", foreground="#555555", font=("Segoe UI", 8))
         self.prezzi_label.grid(row=0, column=1, sticky="w")
 
-        export_box = ttk.LabelFrame(self, text=" 📂 Output Destinations & Settings ", padding=10)
+        export_box = ttk.LabelFrame(content, text=" 📂 Output Destinations & Settings ", padding=10)
         export_box.pack(fill="x", padx=4, pady=(0, 10))
         export_box.columnconfigure(1, weight=1)
         self._build_folder_row(export_box, 0, "elvy", "📁  ELVY Output Folder", show_email_buttons=True)
@@ -124,13 +140,29 @@ class BigliettiTab(ttk.Frame):
         self._build_folder_row(export_box, 2, "el_kamal", "📁  EL KAMAL Output Folder", show_email_buttons=True)
         self._build_folder_row(export_box, 3, "filato", "📁  Filato Output Folder", with_checkbox=True)
 
-        action_box = ttk.Frame(self)
+        shared_box = ttk.LabelFrame(content, text=" 📚 Shared Create Excel (MED / ELVY) ", padding=10)
+        shared_box.pack(fill="x", padx=4, pady=(0, 10))
+        shared_box.columnconfigure(1, weight=1)
+        shared_buttons = ttk.Frame(shared_box)
+        shared_buttons.grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Button(shared_buttons, text="📂 Select Existing", command=self._pick_shared_excel, width=18).pack(side="left")
+        ttk.Button(shared_buttons, text="➕ Create New", command=self._create_shared_excel, width=15).pack(side="left", padx=(6, 0))
+        self.shared_excel_label = ttk.Label(shared_box, text="Not selected — Convert will append here", foreground="grey", anchor="w")
+        self.shared_excel_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
+        ttk.Button(shared_box, text="📋  Show Orders", command=self._show_shared_orders, width=24).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        action_box = ttk.Frame(content)
         action_box.pack(fill="x", padx=4, pady=(8, 4))
         action_box.columnconfigure(0, weight=1)
         self.convert_btn = ttk.Button(action_box, text="⚡  Convert & Generate Tickets (Excel + Word)", command=self._run_convert, width=42, style="Bold.TButton")
         self.convert_btn.pack(side="top", anchor="w", pady=(0, 8))
         self.status = ttk.Label(action_box, text="● Ready", font=("Segoe UI", 9, "bold"), foreground="#2E7D32", anchor="w", wraplength=950)
         self.status.pack(fill="x")
+
+    def _on_mousewheel(self, event):
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        if self.winfo_exists() and widget is not None and str(widget).startswith(str(self._w)):
+            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _build_folder_row(self, parent, row_idx, kind, btn_text, with_checkbox=False, show_email_buttons=False):
         btn_frame = ttk.Frame(parent)
@@ -353,6 +385,10 @@ class BigliettiTab(ttk.Frame):
             if p and Path(p).is_dir():
                 setattr(self, f"{kind}_output_dir", Path(p))
                 getattr(self, f"{kind}_dir_label").config(text=p, foreground="#111827")
+        shared = self._prefs.get("biglietti_shared_excel_path", "")
+        if shared and Path(shared).is_file():
+            self.shared_excel_path = Path(shared)
+            self.shared_excel_label.config(text=shared, foreground="#111827")
         saved_templates = self._prefs.get("biglietti_email_templates", {})
         self._sender_email = str(self._prefs.get("sender_email", "") or "")
         for kind in ("elvy", "med", "el_kamal"):
@@ -422,6 +458,480 @@ class BigliettiTab(ttk.Frame):
             setattr(self, f"{kind}_output_dir", Path(p))
             getattr(self, f"{kind}_dir_label").config(text=p, foreground="#111827")
             self._save_prefs(**{f"biglietti_{kind}_output_dir": p})
+
+    def _set_shared_excel(self, path: str | Path) -> None:
+        candidate = Path(path)
+        self.shared_excel_path = candidate
+        self.shared_excel_label.config(text=str(candidate), foreground="#111827")
+        self._save_prefs(biglietti_shared_excel_path=str(candidate))
+
+    def _pick_shared_excel(self):
+        p = filedialog.askopenfilename(
+            title="Select shared Create Excel",
+            filetypes=[("Excel workbook", "*.xlsx;*.xlsm"), ("All files", "*.*")],
+        )
+        if p:
+            self._set_shared_excel(p)
+
+    def _create_shared_excel(self):
+        folder = filedialog.askdirectory(title="Select folder for shared Create Excel and Biglietti")
+        if folder:
+            self._set_shared_excel(Path(folder) / "Create Orders.xlsx")
+
+    def _show_shared_orders(self):
+        if not self.shared_excel_path or not self.shared_excel_path.is_file():
+            return messagebox.showwarning("Missing Shared Excel", "Select the shared Excel file first.")
+        if getattr(self, "_orders_loading", False):
+            return
+        self._orders_loading = True
+        loading = tk.Toplevel(self)
+        loading.title("Show Orders")
+        loading.geometry("360x120")
+        loading.resizable(False, False)
+        loading.transient(self.winfo_toplevel())
+        ttk.Label(loading, text="Loading orders...", anchor="center").pack(expand=True, fill="both", padx=20, pady=20)
+        threading.Thread(target=self._load_shared_orders_worker, args=(self.shared_excel_path, loading), daemon=True).start()
+
+    def _load_shared_orders_worker(self, path: Path, loading: tk.Toplevel):
+        try:
+            datasets = {
+                "Orders": load_create_excel_records(path, sheet_name="Orders"),
+                "PG-X": load_create_excel_records(path, sheet_name="PG-X"),
+            }
+            self.after(0, lambda: self._finish_shared_orders_load(datasets, loading))
+        except Exception as exc:
+            self.after(0, lambda exc=exc: self._finish_shared_orders_error(exc, loading))
+
+    def _finish_shared_orders_error(self, exc: Exception, loading: tk.Toplevel):
+        self._orders_loading = False
+        if loading.winfo_exists():
+            loading.destroy()
+        messagebox.showerror("Shared Excel Error", str(exc))
+
+    def _finish_shared_orders_load(self, datasets, loading: tk.Toplevel):
+        self._orders_loading = False
+        if loading.winfo_exists():
+            loading.destroy()
+        if not any(datasets.values()):
+            return messagebox.showinfo("Show Orders", "The shared Excel has no orders yet.")
+        self._open_shared_orders_window(datasets)
+
+    def _open_shared_orders_window(self, datasets):
+
+        window = tk.Toplevel(self)
+        window.title("Select Orders for Biglietti")
+        window.geometry("1100x560")
+        window.minsize(850, 420)
+        window.resizable(True, True)
+        window.grab_set()
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        sheets = ttk.Notebook(window)
+        sheets.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 0))
+        orders_page = ttk.Frame(sheets)
+        pgx_page = ttk.Frame(sheets)
+        sheets.add(orders_page, text="Orders")
+        sheets.add(pgx_page, text="PG-X")
+
+        frame = ttk.Frame(window, padding=10)
+        frame.grid(row=1, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=0)
+        frame.rowconfigure(1, weight=1)
+        search_bar = ttk.Frame(frame)
+        search_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        search_bar.columnconfigure(1, weight=1)
+        ttk.Label(search_bar, text="🔎 Search:").grid(row=0, column=0, sticky="w")
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_bar, textvariable=search_var)
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(search_bar, text="Clear", width=10, command=lambda: search_var.set("")).grid(row=0, column=2, sticky="e")
+        ttk.Label(search_bar, text="Partita GG:").grid(row=0, column=3, sticky="w", padx=(18, 4))
+        partita_gg_var = tk.StringVar()
+        ttk.Entry(search_bar, textvariable=partita_gg_var, width=14).grid(row=0, column=4, sticky="w")
+        excel_columns = (
+            "Dispo/Riga", "Cliente", "Articolo", "Titolo", "Formato", "Ordine", "Codice",
+            "Colore", "Rocche", "KG", "M/C", "Partita Col", "Consegna", "Commento",
+            "Bagno", "Partita GG", "Delivery Date", "Partita MED", "Cliente MED", "POLMON",
+            "Color Tube", "VMM22", "Prezzo", "Densita` (360-390)",
+        )
+        columns = ("select",) + tuple(f"excel_{index}" for index in range(len(excel_columns)))
+        tree_style = ttk.Style(window)
+        tree_style.configure("Orders.Treeview", rowheight=28, background="#ffffff", fieldbackground="#ffffff")
+        tree_style.configure("Orders.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse", style="Orders.Treeview")
+        tree.tag_configure("odd", background="#e8f1fa", foreground="#172b4d")
+        tree.tag_configure("even", background="#ffffff", foreground="#172b4d")
+        headings = {"select": "Print"}
+        headings.update({f"excel_{index}": name for index, name in enumerate(excel_columns)})
+        widths = {"select": 70}
+        widths.update({f"excel_{index}": max(90, min(220, len(name) * 10 + 20)) for index, name in enumerate(excel_columns)})
+        for column in columns:
+            tree.heading(column, text=headings[column], command=lambda c=column: sort_by(c))
+            tree.column(column, width=widths[column], anchor="center")
+        tree.grid(row=1, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        hscrollbar = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        hscrollbar.grid(row=2, column=0, sticky="ew")
+        tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=hscrollbar.set)
+
+        selected: dict[str, bool] = {}
+        record_by_iid: dict[str, object] = {}
+        sheet_by_iid: dict[str, str] = {}
+        sort_state = {"column": None, "reverse": False}
+        current_sheet = {"name": "Orders"}
+        for sheet_name, sheet_records in datasets.items():
+            for index, record in enumerate(sheet_records):
+                iid = f"{sheet_name}-{index}"
+                selected[iid] = False
+                record_by_iid[iid] = record
+                sheet_by_iid[iid] = sheet_name
+
+        def refresh_records(new_datasets):
+            datasets.clear()
+            datasets.update(new_datasets)
+            selected.clear()
+            record_by_iid.clear()
+            sheet_by_iid.clear()
+            for sheet_name, sheet_records in datasets.items():
+                for index, record in enumerate(sheet_records):
+                    iid = f"{sheet_name}-{index}"
+                    selected[iid] = False
+                    record_by_iid[iid] = record
+                    sheet_by_iid[iid] = sheet_name
+
+        def values_for(record, iid):
+            polmon = ""
+            if record.customer_code == "3004":
+                parts = [part.strip() for part in str(record.additional_raw or "").split("-")]
+                polmon = parts[4] if len(parts) > 4 and "POLMON" in parts[4].upper() else ""
+            values = {
+                "Dispo/Riga": record.dispo, "Cliente": record.customer_name,
+                "Articolo": record.article, "Titolo": record.title, "Formato": record.formato,
+                "Ordine": record.order_no, "Codice": record.color_code, "Colore": record.color_name,
+                "Rocche": record.quantity_cones, "KG": record.kg, "M/C": record.machine,
+                "Partita Col": record.colored_batch, "Consegna": record.delivery,
+                "Commento": record.commento, "Bagno": record.bagno, "Partita GG": record.raw_batch,
+                "Delivery Date": record.delivery_date, "Partita MED": record.partita_med,
+                "Cliente MED": record.cliente_med, "POLMON": polmon, "Color Tube": record.color_tube,
+                "VMM22": record.vmm22, "Prezzo": record.prezzo, "Densita` (360-390)": record.densita,
+            }
+            return tuple(["☑" if selected[iid] else "☐"] + [values.get(name, "") for name in excel_columns])
+
+        def sort_by(column):
+            if sort_state["column"] == column:
+                sort_state["reverse"] = not sort_state["reverse"]
+            else:
+                sort_state["column"] = column
+                sort_state["reverse"] = False
+            rebuild()
+
+        def rebuild(*_args):
+            query = search_var.get().strip().casefold()
+            for iid in tree.get_children(""):
+                tree.delete(iid)
+            visible_index = 0
+            visible_rows = []
+            for iid, record in record_by_iid.items():
+                if sheet_by_iid[iid] != current_sheet["name"]:
+                    continue
+                searchable = " ".join(str(value or "") for value in values_for(record, iid)).casefold()
+                if query and query not in searchable:
+                    continue
+                visible_rows.append((iid, record))
+            if sort_state["column"] is not None:
+                sort_index = columns.index(sort_state["column"])
+                visible_rows.sort(key=lambda pair: str(values_for(pair[1], pair[0])[sort_index] or "").casefold(), reverse=sort_state["reverse"])
+            for iid, record in visible_rows:
+                tree.insert("", "end", iid=iid, values=values_for(record, iid), tags=("odd" if visible_index % 2 else "even",))
+                visible_index += 1
+
+        search_var.trace_add("write", rebuild)
+        rebuild()
+
+        def switch_sheet(_event=None):
+            current_sheet["name"] = "PG-X" if sheets.index(sheets.select()) == 1 else "Orders"
+            search_var.set("")
+            partita_gg_var.set("")
+            rebuild()
+
+        sheets.bind("<<NotebookTabChanged>>", switch_sheet)
+
+        def save_pg_x(allow_article_mismatch=False):
+            if current_sheet["name"] != "PG-X":
+                return messagebox.showwarning("PG-X Only", "Partita GG can be saved only from the PG-X page.", parent=window)
+            partita_col = search_var.get().strip()
+            partita_gg = partita_gg_var.get().strip()
+            if not partita_col or not partita_gg:
+                return messagebox.showwarning("Missing Data", "Search for one Partita Col and enter its Partita GG.", parent=window)
+            self._save_pg_x_in_background(window, partita_col, partita_gg, datasets, refresh_records, rebuild, partita_gg_var, allow_article_mismatch)
+
+        ttk.Button(search_bar, text="SAVE", width=10, command=save_pg_x).grid(row=0, column=5, sticky="e", padx=(6, 0))
+
+        def edit_pg_x_row(event):
+            if current_sheet["name"] != "PG-X":
+                return
+            iid = tree.identify_row(event.y)
+            if not iid or sheet_by_iid.get(iid) != "PG-X":
+                return
+            record = record_by_iid[iid]
+            editor = tk.Toplevel(window)
+            editor.title("Assign Partita GG")
+            editor.geometry("390x150")
+            editor.resizable(False, False)
+            editor.transient(window)
+            editor.grab_set()
+            form = ttk.Frame(editor, padding=12)
+            form.pack(fill="both", expand=True)
+            form.columnconfigure(1, weight=1)
+            ttk.Label(form, text="Partita Col:").grid(row=0, column=0, sticky="w", pady=5)
+            ttk.Label(form, text=str(record.colored_batch)).grid(row=0, column=1, sticky="w", pady=5)
+            ttk.Label(form, text="Partita GG:").grid(row=1, column=0, sticky="w", pady=5)
+            gg_entry = ttk.Entry(form, width=25)
+            gg_entry.grid(row=1, column=1, sticky="ew", pady=5)
+            gg_entry.insert(0, str(record.raw_batch or ""))
+            expected_raw = str(record.article or "").strip().upper()
+            expected_raw = "G" + expected_raw[1:] if expected_raw.startswith("C") else expected_raw
+            availability_var = tk.StringVar(value=f"Expected raw article: {expected_raw} — loading Magazino...")
+            availability_label = ttk.Label(form, textvariable=availability_var, foreground="#666666", wraplength=340)
+            availability_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 4))
+            stock_by_partita = {}
+            availability_state = {"ready": False, "valid": False, "article_mismatch": False}
+
+            def normal_partita(value):
+                text = str(value or "").strip()
+                try:
+                    number = float(text.replace(",", "."))
+                    return str(int(number)) if number.is_integer() else str(number)
+                except ValueError:
+                    return text.casefold()
+
+            def refresh_availability(*_args):
+                key = normal_partita(gg_entry.get())
+                if not availability_state["ready"]:
+                    availability_var.set(f"Expected raw article: {expected_raw} — loading Magazino...")
+                    return
+                items = stock_by_partita.get(key, [])
+                item = next((candidate for candidate in items if candidate[1] == expected_raw), None)
+                if not items:
+                    availability_state["valid"] = False
+                    availability_state["article_mismatch"] = False
+                    availability_var.set(f"Expected raw article: {expected_raw} — Partita not found")
+                    availability_label.config(foreground="#c62828")
+                else:
+                    available, article = item if item is not None else items[0]
+                    valid = item is not None
+                    availability_state["valid"] = valid
+                    availability_state["article_mismatch"] = not valid
+                    availability_var.set(f"Available: {available:g} rocche — raw article: {article}")
+                    availability_label.config(foreground="#2e7d32" if valid else "#c62828")
+                    if not valid:
+                        availability_var.set(f"Wrong article. Expected {expected_raw}, found {article} ({available:g} rocche)")
+
+            def load_stock():
+                try:
+                    _codes, _density, _vmm, _prices, summary = self._load_common_sources()
+                    if summary is not None:
+                        for row in summary.itertuples(index=False):
+                            article = str(getattr(row, "articolo", "") or "").strip().upper()
+                            partita = normal_partita(getattr(row, "partita", ""))
+                            available = float(getattr(row, "mag_rocche", 0) or 0)
+                            stock_by_partita.setdefault(partita, []).append((available, article))
+                    self.after(0, lambda: (availability_state.update(ready=True), refresh_availability()))
+                except Exception as exc:
+                    self.after(0, lambda: availability_var.set(f"Magazino error: {exc}"))
+
+            gg_entry.bind("<KeyRelease>", refresh_availability)
+            threading.Thread(target=load_stock, daemon=True).start()
+
+            def save_from_editor():
+                value = gg_entry.get().strip()
+                if not value:
+                    return messagebox.showwarning("Missing Partita GG", "Enter Partita GG first.", parent=editor)
+                if not availability_state["ready"]:
+                    return messagebox.showwarning("Magazino", "Wait for Magazino availability to load.", parent=editor)
+                refresh_availability()
+                allow_mismatch = False
+                if not availability_state["valid"]:
+                    if not availability_state["article_mismatch"]:
+                        return messagebox.showerror("Partita Not Found", "This Partita GG was not found in Magazino.", parent=editor)
+                    allow_mismatch = messagebox.askyesno(
+                        "Article Mismatch",
+                        "The raw article is different from the color article. Do you want to save anyway?",
+                        parent=editor,
+                    )
+                    if not allow_mismatch:
+                        return
+                search_var.set(str(record.colored_batch))
+                partita_gg_var.set(value)
+                editor.destroy()
+                save_pg_x(allow_article_mismatch=allow_mismatch)
+
+            ttk.Button(form, text="SAVE", command=save_from_editor).grid(row=3, column=1, sticky="e", pady=(8, 0))
+            gg_entry.focus_set()
+
+        tree.bind("<Double-1>", edit_pg_x_row)
+
+        def toggle(_event=None):
+            iid = tree.identify_row(_event.y) if _event is not None else ""
+            column = tree.identify_column(_event.x) if _event is not None else ""
+            if not iid or column != "#1":
+                return
+            selected[iid] = not selected[iid]
+            values = list(tree.item(iid, "values"))
+            values[0] = "☑" if selected[iid] else "☐"
+            tree.item(iid, values=values)
+            tree.selection_set(iid)
+
+        tree.bind("<ButtonRelease-1>", toggle)
+        actions = ttk.Frame(window, padding=(10, 0, 10, 10))
+        actions.grid(row=2, column=0, sticky="ew")
+        ttk.Label(actions, text="Click Print to select or unselect each color.").pack(side="left")
+        def pg_x_action(action):
+            if current_sheet["name"] != "PG-X":
+                return messagebox.showwarning("PG-X Only", "This action is available only on the PG-X page.", parent=window)
+            selection = tree.selection()
+            if not selection:
+                return messagebox.showwarning("No Row Selected", "Click a PG-X row first.", parent=window)
+            iid = selection[0]
+            partita_col = str(record_by_iid[iid].colored_batch)
+            if action == "delete" and not messagebox.askyesno(
+                "Delete PG-X Row", f"Delete Partita Col {partita_col} from PG-X?", parent=window
+            ):
+                return
+            self._pg_x_row_action_in_background(
+                window, action, partita_col, datasets, refresh_records, rebuild,
+            )
+
+        ttk.Button(actions, text="Send to Orders", command=lambda: pg_x_action("move")).pack(side="left", padx=(16, 4))
+        ttk.Button(actions, text="Delete", command=lambda: pg_x_action("delete")).pack(side="left", padx=4)
+        ttk.Button(actions, text="🖨  Print Selected Biglietti", command=lambda: self._print_selected_shared(window, selected, record_by_iid)).pack(side="right")
+        ttk.Button(actions, text="Close", command=window.destroy).pack(side="right", padx=(0, 8))
+
+    @staticmethod
+    def _toggle_child_maximize(window: tk.Toplevel) -> None:
+        try:
+            window.state("normal" if window.state() == "zoomed" else "zoomed")
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _start_child_drag(window: tk.Toplevel, event) -> None:
+        window._drag_origin = (event.x_root, event.y_root, window.winfo_x(), window.winfo_y())
+
+    @staticmethod
+    def _drag_child(window: tk.Toplevel, event) -> None:
+        origin = getattr(window, "_drag_origin", None)
+        if origin is None:
+            return
+        start_x, start_y, window_x, window_y = origin
+        window.geometry(f"+{window_x + event.x_root - start_x}+{window_y + event.y_root - start_y}")
+
+    @staticmethod
+    def _restore_child_window(window: tk.Toplevel) -> None:
+        try:
+            window.state("normal")
+            window.deiconify()
+        except tk.TclError:
+            pass
+
+    def _save_pg_x_in_background(self, window, partita_col, partita_gg, datasets, refresh_records, rebuild, partita_gg_var, allow_article_mismatch=False):
+        if getattr(self, "_pg_x_saving", False):
+            return
+        self._pg_x_saving = True
+
+        def worker():
+            try:
+                _codes, densita_map, vmm_ratio_map, _prices, magazino_summary = self._load_common_sources()
+                result = save_pg_x_partita(
+                    self.shared_excel_path, partita_col, partita_gg,
+                    densita_map=densita_map, vmm_ratio_map=vmm_ratio_map,
+                    magazino_summary=magazino_summary,
+                    allow_article_mismatch=allow_article_mismatch,
+                )
+                new_datasets = {
+                    "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                    "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                }
+                self.after(0, lambda: finish(result, new_datasets))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: fail(exc))
+
+        def finish(result, new_datasets):
+            self._pg_x_saving = False
+            refresh_records(new_datasets)
+            partita_gg_var.set("")
+            rebuild()
+            messagebox.showinfo(
+                "PG-X Saved",
+                f"Updated {result['updated']} row(s). Available raw yarn: {result['available']:g} rocche.",
+                parent=window,
+            )
+
+        def fail(exc):
+            self._pg_x_saving = False
+            messagebox.showerror("PG-X Save Error", str(exc), parent=window)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pg_x_row_action_in_background(self, window, action, partita_col, datasets, refresh_records, rebuild):
+        if getattr(self, "_pg_x_action_running", False):
+            return
+        self._pg_x_action_running = True
+
+        def worker():
+            try:
+                count = move_pg_x_to_orders(self.shared_excel_path, partita_col) if action == "move" else delete_pg_x_row(self.shared_excel_path, partita_col)
+                new_datasets = {
+                    "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                    "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                }
+                self.after(0, lambda: finish(count, new_datasets))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: fail(exc))
+
+        def finish(count, new_datasets):
+            self._pg_x_action_running = False
+            refresh_records(new_datasets)
+            rebuild()
+            messagebox.showinfo(
+                "PG-X",
+                f"{count} row(s) {'sent to Orders' if action == 'move' else 'deleted'}.",
+                parent=window,
+            )
+
+        def fail(exc):
+            self._pg_x_action_running = False
+            messagebox.showerror("PG-X Error", str(exc), parent=window)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _print_selected_shared(self, window, selected: dict[str, bool], record_by_iid: dict[str, object]):
+        if not self.template_path or not self.template_path.is_file():
+            return messagebox.showwarning("Missing Template", "Select the Biglietti.docx template first.", parent=window)
+        records = [record_by_iid[iid] for iid, is_selected in selected.items() if is_selected]
+        if not records:
+            return messagebox.showwarning("No Orders Selected", "Select at least one color to print.", parent=window)
+        from datetime import datetime
+        destination = self.shared_excel_path.parent / f"Biglietti_Selected_{datetime.now():%Y%m%d_%H%M%S}.docx"
+        window.destroy()
+        self.convert_btn.config(state="disabled")
+        self._set_status("Creating selected Biglietti from shared Excel in progress...")
+        threading.Thread(target=self._worker_shared_biglietti, args=(records, destination), daemon=True).start()
+
+    def _worker_shared_biglietti(self, records, destination: Path):
+        try:
+            export_word(destination, self.template_path, records, stem="Selected Orders")
+            self._set_status(f"Created {len(records)} selected Biglietti.")
+            self.after(0, lambda: messagebox.showinfo("Biglietti", f"Created:\n{destination}"))
+        except Exception as exc:
+            self._logger.exception("Shared Excel Biglietti failed")
+            self._set_status(f"Error: {exc}")
+            self.after(0, lambda exc=exc: messagebox.showerror("Biglietti Error", str(exc)))
+        finally:
+            self.after(0, lambda: self.convert_btn.config(state="normal"))
 
     def _pick_articoli(self):
         p = self._pick_file("Select Articoli.xlsx")
@@ -518,6 +1028,10 @@ class BigliettiTab(ttk.Frame):
             if self.filato_enabled.get() and (not self.filato_output_dir or not Path(self.filato_output_dir).is_dir()):
                 self._pick_output_dir("filato")
                 if not self.filato_output_dir or not Path(self.filato_output_dir).is_dir(): return
+            if not self.shared_excel_path:
+                self._create_shared_excel()
+                if not self.shared_excel_path:
+                    return
         self.convert_btn.config(state="disabled")
         self._set_status("Converting orders and generating tickets in progress...")
         threading.Thread(target=self._worker_convert, daemon=True).start()
@@ -548,8 +1062,9 @@ class BigliettiTab(ttk.Frame):
                     xlsx = out_dir / f"{stem}_ELVY.xlsx"; docx = out_dir / f"{stem}_ELVY_Biglietti.docx"
                     enrich_records(elvy_records, "ELVY", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
                     export_workbook(xlsx, elvy_records, raw, include_filato=True, stem=stem, customer="ELVY", magazino_summary=magazino_summary)
+                    shared_result = append_create_excel(self.shared_excel_path, elvy_records, "ELVY")
                     export_word(docx, template, elvy_records, stem=stem)
-                    created_items.append(f"• ELVY: {len(elvy_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
+                    created_items.append(f"• ELVY: {len(elvy_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
                     self._last_client_files["elvy"] = [xlsx, docx]
                 med_records = [r for r in records if r.customer_code == "3004"]
                 if med_records:
@@ -557,8 +1072,9 @@ class BigliettiTab(ttk.Frame):
                     xlsx = out_dir / f"{stem}_MED.xlsx"; docx = out_dir / f"{stem}_MED_Biglietti.docx"
                     enrich_records(med_records, "MED", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
                     export_workbook(xlsx, med_records, raw, include_filato=True, stem=stem, customer="MED", magazino_summary=magazino_summary)
+                    shared_result = append_create_excel(self.shared_excel_path, med_records, "MED")
                     export_word(docx, template, med_records, stem=stem)
-                    created_items.append(f"• MED: {len(med_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}")
+                    created_items.append(f"• MED: {len(med_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
                     self._last_client_files["med"] = [xlsx, docx]
                 if self.filato_enabled.get() and self.filato_output_dir and raw:
                     out_dir = Path(self.filato_output_dir); out_dir.mkdir(parents=True, exist_ok=True)
