@@ -21,7 +21,7 @@ for _exporter_function in (
     "load_articoli_titolo_map", "load_densita_query", "load_el_kamal_order", "load_order",
     "load_prezzo_lookup", "load_vmm22_ratio_from_magazino", "_filato_rows",
     "append_create_excel", "load_create_excel_records", "save_pg_x_partita",
-    "move_pg_x_to_orders", "delete_pg_x_row",
+    "update_pg_x_row", "update_order_row", "move_pg_x_to_orders", "delete_pg_x_row",
 ):
     globals()[_exporter_function] = _lazy_exporter_call(_exporter_function)
 from utility.articoli_cache import load_articoli_cache, save_articoli_cache
@@ -307,6 +307,13 @@ class BigliettiTab(ttk.Frame):
         current_idx = next((i for i, (address, _name) in enumerate(accounts) if address.casefold() == self._sender_email.casefold()), 0)
         selected = tk.StringVar(value=choices[current_idx])
         ttk.Combobox(form, textvariable=selected, values=choices, state="readonly", width=48).pack(fill="x")
+        ttk.Label(
+            form,
+            text="Don't see an email you already added in Outlook itself? Outlook only reads its "
+                 "account list once, when it starts -- fully quit Outlook (check the Windows system "
+                 "tray, it can keep running there) and reopen it, then try again.",
+            foreground="#555555", wraplength=420, justify="left",
+        ).pack(anchor="w", pady=(6, 0))
 
         def add_account():
             try:
@@ -339,7 +346,12 @@ class BigliettiTab(ttk.Frame):
                     messagebox.showinfo(
                         "Complete Outlook setup",
                         f"In the Outlook window, add and connect:\n\n{new_email.get().strip()}\n\n"
-                        "When finished, open Change sender email again to select it.",
+                        "When finished, open Change sender email again to select it.\n\n"
+                        "Already added it in Outlook but still don't see it here? Outlook keeps "
+                        "the account list loaded in memory from when it started, so just adding "
+                        "the account isn't enough on its own -- fully quit Outlook (check the "
+                        "Windows system tray, it can keep running there after the window is "
+                        "closed) and reopen it, then try Change sender email again.",
                     )
 
                 ttk.Button(add_form, text="Open Outlook account setup", command=launch_setup).pack(anchor="e")
@@ -671,15 +683,15 @@ class BigliettiTab(ttk.Frame):
         ttk.Button(search_bar, text="SAVE", width=10, command=save_pg_x).grid(row=0, column=5, sticky="e", padx=(6, 0))
 
         def edit_pg_x_row(event):
-            if current_sheet["name"] != "PG-X":
+            if current_sheet["name"] not in ("PG-X", "Orders"):
                 return
             iid = tree.identify_row(event.y)
-            if not iid or sheet_by_iid.get(iid) != "PG-X":
+            if not iid or sheet_by_iid.get(iid) != current_sheet["name"]:
                 return
             record = record_by_iid[iid]
             editor = tk.Toplevel(window)
-            editor.title("Assign Partita GG")
-            editor.geometry("390x150")
+            editor.title(f"Edit {current_sheet['name']} Color")
+            editor.geometry("470x300")
             editor.resizable(False, False)
             editor.transient(window)
             editor.grab_set()
@@ -688,16 +700,29 @@ class BigliettiTab(ttk.Frame):
             form.columnconfigure(1, weight=1)
             ttk.Label(form, text="Partita Col:").grid(row=0, column=0, sticky="w", pady=5)
             ttk.Label(form, text=str(record.colored_batch)).grid(row=0, column=1, sticky="w", pady=5)
-            ttk.Label(form, text="Partita GG:").grid(row=1, column=0, sticky="w", pady=5)
-            gg_entry = ttk.Entry(form, width=25)
-            gg_entry.grid(row=1, column=1, sticky="ew", pady=5)
-            gg_entry.insert(0, str(record.raw_batch or ""))
+            fields = (
+                ("Articolo", str(record.article or "")),
+                ("Partita GG", str(record.raw_batch or "")),
+                ("Bagno", str(record.bagno or "")),
+                ("Rocche", "" if record.quantity_cones is None else str(record.quantity_cones)),
+                ("M/C", str(record.machine or "")),
+            )
+            entries = {}
+            for row_idx, (label, value) in enumerate(fields, start=1):
+                ttk.Label(form, text=f"{label}:").grid(row=row_idx, column=0, sticky="w", pady=5)
+                entry = ttk.Combobox(form, width=30, state="normal") if label == "Partita GG" else ttk.Entry(form, width=32)
+                entry.grid(row=row_idx, column=1, sticky="ew", pady=5)
+                entry.insert(0, value)
+                entries[label] = entry
+
+            status_row = len(fields) + 1
             expected_raw = str(record.article or "").strip().upper()
             expected_raw = "G" + expected_raw[1:] if expected_raw.startswith("C") else expected_raw
             availability_var = tk.StringVar(value=f"Expected raw article: {expected_raw} — loading Magazino...")
             availability_label = ttk.Label(form, textvariable=availability_var, foreground="#666666", wraplength=340)
-            availability_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 4))
+            availability_label.grid(row=status_row, column=0, columnspan=2, sticky="w", pady=(2, 4))
             stock_by_partita = {}
+            partita_choices_by_article = {}
             availability_state = {"ready": False, "valid": False, "article_mismatch": False}
 
             def normal_partita(value):
@@ -709,16 +734,24 @@ class BigliettiTab(ttk.Frame):
                     return text.casefold()
 
             def refresh_availability(*_args):
-                key = normal_partita(gg_entry.get())
+                key = normal_partita(entries["Partita GG"].get())
+                article = entries["Articolo"].get().strip().upper()
+                expected = "G" + article[1:] if article.startswith("C") else article
                 if not availability_state["ready"]:
-                    availability_var.set(f"Expected raw article: {expected_raw} — loading Magazino...")
+                    availability_var.set(f"Expected raw article: {expected} — loading Magazino...")
+                    return
+                if not key:
+                    availability_state["valid"] = False
+                    availability_state["article_mismatch"] = False
+                    availability_var.set("Partita GG is blank — the row will remain in PG-X")
+                    availability_label.config(foreground="#666666")
                     return
                 items = stock_by_partita.get(key, [])
-                item = next((candidate for candidate in items if candidate[1] == expected_raw), None)
+                item = next((candidate for candidate in items if candidate[1] == expected), None)
                 if not items:
                     availability_state["valid"] = False
                     availability_state["article_mismatch"] = False
-                    availability_var.set(f"Expected raw article: {expected_raw} — Partita not found")
+                    availability_var.set(f"Expected raw article: {expected} — Partita not found")
                     availability_label.config(foreground="#c62828")
                 else:
                     available, article = item if item is not None else items[0]
@@ -728,7 +761,16 @@ class BigliettiTab(ttk.Frame):
                     availability_var.set(f"Available: {available:g} rocche — raw article: {article}")
                     availability_label.config(foreground="#2e7d32" if valid else "#c62828")
                     if not valid:
-                        availability_var.set(f"Wrong article. Expected {expected_raw}, found {article} ({available:g} rocche)")
+                        availability_var.set(f"Wrong article. Expected {expected}, found {article} ({available:g} rocche)")
+
+            def refresh_partita_choices(*_args):
+                article = entries["Articolo"].get().strip().upper()
+                expected = "G" + article[1:] if article.startswith("C") else article
+                choices = sorted(
+                    partita_choices_by_article.get(expected, set()),
+                    key=lambda value: (normal_partita(value).casefold(), str(value)),
+                )
+                entries["Partita GG"]["values"] = choices
 
             def load_stock():
                 try:
@@ -739,22 +781,27 @@ class BigliettiTab(ttk.Frame):
                             partita = normal_partita(getattr(row, "partita", ""))
                             available = float(getattr(row, "mag_rocche", 0) or 0)
                             stock_by_partita.setdefault(partita, []).append((available, article))
-                    self.after(0, lambda: (availability_state.update(ready=True), refresh_availability()))
+                            if partita:
+                                partita_choices_by_article.setdefault(article, set()).add(partita)
+                    self.after(0, lambda: (availability_state.update(ready=True), refresh_partita_choices(), refresh_availability()))
                 except Exception as exc:
-                    self.after(0, lambda: availability_var.set(f"Magazino error: {exc}"))
+                    self.after(0, lambda exc=exc: availability_var.set(f"Magazino error: {exc}"))
 
-            gg_entry.bind("<KeyRelease>", refresh_availability)
+            entries["Partita GG"].bind("<KeyRelease>", refresh_availability)
+            entries["Partita GG"].bind("<<ComboboxSelected>>", refresh_availability)
+            entries["Articolo"].bind("<KeyRelease>", refresh_partita_choices)
+            entries["Articolo"].bind("<KeyRelease>", refresh_availability, add="+")
             threading.Thread(target=load_stock, daemon=True).start()
 
             def save_from_editor():
-                value = gg_entry.get().strip()
-                if not value:
-                    return messagebox.showwarning("Missing Partita GG", "Enter Partita GG first.", parent=editor)
-                if not availability_state["ready"]:
+                values = {label: entry.get().strip() for label, entry in entries.items()}
+                value = values["Partita GG"]
+                if value and not availability_state["ready"]:
                     return messagebox.showwarning("Magazino", "Wait for Magazino availability to load.", parent=editor)
-                refresh_availability()
+                if value:
+                    refresh_availability()
                 allow_mismatch = False
-                if not availability_state["valid"]:
+                if value and not availability_state["valid"]:
                     if not availability_state["article_mismatch"]:
                         return messagebox.showerror("Partita Not Found", "This Partita GG was not found in Magazino.", parent=editor)
                     allow_mismatch = messagebox.askyesno(
@@ -764,13 +811,15 @@ class BigliettiTab(ttk.Frame):
                     )
                     if not allow_mismatch:
                         return
-                search_var.set(str(record.colored_batch))
-                partita_gg_var.set(value)
                 editor.destroy()
-                save_pg_x(allow_article_mismatch=allow_mismatch)
+                self._save_pg_x_details_in_background(
+                    window, str(record.colored_batch), values, datasets, refresh_records,
+                    rebuild, partita_gg_var, sheet_name=current_sheet["name"],
+                    allow_article_mismatch=allow_mismatch,
+                )
 
-            ttk.Button(form, text="SAVE", command=save_from_editor).grid(row=3, column=1, sticky="e", pady=(8, 0))
-            gg_entry.focus_set()
+            ttk.Button(form, text="SAVE", command=save_from_editor).grid(row=status_row + 1, column=1, sticky="e", pady=(8, 0))
+            entries["Articolo"].focus_set()
 
         tree.bind("<Double-1>", edit_pg_x_row)
 
@@ -836,6 +885,84 @@ class BigliettiTab(ttk.Frame):
             window.deiconify()
         except tk.TclError:
             pass
+
+    def _save_pg_x_details_in_background(
+        self, window, partita_col, values, datasets, refresh_records, rebuild,
+        partita_gg_var, sheet_name="PG-X", allow_article_mismatch=False,
+    ):
+        """Persist the PG-X editor fields, then apply the normal Partita GG flow."""
+        if getattr(self, "_pg_x_saving", False):
+            return
+        self._pg_x_saving = True
+
+        def as_number(text):
+            value = str(text or "").strip()
+            if not value:
+                return ""
+            try:
+                number = float(value.replace(",", "."))
+                return int(number) if number.is_integer() else number
+            except ValueError:
+                return value
+
+        updates = {
+            "Articolo": values.get("Articolo", ""),
+            "Partita GG": values.get("Partita GG", ""),
+            "Bagno": values.get("Bagno", ""),
+            "Rocche": as_number(values.get("Rocche", "")),
+            "M/C": values.get("M/C", ""),
+        }
+
+        def worker():
+            try:
+                partita_gg = str(values.get("Partita GG", "")).strip()
+                if sheet_name == "Orders":
+                    magazino_summary = None
+                    if partita_gg:
+                        _codes, _densita_map, _vmm_ratio_map, _prices, magazino_summary = self._load_common_sources()
+                    result = update_order_row(
+                        self.shared_excel_path, partita_col, updates,
+                        magazino_summary=magazino_summary,
+                        allow_article_mismatch=allow_article_mismatch,
+                    )
+                    if result["moved_to_pgx"]:
+                        message = f"Moved {result['updated']} row(s) to PG-X."
+                    else:
+                        message = f"Updated {result['updated']} row(s) in Orders."
+                else:
+                    update_pg_x_row(self.shared_excel_path, partita_col, updates)
+                    if partita_gg:
+                        _codes, densita_map, vmm_ratio_map, _prices, magazino_summary = self._load_common_sources()
+                        result = save_pg_x_partita(
+                            self.shared_excel_path, partita_col, partita_gg,
+                            densita_map=densita_map, vmm_ratio_map=vmm_ratio_map,
+                            magazino_summary=magazino_summary,
+                            allow_article_mismatch=allow_article_mismatch,
+                        )
+                        message = f"Moved {result['updated']} row(s) to Orders. Available raw yarn: {result['available']:g} rocche."
+                    else:
+                        result = {"updated": 1}
+                        message = "PG-X color updated."
+                new_datasets = {
+                    "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                    "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                }
+                self.after(0, lambda: finish(new_datasets, message))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: fail(exc))
+
+        def finish(new_datasets, message):
+            self._pg_x_saving = False
+            refresh_records(new_datasets)
+            partita_gg_var.set("")
+            rebuild()
+            messagebox.showinfo("PG-X Saved", message, parent=window)
+
+        def fail(exc):
+            self._pg_x_saving = False
+            messagebox.showerror("PG-X Save Error", str(exc), parent=window)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _save_pg_x_in_background(self, window, partita_col, partita_gg, datasets, refresh_records, rebuild, partita_gg_var, allow_article_mismatch=False):
         if getattr(self, "_pg_x_saving", False):

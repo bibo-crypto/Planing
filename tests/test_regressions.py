@@ -876,6 +876,109 @@ class PlanningRegressionTests(unittest.TestCase):
         fake_client.Dispatch.assert_called_once_with("Outlook.Application")
         fake_mail.Display.assert_called_once()
 
+    def test_no_deferred_lambda_captures_dead_except_variable(self):
+        # Regression guard for a recurring bug class: `except E as exc:`
+        # followed by `self.after(0, lambda: ...str(exc)...)` looks fine,
+        # but Python deletes `exc` the moment the except block exits, and
+        # `self.after` runs the lambda *after* that -- it raises NameError
+        # right when showing the user the real error message. The fix is
+        # always `lambda exc=exc: ...` (binds the value at definition time).
+        # This scans every module (not just the ones fixed before) so the
+        # same mistake can't quietly reappear elsewhere.
+        import ast
+        import glob
+
+        violations = []
+        for path in sorted(glob.glob("**/*.py", recursive=True)):
+            if "/.git/" in path or path.startswith("tests/") or path.startswith("tests\\"):
+                continue
+            try:
+                tree = ast.parse(open(path, encoding="utf-8").read())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ExceptHandler) or not node.name:
+                    continue
+                exc_name = node.name
+                for sub in ast.walk(node):
+                    if not isinstance(sub, ast.Lambda):
+                        continue
+                    bound_args = {a.arg for a in sub.args.args + sub.args.kwonlyargs}
+                    if exc_name in bound_args:
+                        continue  # e.g. lambda exc=exc: ... -- safe, value captured at definition time
+                    for name_node in ast.walk(sub.body):
+                        if isinstance(name_node, ast.Name) and name_node.id == exc_name:
+                            violations.append(f"{path}:{sub.lineno}: lambda captures '{exc_name}' from its enclosing except block without binding it as a default argument")
+                            break
+
+        self.assertEqual(violations, [])
+
+    def test_is_newer_version_compares_correctly(self):
+        from utility.updater import is_newer_version
+        self.assertTrue(is_newer_version("1.2.0", "1.1.9"))
+        self.assertTrue(is_newer_version("v2.0.0", "1.9.9"))  # leading "v" tolerated
+        self.assertFalse(is_newer_version("1.1.0", "1.2.0"))
+        self.assertFalse(is_newer_version("1.2.0", "1.2.0"))  # equal -- not "newer"
+
+    def test_safe_extract_blocks_zip_slip(self):
+        import zipfile
+        from utility.updater import _safe_extract
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = Path(temp_dir) / "evil.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("../../evil.txt", "should never land outside destination")
+            destination = Path(temp_dir) / "dest"
+            destination.mkdir()
+            with self.assertRaises(Exception):
+                _safe_extract(zip_path, destination)
+            self.assertFalse((Path(temp_dir) / "evil.txt").exists())
+
+    def test_install_update_requires_frozen_app(self):
+        from utility.updater import install_update
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = Path(temp_dir) / "update.zip"
+            zip_path.write_bytes(b"not a real zip, but frozen-check happens first")
+            with self.assertRaises(RuntimeError):
+                install_update(zip_path, Path(temp_dir) / "install", "2.0.0")
+
+    def test_install_update_generates_backup_and_rollback_script(self):
+        # Regression guard for "what happens if the update fails": the
+        # generated PowerShell must back up the current install before
+        # overwriting it, and roll back to that backup both if the new
+        # build crashes immediately on launch and if the file copy never
+        # succeeds -- not just replace files and hope for the best.
+        import sys
+        import zipfile
+        from unittest.mock import patch
+        import utility.updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            zip_path = temp_dir / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("Planing/Planing.exe", "fake exe bytes")
+            install_dir = temp_dir / "install"
+            install_dir.mkdir()
+
+            captured = {}
+
+            def fake_popen(args, **kwargs):
+                captured["script"] = Path(args[-1]).read_text(encoding="utf-8")
+                return object()
+
+            with patch.object(sys, "frozen", True, create=True), patch("subprocess.Popen", side_effect=fake_popen):
+                updater.install_update(zip_path, install_dir, "2.0.0")
+
+            script = captured["script"]
+            self.assertIn("$backup", script)
+            self.assertIn("Restore-Backup", script)
+            self.assertIn("Copy-Item -LiteralPath $_.FullName -Destination $backup", script)  # backs up BEFORE overwriting
+            self.assertIn("Get-Process -Name 'Planing'", script)  # verifies the new build actually starts running
+            self.assertIn("sawRunning", script)  # tolerates AV closing/relaunching under a different PID
+            self.assertIn("rolling back to the previous version", script)
+            # The rollback path must run for both real failure modes.
+            self.assertEqual(script.count("Restore-Backup"), 3)  # 1 definition + 2 call sites (crash-on-launch, copy-never-succeeded)
+
 
 if __name__ == "__main__":
     unittest.main()

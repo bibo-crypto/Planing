@@ -1097,7 +1097,6 @@ def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -
                 return idx
         return None
 
-    partita_col = col("Partita Col")
     existing = set()
     for candidate_ws, candidate_headers in ((ws, headers), (pg_ws, pg_headers)):
         candidate_col = next((i + 1 for i, h in enumerate(candidate_headers) if _key(h) == _key("Partita Col")), None)
@@ -1182,6 +1181,120 @@ def load_create_excel_records(path: Path, partita_gg: str = "", sheet_name: str 
     if not out:
         raise ValueError(f"No rows were found for Partita GG '{partita_gg}'.")
     return out
+
+
+def update_pg_x_row(path: Path, partita_col: str, updates: dict[str, Any]) -> int:
+    """Update editable fields for a PG-X color without assigning it yet."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path)
+    try:
+        if "PG-X" not in wb.sheetnames:
+            raise ValueError("The shared Excel has no PG-X sheet.")
+        ws = wb["PG-X"]
+        headers = [_clean(c.value) for c in ws[1]]
+
+        def header_col(name):
+            wanted = _key(name)
+            return next((i + 1 for i, value in enumerate(headers) if _key(value) == wanted), None)
+
+        partita_col_idx = header_col("Partita Col")
+        if not partita_col_idx:
+            raise ValueError("Partita Col column is missing.")
+        wanted = _partita_key(partita_col)
+        matches = [
+            row_idx for row_idx in range(2, ws.max_row + 1)
+            if _partita_key(ws.cell(row=row_idx, column=partita_col_idx).value) == wanted
+        ]
+        if not matches:
+            raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+
+        columns = {name: header_col(name) for name in updates}
+        for name, value in updates.items():
+            column = columns[name]
+            if column:
+                for row_idx in matches:
+                    ws.cell(row=row_idx, column=column).value = value
+        _style_sheet(ws, date_columns=("Consegna", "Delivery Date"))
+        wb.save(path)
+        return len(matches)
+    finally:
+        wb.close()
+
+
+def update_order_row(
+    path: Path,
+    partita_col: str,
+    updates: dict[str, Any],
+    magazino_summary=None,
+    allow_article_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Edit an Orders row; clearing Partita GG moves it back to PG-X."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path)
+    try:
+        if "Orders" not in wb.sheetnames or "PG-X" not in wb.sheetnames:
+            raise ValueError("The shared Excel must contain Orders and PG-X sheets.")
+        orders_ws, pg_ws = wb["Orders"], wb["PG-X"]
+        order_headers = [_clean(c.value) for c in orders_ws[1]]
+        pg_headers = [_clean(c.value) for c in pg_ws[1]]
+
+        def header_col(headers, name):
+            wanted = _key(name)
+            return next((i + 1 for i, value in enumerate(headers) if _key(value) == wanted), None)
+
+        part_col_idx = header_col(order_headers, "Partita Col")
+        gg_col_idx = header_col(order_headers, "Partita GG")
+        if not part_col_idx or not gg_col_idx:
+            raise ValueError("Orders is missing Partita Col or Partita GG columns.")
+        wanted = _partita_key(partita_col)
+        matches = [
+            row_idx for row_idx in range(2, orders_ws.max_row + 1)
+            if _partita_key(orders_ws.cell(row=row_idx, column=part_col_idx).value) == wanted
+        ]
+        if not matches:
+            raise ValueError(f"Partita Col '{partita_col}' was not found in Orders.")
+
+        new_gg = _clean(updates.get("Partita GG", ""))
+        if new_gg and magazino_summary is not None:
+            article_col_idx = header_col(order_headers, "Articolo")
+            color_article = _clean(updates.get("Articolo"))
+            if not color_article and article_col_idx:
+                color_article = _clean(orders_ws.cell(row=matches[0], column=article_col_idx).value)
+            color_article = color_article.upper()
+            expected_raw = "G" + color_article[1:] if color_article.startswith("C") else color_article
+            batch_key = _partita_key(new_gg)
+            matching_stock = magazino_summary[
+                (magazino_summary["articolo"].astype(str).str.strip().str.upper() == expected_raw)
+                & (magazino_summary["partita"].map(_partita_key) == batch_key)
+            ]
+            if matching_stock.empty and not allow_article_mismatch:
+                raise ValueError(
+                    f"Partita GG {new_gg} does not belong to article {expected_raw} "
+                    f"required by color article {color_article}."
+                )
+
+        updates_by_header = {header_col(order_headers, name): value for name, value in updates.items()}
+        for row_idx in matches:
+            for column, value in updates_by_header.items():
+                if column:
+                    orders_ws.cell(row=row_idx, column=column).value = value
+
+        moved_to_pgx = not new_gg
+        if moved_to_pgx:
+            for row_idx in matches:
+                pg_values = {header: orders_ws.cell(row=row_idx, column=idx + 1).value for idx, header in enumerate(order_headers)}
+                pg_ws.append([pg_values.get(header, "") for header in pg_headers])
+            for row_idx in reversed(matches):
+                orders_ws.delete_rows(row_idx, 1)
+
+        _style_sheet(orders_ws, date_columns=("Consegna", "Delivery Date"))
+        _style_sheet(pg_ws, date_columns=("Consegna", "Delivery Date"))
+        wb.save(path)
+        return {"updated": len(matches), "moved_to_pgx": moved_to_pgx}
+    finally:
+        wb.close()
 
 
 def save_pg_x_partita(

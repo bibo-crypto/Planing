@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
-import tkinter as tk
 from tkinter import ttk
 
 
