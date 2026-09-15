@@ -228,7 +228,7 @@ class ConverterApp(tk.Tk):
                 )
                 self.after(0, self._finish_update, installer)
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._update_failed(str(exc)))
+                self.after(0, lambda exc=exc: self._update_failed(str(exc)))
 
         import threading
         threading.Thread(target=worker, name="planing-update-download", daemon=True).start()

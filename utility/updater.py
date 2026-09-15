@@ -174,9 +174,14 @@ def install_update(zip_path: Path, install_dir: Path, new_version: str) -> None:
     """Stage a ZIP update and start a hidden process that replaces files later.
 
     The running EXE cannot replace itself. The generated PowerShell helper
-    waits for Planing to exit, copies the new application files over the
-    existing installation, then starts the new EXE. User settings/data live
-    in AppData and are never touched.
+    waits for Planing to exit, backs up the current installation, copies
+    the new application files over it, starts the new EXE, and verifies it
+    actually stays running -- if the new build crashes immediately on
+    launch, or the file copy never succeeds, it automatically restores the
+    backup and relaunches the previous, known-working version instead of
+    leaving the install broken or, worse, leaving nothing running at all.
+    User settings/data live in AppData and are never touched by either the
+    update or the rollback.
     """
     if not zip_path.is_file():
         raise FileNotFoundError(zip_path)
@@ -195,26 +200,82 @@ def install_update(zip_path: Path, install_dir: Path, new_version: str) -> None:
 
         script_path = stage_root.parent / f"Planing_Update_{os.getpid()}.ps1"
         exe_path = install_dir / "Planing.exe"
+        # A sibling of install_dir, not inside it, so clearing/restoring
+        # install_dir during a rollback never touches the backup itself.
+        # Overwritten fresh on every update -- always exactly one, most
+        # recent known-good version to fall back to.
+        backup_dir = install_dir.parent / "Planing_Backup"
         script = f"""$ErrorActionPreference = 'Stop'
 $log = Join-Path $env:TEMP 'Planing_Update.log'
-Start-Sleep -Seconds 3
+# Give the old process time to fully exit and release its file locks
+# before the very first copy attempt -- a cold machine (or one under
+# antivirus real-time scanning) can take noticeably longer than a dev
+# box to let go of the exe/DLLs.
+Start-Sleep -Seconds 5
 $source = {_powershell_quote(source_dir)}
 $target = {_powershell_quote(install_dir)}
+$backup = {_powershell_quote(backup_dir)}
+$exePath = {_powershell_quote(exe_path)}
+function Restore-Backup {{
+    Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $backup -Force | ForEach-Object {{
+        Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force
+    }}
+}}
 try {{
+    if (Test-Path -LiteralPath $backup) {{ Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }}
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+    Get-ChildItem -LiteralPath $target -Force | ForEach-Object {{
+        Copy-Item -LiteralPath $_.FullName -Destination $backup -Recurse -Force
+    }}
+
+    $copied = $false
     for ($attempt = 1; $attempt -le 20; $attempt++) {{
         try {{
             Get-ChildItem -LiteralPath $source -Force | ForEach-Object {{
                 Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force -ErrorAction Stop
             }}
-            if (Test-Path -LiteralPath {_powershell_quote(exe_path)}) {{
-                Set-Content -LiteralPath (Join-Path $target 'version.txt') -Value {_powershell_quote(new_version)} -Encoding UTF8
-                Start-Process -FilePath {_powershell_quote(exe_path)} -WorkingDirectory {_powershell_quote(install_dir)}
+            if (Test-Path -LiteralPath $exePath) {{
+                $copied = $true
                 break
             }}
         }} catch {{
             $_ | Out-File -FilePath $log -Append
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
         }}
+    }}
+
+    if ($copied) {{
+        Set-Content -LiteralPath (Join-Path $target 'version.txt') -Value {_powershell_quote(new_version)} -Encoding UTF8
+        Start-Process -FilePath $exePath -WorkingDirectory $target
+        # Antivirus commonly intercepts a freshly-written, unsigned exe on
+        # its first launch -- it can run its own scan/sandbox pass, kill
+        # that first process, and start a *different* one afterwards, on
+        # top of an already slower cold start. Watching one specific PID
+        # (Start-Process -PassThru) would misread that AV cycle as a crash,
+        # and a short fixed wait isn't enough either -- this has been
+        # observed taking close to a minute in practice. So instead: poll
+        # by process name (survives the PID changing under AV) for up to 3
+        # minutes, and succeed the moment Planing.exe is seen running even
+        # once -- a genuine crash never shows up running at all, no matter
+        # how long or how many times checked.
+        $sawRunning = $false
+        for ($check = 1; $check -le 36; $check++) {{
+            Start-Sleep -Seconds 5
+            if (Get-Process -Name 'Planing' -ErrorAction SilentlyContinue) {{
+                $sawRunning = $true
+                break
+            }}
+        }}
+        if (-not $sawRunning) {{
+            "New version never started running within 3 minutes -- rolling back to the previous version" | Out-File -FilePath $log -Append
+            Restore-Backup
+            Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
+        }}
+    }} else {{
+        "Update copy never succeeded after 20 attempts -- rolling back to the previous version" | Out-File -FilePath $log -Append
+        Restore-Backup
+        Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
     }}
     }} catch {{ $_ | Out-File -FilePath $log -Append }}
 Remove-Item -LiteralPath {_powershell_quote(zip_path)} -Force -ErrorAction SilentlyContinue
