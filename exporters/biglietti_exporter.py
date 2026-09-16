@@ -1256,7 +1256,16 @@ def update_order_row(
         if not matches:
             raise ValueError(f"Partita Col '{partita_col}' was not found in Orders.")
 
-        new_gg = _clean(updates.get("Partita GG", ""))
+        # "Partita GG" may not be in *updates* at all (e.g. a caller only
+        # changing Articolo) -- that must never be read as "cleared" (which
+        # would wrongly move the row to PG-X) nor let a changed Articolo
+        # skip validation against whatever Partita GG the row already has.
+        # Only an explicit, empty "Partita GG" in updates means "clear it".
+        partita_gg_submitted = "Partita GG" in updates
+        if partita_gg_submitted:
+            new_gg = _clean(updates.get("Partita GG", ""))
+        else:
+            new_gg = _clean(orders_ws.cell(row=matches[0], column=gg_col_idx).value)
         if new_gg and magazino_summary is not None:
             article_col_idx = header_col(order_headers, "Articolo")
             color_article = _clean(updates.get("Articolo"))
@@ -1281,7 +1290,7 @@ def update_order_row(
                 if column:
                     orders_ws.cell(row=row_idx, column=column).value = value
 
-        moved_to_pgx = not new_gg
+        moved_to_pgx = partita_gg_submitted and not new_gg
         if moved_to_pgx:
             for row_idx in matches:
                 pg_values = {header: orders_ws.cell(row=row_idx, column=idx + 1).value for idx, header in enumerate(order_headers)}

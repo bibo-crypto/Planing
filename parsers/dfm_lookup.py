@@ -171,6 +171,7 @@ def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list
 
     missing = [c for c in REQUIRED_COLUMNS if c not in headers]
     if missing:
+        wb.close()
         raise ValueError(
             f"This file doesn't look like a DFM export — missing column(s): "
             f"{', '.join(missing)}"
