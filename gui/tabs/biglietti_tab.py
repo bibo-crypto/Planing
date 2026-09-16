@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -90,12 +91,21 @@ class BigliettiTab(ttk.Frame):
         content.columnconfigure(0, weight=1)
         style = ttk.Style(self)
         style.configure("Bold.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("PageTitle.TLabel", font=("Segoe UI", 17, "bold"), foreground="#16324F")
+        style.configure("PageSubtitle.TLabel", font=("Segoe UI", 9), foreground="#5B6B7A")
+        style.configure("Section.TLabelframe", padding=10)
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"), foreground="#16324F")
+        style.configure("Hint.TLabel", font=("Segoe UI", 8), foreground="#64748B")
         header_frame = ttk.Frame(content)
         header_frame.pack(fill="x", padx=4, pady=(0, 10))
-        ttk.Label(header_frame, text="Order Extraction & Dyeing Tickets", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(header_frame, text="Single Order Data + Dispo-Bagno for all clients (ELVY, MED, EL KAMAL) — format is automatically recognized.", foreground="#666666", wraplength=950).pack(anchor="w", pady=(2, 0))
+        ttk.Label(header_frame, text="Create Excel + Biglietti", style="PageTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            header_frame,
+            text="Convert order data into dyeing tickets and a shared Excel workbook for ELVY, MED, and EL KAMAL.",
+            style="PageSubtitle.TLabel", wraplength=950,
+        ).pack(anchor="w", pady=(3, 0))
 
-        input_box = ttk.LabelFrame(content, text=" 📁 Main Input Files (Required) ", padding=10)
+        input_box = ttk.LabelFrame(content, text=" 1. Main input files (required) ", style="Section.TLabelframe")
         input_box.pack(fill="x", padx=4, pady=(0, 10))
         input_box.columnconfigure(1, weight=1)
         ttk.Button(input_box, text="📂  Select Order Data", command=self._pick_data, width=24).grid(row=0, column=0, sticky="w", pady=4)
@@ -105,14 +115,14 @@ class BigliettiTab(ttk.Frame):
         self.biglietti_dispo_path_label = ttk.Label(input_box, text="No file selected (optional if embedded)", foreground="grey", anchor="w")
         self.biglietti_dispo_path_label.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
 
-        template_box = ttk.LabelFrame(content, text=" 📝 Select Forma Biglietti ", padding=10)
+        template_box = ttk.LabelFrame(content, text=" 2. Ticket template ", style="Section.TLabelframe")
         template_box.pack(fill="x", padx=4, pady=(0, 10))
         template_box.columnconfigure(1, weight=1)
         ttk.Button(template_box, text="📄  Select Forma Biglietti", command=self._pick_template, width=24).grid(row=0, column=0, sticky="w", pady=4)
         self.template_path_label = ttk.Label(template_box, text="Searching for Biglietti.docx...", foreground="grey", anchor="w")
         self.template_path_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
 
-        opt_box = ttk.LabelFrame(content, text=" ⚙️ Optional Data Sources (Shared across all clients) ", padding=10)
+        opt_box = ttk.LabelFrame(content, text=" 3. Optional shared data sources ", style="Section.TLabelframe")
         opt_box.pack(fill="x", padx=4, pady=(0, 10))
         opt_box.columnconfigure(1, weight=1)
         self.articoli_btn = ttk.Button(opt_box, text="📂  Articles (Titolo)", command=self._pick_articoli, width=24)
@@ -132,15 +142,18 @@ class BigliettiTab(ttk.Frame):
         self.prezzi_label = ttk.Label(info_frame, text="• Price: Uses Price List (Listini) loaded in Prices / Situation", foreground="#555555", font=("Segoe UI", 8))
         self.prezzi_label.grid(row=0, column=1, sticky="w")
 
-        export_box = ttk.LabelFrame(content, text=" 📂 Output Destinations & Settings ", padding=10)
+        export_box = ttk.LabelFrame(content, text=" 4. Client output folders and email actions ", style="Section.TLabelframe")
         export_box.pack(fill="x", padx=4, pady=(0, 10))
         export_box.columnconfigure(1, weight=1)
-        self._build_folder_row(export_box, 0, "elvy", "📁  ELVY Output Folder", show_email_buttons=True)
-        self._build_folder_row(export_box, 1, "med", "📁  MED Output Folder", show_email_buttons=True)
-        self._build_folder_row(export_box, 2, "el_kamal", "📁  EL KAMAL Output Folder", show_email_buttons=True)
-        self._build_folder_row(export_box, 3, "filato", "📁  Filato Output Folder", with_checkbox=True)
+        ttk.Label(export_box, text="Client / destination", style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(export_box, text="Selected folder", style="Hint.TLabel").grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
+        ttk.Label(export_box, text="Client-specific actions", style="Hint.TLabel").grid(row=0, column=2, sticky="e", padx=(10, 0), pady=(0, 4))
+        self._build_folder_row(export_box, 1, "elvy", "📁  ELVY Output Folder", show_email_buttons=True)
+        self._build_folder_row(export_box, 2, "med", "📁  MED Output Folder", show_email_buttons=True)
+        self._build_folder_row(export_box, 3, "el_kamal", "📁  EL KAMAL Output Folder", show_email_buttons=True)
+        self._build_folder_row(export_box, 4, "filato", "📁  Filato Output Folder", with_checkbox=True)
 
-        shared_box = ttk.LabelFrame(content, text=" 📚 Shared Create Excel (MED / ELVY) ", padding=10)
+        shared_box = ttk.LabelFrame(content, text=" 5. Shared Create Excel workbook ", style="Section.TLabelframe")
         shared_box.pack(fill="x", padx=4, pady=(0, 10))
         shared_box.columnconfigure(1, weight=1)
         shared_buttons = ttk.Frame(shared_box)
@@ -151,7 +164,7 @@ class BigliettiTab(ttk.Frame):
         self.shared_excel_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
         ttk.Button(shared_box, text="📋  Show Orders", command=self._show_shared_orders, width=24).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        action_box = ttk.Frame(content)
+        action_box = ttk.LabelFrame(content, text=" 6. Generate ", style="Section.TLabelframe")
         action_box.pack(fill="x", padx=4, pady=(8, 4))
         action_box.columnconfigure(0, weight=1)
         self.convert_btn = ttk.Button(action_box, text="⚡  Convert & Generate Tickets (Excel + Word)", command=self._run_convert, width=42, style="Bold.TButton")
@@ -174,14 +187,15 @@ class BigliettiTab(ttk.Frame):
         lab.grid(row=row_idx, column=1, sticky="ew", padx=(10, 0), pady=4)
         setattr(self, f"{kind}_dir_label", lab)
         if show_email_buttons:
+            client_name = {"elvy": "ELVY", "med": "MED", "el_kamal": "EL KAMAL"}.get(kind, kind.upper())
             email_frame = ttk.Frame(parent)
             email_frame.grid(row=row_idx, column=2, sticky="e", padx=(10, 0), pady=4)
             ttk.Button(
-                email_frame, text="✉ Template", width=11,
+                email_frame, text=f"✉ {client_name} Template", width=18,
                 command=lambda: self._open_email_template_editor(kind),
             ).pack(side="left", padx=(0, 4))
             ttk.Button(
-                email_frame, text="📧 Prepare Email", width=16,
+                email_frame, text=f"📧 {client_name} Prepare Email", width=22,
                 command=lambda: self._prepare_email(kind),
             ).pack(side="left")
 
@@ -630,7 +644,30 @@ class BigliettiTab(ttk.Frame):
                 "Cliente MED": record.cliente_med, "POLMON": polmon, "Color Tube": record.color_tube,
                 "VMM22": record.vmm22, "Prezzo": record.prezzo, "Densita` (360-390)": record.densita,
             }
-            return tuple(["☑" if selected[iid] else "☐"] + [values.get(name, "") for name in excel_columns])
+
+            def display_value(name, value):
+                if name not in {"Consegna", "Delivery Date"} or value in (None, ""):
+                    return value
+                if isinstance(value, datetime):
+                    return value.strftime("%d/%m/%Y")
+                if isinstance(value, date):
+                    return value.strftime("%d/%m/%Y")
+                text = str(value).strip()
+                for parser in (
+                    lambda: datetime.fromisoformat(text.replace("Z", "+00:00")),
+                    lambda: datetime.strptime(text, "%Y/%m/%d"),
+                    lambda: datetime.strptime(text, "%d/%m/%Y"),
+                ):
+                    try:
+                        return parser().strftime("%d/%m/%Y")
+                    except (ValueError, TypeError):
+                        pass
+                return text
+
+            return tuple(
+                ["☑" if selected[iid] else "☐"]
+                + [display_value(name, values.get(name, "")) for name in excel_columns]
+            )
 
         def sort_by(column):
             if sort_state["column"] == column:
@@ -708,9 +745,15 @@ class BigliettiTab(ttk.Frame):
                 ("M/C", str(record.machine or "")),
             )
             entries = {}
+            machine_choices = tuple(str(machine) for machine in range(3, 13))
             for row_idx, (label, value) in enumerate(fields, start=1):
                 ttk.Label(form, text=f"{label}:").grid(row=row_idx, column=0, sticky="w", pady=5)
-                entry = ttk.Combobox(form, width=30, state="normal") if label == "Partita GG" else ttk.Entry(form, width=32)
+                if label in {"Articolo", "Partita GG"}:
+                    entry = ttk.Combobox(form, width=30, state="normal")
+                elif label == "M/C":
+                    entry = ttk.Combobox(form, width=30, values=machine_choices, state="normal")
+                else:
+                    entry = ttk.Entry(form, width=32)
                 entry.grid(row=row_idx, column=1, sticky="ew", pady=5)
                 entry.insert(0, value)
                 entries[label] = entry
@@ -723,6 +766,7 @@ class BigliettiTab(ttk.Frame):
             availability_label.grid(row=status_row, column=0, columnspan=2, sticky="w", pady=(2, 4))
             stock_by_partita = {}
             partita_choices_by_article = {}
+            articolo_choices = set()
             availability_state = {"ready": False, "valid": False, "article_mismatch": False}
 
             def normal_partita(value):
@@ -772,6 +816,9 @@ class BigliettiTab(ttk.Frame):
                 )
                 entries["Partita GG"]["values"] = choices
 
+            def refresh_articolo_choices(*_args):
+                entries["Articolo"]["values"] = sorted(articolo_choices, key=str.casefold)
+
             def load_stock():
                 try:
                     _codes, _density, _vmm, _prices, summary = self._load_common_sources()
@@ -781,16 +828,21 @@ class BigliettiTab(ttk.Frame):
                             partita = normal_partita(getattr(row, "partita", ""))
                             available = float(getattr(row, "mag_rocche", 0) or 0)
                             stock_by_partita.setdefault(partita, []).append((available, article))
+                            if article:
+                                articolo_choices.add("C" + article[1:] if article.startswith("G") else article)
                             if partita:
                                 partita_choices_by_article.setdefault(article, set()).add(partita)
-                    self.after(0, lambda: (availability_state.update(ready=True), refresh_partita_choices(), refresh_availability()))
+                    self.after(0, lambda: (availability_state.update(ready=True), refresh_articolo_choices(), refresh_partita_choices(), refresh_availability()))
                 except Exception as exc:
                     self.after(0, lambda exc=exc: availability_var.set(f"Magazino error: {exc}"))
 
             entries["Partita GG"].bind("<KeyRelease>", refresh_availability)
             entries["Partita GG"].bind("<<ComboboxSelected>>", refresh_availability)
-            entries["Articolo"].bind("<KeyRelease>", refresh_partita_choices)
+            entries["Articolo"].bind("<KeyRelease>", refresh_articolo_choices)
+            entries["Articolo"].bind("<KeyRelease>", refresh_partita_choices, add="+")
             entries["Articolo"].bind("<KeyRelease>", refresh_availability, add="+")
+            entries["Articolo"].bind("<<ComboboxSelected>>", refresh_partita_choices)
+            entries["Articolo"].bind("<<ComboboxSelected>>", refresh_availability, add="+")
             threading.Thread(target=load_stock, daemon=True).start()
 
             def save_from_editor():
@@ -1041,8 +1093,9 @@ class BigliettiTab(ttk.Frame):
         records = [record_by_iid[iid] for iid, is_selected in selected.items() if is_selected]
         if not records:
             return messagebox.showwarning("No Orders Selected", "Select at least one color to print.", parent=window)
-        from datetime import datetime
-        destination = self.shared_excel_path.parent / f"Biglietti_Selected_{datetime.now():%Y%m%d_%H%M%S}.docx"
+        # Keep one stable output file: every print replaces the previous
+        # document with only the records selected in the current view.
+        destination = self.shared_excel_path.parent / "Biglietti_Selected.docx"
         window.destroy()
         self.convert_btn.config(state="disabled")
         self._set_status("Creating selected Biglietti from shared Excel in progress...")

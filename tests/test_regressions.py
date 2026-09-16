@@ -505,6 +505,94 @@ class PlanningRegressionTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].partita, "222111")  # only the newer order's row remains
 
+    def test_update_pg_x_row_edits_fields_without_moving_it(self):
+        from exporters.biglietti_exporter import OrderRecord, append_create_excel, update_pg_x_row, load_create_excel_records
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            record = OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S", description="", additional_raw="",
+                color_code="5305", color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch="157890", raw_batch="PG-X", quantity_cones=32, raw_weight=30,
+                dispo="D-00505450-001", bagno="S940",
+            )
+            append_create_excel(path, [record], "ELVY")
+
+            updated = update_pg_x_row(path, "157890", {"Bagno": "S999", "Rocche": 40, "M/C": "5"})
+            self.assertEqual(updated, 1)
+
+            pg_x_rows = load_create_excel_records(path, sheet_name="PG-X")
+            orders_rows = load_create_excel_records(path, sheet_name="Orders")
+            self.assertEqual(len(pg_x_rows), 1)  # still in PG-X -- Partita GG was never filled in
+            self.assertEqual(len(orders_rows), 0)
+            self.assertEqual(pg_x_rows[0].bagno, "S999")
+            self.assertEqual(pg_x_rows[0].quantity_cones, 40)
+
+    def test_update_order_row_clearing_partita_gg_moves_row_back_to_pg_x(self):
+        from exporters.biglietti_exporter import OrderRecord, append_create_excel, update_order_row, load_create_excel_records
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            record = OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S", description="", additional_raw="",
+                color_code="5305", color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch="157890", raw_batch="158694", quantity_cones=32, raw_weight=30,
+                dispo="D-00505450-001", bagno="S940",
+            )
+            append_create_excel(path, [record], "ELVY")
+            self.assertEqual(len(load_create_excel_records(path, sheet_name="Orders")), 1)
+
+            result = update_order_row(path, "157890", {"Partita GG": ""})
+            self.assertTrue(result["moved_to_pgx"])
+            self.assertEqual(len(load_create_excel_records(path, sheet_name="Orders")), 0)
+            self.assertEqual(len(load_create_excel_records(path, sheet_name="PG-X")), 1)
+
+    def test_update_order_row_rejects_articolo_change_that_no_longer_matches_stock(self):
+        # Regression guard for "make sure it checks if I change the Articolo
+        # on the same page" -- changing Articolo must re-validate against
+        # Magazino for the row's existing Partita GG, not just trust it.
+        from exporters.biglietti_exporter import OrderRecord, append_create_excel, update_order_row
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            record = OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S", description="", additional_raw="",
+                color_code="5305", color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch="157890", raw_batch="158694", quantity_cones=32, raw_weight=30,
+                dispo="D-00505450-001", bagno="S940",
+            )
+            append_create_excel(path, [record], "ELVY")
+
+            magazino = pd.DataFrame([{"articolo": "G130027S", "partita": "158694", "mag_rocche": 32, "mag_peso": 300.0}])
+            with self.assertRaises(ValueError):
+                # Change Articolo to something whose raw article (G999999S)
+                # was never stocked under Partita 158694.
+                update_order_row(path, "157890", {"Articolo": "C999999S"}, magazino_summary=magazino)
+
+            # Allowed explicitly when the user confirms the mismatch.
+            result = update_order_row(
+                path, "157890", {"Articolo": "C999999S"},
+                magazino_summary=magazino, allow_article_mismatch=True,
+            )
+            self.assertEqual(result["updated"], 1)
+
+    def test_update_order_row_partial_update_does_not_accidentally_clear_partita_gg(self):
+        # A caller that only sends {"Articolo": ...} (no "Partita GG" key
+        # at all) must not have that read as "Partita GG cleared" -- that
+        # would wrongly move an untouched row into PG-X.
+        from exporters.biglietti_exporter import OrderRecord, append_create_excel, update_order_row, load_create_excel_records
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            record = OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S", description="", additional_raw="",
+                color_code="5305", color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch="157890", raw_batch="158694", quantity_cones=32, raw_weight=30,
+                dispo="D-00505450-001", bagno="S940",
+            )
+            append_create_excel(path, [record], "ELVY")
+
+            result = update_order_row(path, "157890", {"Bagno": "S999"})
+            self.assertFalse(result["moved_to_pgx"])
+            self.assertEqual(len(load_create_excel_records(path, sheet_name="Orders")), 1)
+            self.assertEqual(len(load_create_excel_records(path, sheet_name="PG-X")), 0)
+
     def test_ordini_full_replaces_previous_order_content(self):
         from pipelines.ordini_elvy import export_ordini_full, OrdiniElvyRow
         with tempfile.TemporaryDirectory() as temp_dir:
