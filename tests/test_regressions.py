@@ -1052,6 +1052,7 @@ class PlanningRegressionTests(unittest.TestCase):
 
             def fake_popen(args, **kwargs):
                 captured["script"] = Path(args[-1]).read_text(encoding="utf-8")
+                captured["creationflags"] = kwargs.get("creationflags", 0)
                 return object()
 
             with patch.object(sys, "frozen", True, create=True), patch("subprocess.Popen", side_effect=fake_popen):
@@ -1066,6 +1067,50 @@ class PlanningRegressionTests(unittest.TestCase):
             self.assertIn("rolling back to the previous version", script)
             # The rollback path must run for both real failure modes.
             self.assertEqual(script.count("Restore-Backup"), 3)  # 1 definition + 2 call sites (crash-on-launch, copy-never-succeeded)
+
+    def test_install_update_detaches_helper_from_any_job_object(self):
+        # Regression guard: if Planing.exe runs inside a Windows Job Object
+        # (some launchers/security software do this), closing the parent
+        # can silently kill an undetached child the instant the parent
+        # exits -- the update helper would never get to run at all, and
+        # the person is left thinking the update just silently failed.
+        # CREATE_BREAKAWAY_FROM_JOB (+ CREATE_NEW_PROCESS_GROUP) makes sure
+        # it survives regardless.
+        import subprocess
+        import sys
+        import zipfile
+        from unittest.mock import patch
+        import utility.updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            zip_path = temp_dir / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("Planing/Planing.exe", "fake exe bytes")
+            install_dir = temp_dir / "install"
+            install_dir.mkdir()
+
+            captured = {}
+
+            def fake_popen(args, **kwargs):
+                captured["creationflags"] = kwargs.get("creationflags", 0)
+                return object()
+
+            fake_flags = type("F", (), {
+                "CREATE_NO_WINDOW": 0x08000000,
+                "CREATE_NEW_PROCESS_GROUP": 0x00000200,
+                "CREATE_BREAKAWAY_FROM_JOB": 0x01000000,
+            })
+            with patch.object(sys, "frozen", True, create=True), \
+                 patch("subprocess.Popen", side_effect=fake_popen), \
+                 patch.object(subprocess, "CREATE_NO_WINDOW", fake_flags.CREATE_NO_WINDOW, create=True), \
+                 patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", fake_flags.CREATE_NEW_PROCESS_GROUP, create=True), \
+                 patch.object(subprocess, "CREATE_BREAKAWAY_FROM_JOB", fake_flags.CREATE_BREAKAWAY_FROM_JOB, create=True):
+                updater.install_update(zip_path, install_dir, "2.0.0")
+
+            flags = captured["creationflags"]
+            self.assertTrue(flags & fake_flags.CREATE_BREAKAWAY_FROM_JOB)
+            self.assertTrue(flags & fake_flags.CREATE_NEW_PROCESS_GROUP)
 
 
 if __name__ == "__main__":

@@ -1470,6 +1470,33 @@ def delete_pg_x_row(path: Path, partita_col: str) -> int:
     return len(matches)
 
 
+def delete_shipped_shared_rows(path: Path, partita_cols, sheet_name: str) -> int:
+    """Delete rows in one shared-workbook sheet whose Partita Col shipped."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"The shared Excel has no '{sheet_name}' sheet.")
+        ws = wb[sheet_name]
+        headers = [_clean(c.value) for c in ws[1]]
+        col_idx = next((i + 1 for i, h in enumerate(headers) if _key(h) == _key("Partita Col")), None)
+        if not col_idx:
+            raise ValueError("Partita Col column is missing.")
+        shipped = {_partita_key(value) for value in partita_cols if _partita_key(value)}
+        matches = [
+            row_idx for row_idx in range(2, ws.max_row + 1)
+            if _partita_key(ws.cell(row=row_idx, column=col_idx).value) in shipped
+        ]
+        for row_idx in reversed(matches):
+            ws.delete_rows(row_idx, 1)
+        _style_sheet(ws, date_columns=("Consegna", "Delivery Date"))
+        wb.save(path)
+        return len(matches)
+    finally:
+        wb.close()
+
+
 def export_filato_workbook(
     path: Path,
     records: list["OrderRecord"],
@@ -1590,6 +1617,17 @@ def export_word(path: Path, template_path: Path, records: list[OrderRecord], ste
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Inches
+
+    # Keep the ticket pages in the same numeric Partita Col order as the
+    # extracted Excel sheet.  MED source rows are not always delivered in
+    # that order, so sorting only the workbook is not enough.
+    records = sorted(
+        records,
+        key=lambda record: (
+            _number(record.colored_batch) is None,
+            _number(record.colored_batch) if _number(record.colored_batch) is not None else 0,
+        ),
+    )
 
     doc = Document(str(template_path))
     if not doc.tables:
