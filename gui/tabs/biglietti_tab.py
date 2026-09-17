@@ -23,6 +23,7 @@ for _exporter_function in (
     "load_prezzo_lookup", "load_vmm22_ratio_from_magazino", "_filato_rows",
     "append_create_excel", "load_create_excel_records", "save_pg_x_partita",
     "update_pg_x_row", "update_order_row", "move_pg_x_to_orders", "delete_pg_x_row",
+    "delete_shipped_shared_rows",
 ):
     globals()[_exporter_function] = _lazy_exporter_call(_exporter_function)
 from utility.articoli_cache import load_articoli_cache, save_articoli_cache
@@ -46,6 +47,15 @@ from utility.utils import keep_window_on_top, lazy_call
 # not the old per-order-named "{order file}_Filato.xlsx" snapshot.
 export_filato_full = lazy_call("pipelines.ordini_elvy", "export_filato_full")
 RawYarnMatch = lazy_call("pipelines.ordini_elvy", "RawYarnMatch")
+
+
+def _split_pg_x_records(records):
+    """Return (ready, pg_x) records for separate Word ticket files."""
+    ready, pg_x = [], []
+    for record in records:
+        raw_batch = str(record.raw_batch or "").strip().upper().replace(" ", "")
+        (pg_x if raw_batch in {"", "X", "PG-X", "PGX"} else ready).append(record)
+    return ready, pg_x
 
 
 class BigliettiTab(ttk.Frame):
@@ -586,6 +596,8 @@ class BigliettiTab(ttk.Frame):
         tree_style = ttk.Style(window)
         tree_style.configure("Orders.Treeview", rowheight=28, background="#ffffff", fieldbackground="#ffffff")
         tree_style.configure("Orders.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        tree_style.configure("Danger.TButton", foreground="#ffffff", background="#c62828", font=("Segoe UI", 9, "bold"))
+        tree_style.map("Danger.TButton", background=[("active", "#8e0000"), ("pressed", "#8e0000")], foreground=[("disabled", "#eeeeee"), ("!disabled", "#ffffff")])
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse", style="Orders.Treeview")
         tree.tag_configure("odd", background="#e8f1fa", foreground="#172b4d")
         tree.tag_configure("even", background="#ffffff", foreground="#172b4d")
@@ -606,7 +618,8 @@ class BigliettiTab(ttk.Frame):
         selected: dict[str, bool] = {}
         record_by_iid: dict[str, object] = {}
         sheet_by_iid: dict[str, str] = {}
-        sort_state = {"column": None, "reverse": False}
+        partita_col_tree_column = f"excel_{excel_columns.index('Partita Col')}"
+        sort_state = {"column": partita_col_tree_column, "reverse": False}
         current_sheet = {"name": "Orders"}
         for sheet_name, sheet_records in datasets.items():
             for index, record in enumerate(sheet_records):
@@ -692,7 +705,18 @@ class BigliettiTab(ttk.Frame):
                 visible_rows.append((iid, record))
             if sort_state["column"] is not None:
                 sort_index = columns.index(sort_state["column"])
-                visible_rows.sort(key=lambda pair: str(values_for(pair[1], pair[0])[sort_index] or "").casefold(), reverse=sort_state["reverse"])
+                if sort_state["column"] == partita_col_tree_column:
+                    def partita_sort_key(pair):
+                        value = str(pair[1].colored_batch or "").strip().replace(",", ".")
+                        try:
+                            number = float(value)
+                            return (False, number, "")
+                        except ValueError:
+                            return (True, 0, value.casefold())
+
+                    visible_rows.sort(key=partita_sort_key, reverse=sort_state["reverse"])
+                else:
+                    visible_rows.sort(key=lambda pair: str(values_for(pair[1], pair[0])[sort_index] or "").casefold(), reverse=sort_state["reverse"])
             for iid, record in visible_rows:
                 tree.insert("", "end", iid=iid, values=values_for(record, iid), tags=("odd" if visible_index % 2 else "even",))
                 visible_index += 1
@@ -908,7 +932,20 @@ class BigliettiTab(ttk.Frame):
 
         ttk.Button(actions, text="Send to Orders", command=lambda: pg_x_action("move")).pack(side="left", padx=(16, 4))
         ttk.Button(actions, text="Delete", command=lambda: pg_x_action("delete")).pack(side="left", padx=4)
-        ttk.Button(actions, text="🖨  Print Selected Biglietti", command=lambda: self._print_selected_shared(window, selected, record_by_iid)).pack(side="right")
+        ttk.Button(
+            actions, text="Delete Shipped Colors", style="Danger.TButton",
+            command=lambda: self._delete_shipped_colors(
+                window, current_sheet["name"], record_by_iid, sheet_by_iid,
+                datasets, refresh_records, rebuild,
+            ),
+        ).pack(side="left", padx=(14, 4))
+        ttk.Button(
+            actions, text="🖨  Print Selected Biglietti",
+            command=lambda: self._print_selected_shared(
+                window, selected, record_by_iid,
+                move_assigned_pg_x=current_sheet["name"] == "PG-X",
+            ),
+        ).pack(side="right")
         ttk.Button(actions, text="Close", command=window.destroy).pack(side="right", padx=(0, 8))
 
     @staticmethod
@@ -1087,7 +1124,95 @@ class BigliettiTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _print_selected_shared(self, window, selected: dict[str, bool], record_by_iid: dict[str, object]):
+    def _delete_shipped_colors(
+        self, window, sheet_name, record_by_iid, sheet_by_iid,
+        datasets, refresh_records, rebuild,
+    ):
+        if getattr(self, "_delete_shipped_running", False):
+            return
+        uscita_path = source_path("uscita", existing_only=True)
+        if not uscita_path:
+            return messagebox.showwarning(
+                "Uscita File Required",
+                "Upload the Uscita file in Situazione first, then try again.",
+                parent=window,
+            )
+        self._delete_shipped_running = True
+
+        def normalize(value):
+            text = str(value or "").strip()
+            try:
+                number = float(text.replace(",", "."))
+                return str(int(number)) if number.is_integer() else str(number)
+            except ValueError:
+                return text.casefold()
+
+        def worker():
+            try:
+                from parsers.situazione_loaders import load_uscita
+                uscita_df, errors = load_uscita(str(uscita_path))
+                if errors or uscita_df is None or uscita_df.empty:
+                    detail = "; ".join(errors) if errors else "The Uscita file has no valid shipped rows."
+                    raise ValueError(detail)
+                shipped = {normalize(value) for value in uscita_df["partita"].tolist() if normalize(value)}
+                page_records = [
+                    record for iid, record in record_by_iid.items()
+                    if sheet_by_iid.get(iid) == sheet_name
+                ]
+                count = sum(1 for record in page_records if normalize(record.colored_batch) in shipped)
+                self.after(0, lambda: confirm_and_delete(count, shipped))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: shipped_delete_failed(exc, window))
+
+        def confirm_and_delete(count, shipped):
+            if not count:
+                self._delete_shipped_running = False
+                return messagebox.showinfo(
+                    "Delete Shipped Colors",
+                    f"No shipped colors were found in {sheet_name}.",
+                    parent=window,
+                )
+            if not messagebox.askyesno(
+                "Delete Shipped Colors",
+                f"{count} color(s) in {sheet_name} have already been shipped.\n\nDelete them now?",
+                parent=window,
+            ):
+                self._delete_shipped_running = False
+                return
+
+            def delete_worker():
+                try:
+                    deleted = delete_shipped_shared_rows(self.shared_excel_path, shipped, sheet_name)
+                    new_datasets = {
+                        "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                        "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                    }
+                    self.after(0, lambda: delete_finished(deleted, new_datasets))
+                except Exception as exc:
+                    self.after(0, lambda exc=exc: shipped_delete_failed(exc, window))
+
+            threading.Thread(target=delete_worker, daemon=True).start()
+
+        def delete_finished(deleted, new_datasets):
+            self._delete_shipped_running = False
+            refresh_records(new_datasets)
+            rebuild()
+            messagebox.showinfo(
+                "Delete Shipped Colors",
+                f"Deleted {deleted} shipped color(s) from {sheet_name}.",
+                parent=window,
+            )
+
+        def shipped_delete_failed(exc, parent):
+            self._delete_shipped_running = False
+            messagebox.showerror("Delete Shipped Colors", str(exc), parent=parent)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _print_selected_shared(
+        self, window, selected: dict[str, bool], record_by_iid: dict[str, object],
+        move_assigned_pg_x: bool = False,
+    ):
         if not self.template_path or not self.template_path.is_file():
             return messagebox.showwarning("Missing Template", "Select the Biglietti.docx template first.", parent=window)
         records = [record_by_iid[iid] for iid, is_selected in selected.items() if is_selected]
@@ -1096,16 +1221,31 @@ class BigliettiTab(ttk.Frame):
         # Keep one stable output file: every print replaces the previous
         # document with only the records selected in the current view.
         destination = self.shared_excel_path.parent / "Biglietti_Selected.docx"
+        pg_x_partita_cols = []
+        if move_assigned_pg_x:
+            pg_x_partita_cols = list(dict.fromkeys(
+                str(record.colored_batch)
+                for record in records
+                if str(record.raw_batch or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
+            ))
         window.destroy()
         self.convert_btn.config(state="disabled")
         self._set_status("Creating selected Biglietti from shared Excel in progress...")
-        threading.Thread(target=self._worker_shared_biglietti, args=(records, destination), daemon=True).start()
+        threading.Thread(
+            target=self._worker_shared_biglietti,
+            args=(records, destination, pg_x_partita_cols),
+            daemon=True,
+        ).start()
 
-    def _worker_shared_biglietti(self, records, destination: Path):
+    def _worker_shared_biglietti(self, records, destination: Path, pg_x_partita_cols=None):
         try:
             export_word(destination, self.template_path, records, stem="Selected Orders")
+            moved = 0
+            for partita_col in pg_x_partita_cols or []:
+                moved += move_pg_x_to_orders(self.shared_excel_path, partita_col)
             self._set_status(f"Created {len(records)} selected Biglietti.")
-            self.after(0, lambda: messagebox.showinfo("Biglietti", f"Created:\n{destination}"))
+            moved_text = f"\nMoved {moved} PG-X row(s) to Orders." if moved else ""
+            self.after(0, lambda: messagebox.showinfo("Biglietti", f"Created:\n{destination}{moved_text}"))
         except Exception as exc:
             self._logger.exception("Shared Excel Biglietti failed")
             self._set_status(f"Error: {exc}")
@@ -1243,9 +1383,18 @@ class BigliettiTab(ttk.Frame):
                     enrich_records(elvy_records, "ELVY", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
                     export_workbook(xlsx, elvy_records, raw, include_filato=True, stem=stem, customer="ELVY", magazino_summary=magazino_summary)
                     shared_result = append_create_excel(self.shared_excel_path, elvy_records, "ELVY")
-                    export_word(docx, template, elvy_records, stem=stem)
-                    created_items.append(f"• ELVY: {len(elvy_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
-                    self._last_client_files["elvy"] = [xlsx, docx]
+                    elvy_ready, elvy_pgx = _split_pg_x_records(elvy_records)
+                    files = [xlsx]
+                    if elvy_ready:
+                        export_word(docx, template, elvy_ready, stem=stem)
+                        files.append(docx)
+                    if elvy_pgx:
+                        pgx_docx = docx.with_name(f"{docx.stem}-pg-x{docx.suffix}")
+                        export_word(pgx_docx, template, elvy_pgx, stem=f"{stem}-PG-X")
+                        files.append(pgx_docx)
+                    word_text = ", ".join(path.name for path in files[1:]) or "no Word tickets"
+                    created_items.append(f"• ELVY: {len(elvy_records)} tickets ({word_text})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
+                    self._last_client_files["elvy"] = files
                 med_records = [r for r in records if r.customer_code == "3004"]
                 if med_records:
                     out_dir = Path(self.med_output_dir); stem = build_output_stem(med_records, "MED")
@@ -1253,9 +1402,18 @@ class BigliettiTab(ttk.Frame):
                     enrich_records(med_records, "MED", codes_map=codes_map, densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, price_lookup=price_lookup)
                     export_workbook(xlsx, med_records, raw, include_filato=True, stem=stem, customer="MED", magazino_summary=magazino_summary)
                     shared_result = append_create_excel(self.shared_excel_path, med_records, "MED")
-                    export_word(docx, template, med_records, stem=stem)
-                    created_items.append(f"• MED: {len(med_records)} tickets ({docx.name})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
-                    self._last_client_files["med"] = [xlsx, docx]
+                    med_ready, med_pgx = _split_pg_x_records(med_records)
+                    files = [xlsx]
+                    if med_ready:
+                        export_word(docx, template, med_ready, stem=stem)
+                        files.append(docx)
+                    if med_pgx:
+                        pgx_docx = docx.with_name(f"{docx.stem}-pg-x{docx.suffix}")
+                        export_word(pgx_docx, template, med_pgx, stem=f"{stem}-PG-X")
+                        files.append(pgx_docx)
+                    word_text = ", ".join(path.name for path in files[1:]) or "no Word tickets"
+                    created_items.append(f"• MED: {len(med_records)} tickets ({word_text})\n   ↳ Saved to: {xlsx}\n   ↳ Shared Excel: +{shared_result['added']} rows, {shared_result['skipped']} duplicate Partita Col skipped")
+                    self._last_client_files["med"] = files
                 if self.filato_enabled.get() and self.filato_output_dir and raw:
                     out_dir = Path(self.filato_output_dir); out_dir.mkdir(parents=True, exist_ok=True)
                     filato_file = out_dir / "Filato x Tinturia.xlsx"

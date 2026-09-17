@@ -283,7 +283,19 @@ Remove-Item -LiteralPath {_powershell_quote(stage_root)} -Recurse -Force -ErrorA
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 """
         script_path.write_text(script, encoding="utf-8")
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # CREATE_NO_WINDOW alone only hides the console -- it doesn't
+        # detach the process from anything. If Planing.exe is running
+        # inside a Windows Job Object (common under some launchers, remote
+        # sessions, or security software), closing the parent can silently
+        # kill this helper along with it before it ever gets to run,
+        # leaving the update never applied and nothing relaunched at all.
+        # CREATE_BREAKAWAY_FROM_JOB + CREATE_NEW_PROCESS_GROUP make sure
+        # this process survives the parent's exit regardless.
+        creation_flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        )
         subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script_path)],
             creationflags=creation_flags,
