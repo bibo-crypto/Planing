@@ -39,9 +39,47 @@ utility/                 shared infra: generic helpers, path/file caches, db
   articoli_cache.py, densita_cache.py, lotti_cache.py, magazino_cache.py,
   prezzi_cache.py
   situazione_db.py        SQLite-backed upload log + Articolo->TITOLO table
+  notifications.py        persisted, deduplicated application notifications
+  master_data.py          local JSON reference data (temporary, not central DB)
 
 tests/                   regression tests (pytest/unittest)
 ```
+
+## Notifications
+
+The main window has a global `Notifications` button. Notices are stored in
+`settings/notifications.json`, deduplicated by key, and remain visible until
+the user marks them resolved. The notification window shows severity, title,
+page, message, and creation time.
+
+`Ordine > Ordine Med` creates a high-severity notice after conversion when an
+article required by `Filato X Tinturia` is missing from `Magazino Filato`.
+The notice lists the missing article codes so the operator can upload or fix
+the Magazino source. `Situazione Generale` also compares the displayed color
+price against `Prezzi` using `Articolo + Codice`; missing matches and existing
+price differences become notifications. The machine surcharge rule is applied
+for both capacity values `24/32/56` and machine numbers `12/9/10`: add $2 to
+the Listini price.
+
+## Master Data (local phase)
+
+The `Master Data` tab intentionally contains only the two manually maintained
+tables that are useful globally: `Customers` and `Machines`. Machines use the
+fields `Code`, `Number`, and `Rocche`; for example `3307 - 7 - 72`. The seeded
+machine registry is loaded by `calculate/constants.py` and supplies the
+machine-code, machine-number, and capacity mappings used by planning logic.
+Article files remain managed through their dedicated upload flow, and the
+G/C article-prefix rule remains business logic rather than a separate table.
+Changes are saved in `settings/master_data.json` and are picked up on the
+next application start.
+
+## Central database (postponed)
+
+A central business database is deliberately not part of this phase. Existing
+source-path caches, the Situazione upload log, and the new local JSON stores
+remain in place. A future database phase can add migrations, permissions,
+history, and shared records after the operating rules and backup strategy are
+approved.
 
 Packaging/build tooling stays at the repo root since it isn't application
 code: `main.spec`, `build.bat`, `installer.iss`, `requirements.txt`,

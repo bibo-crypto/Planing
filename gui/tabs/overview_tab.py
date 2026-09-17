@@ -612,7 +612,21 @@ class OverviewTab(ttk.Frame):
         self._add_card(6, "🎨 Elvy: totale colori", f"{elvy_total_colors:,}")
         self._add_card(7, f"📅 Elvy: entro {DELIVERY_ALERT_DAYS} giorni", f"{elvy_due_colors:,}", alert=elvy_due_colors > 0)
 
-        price_anomalies = business_logic.find_price_anomalies(df)
+        prezzo_pairs = set()
+        prezzi_df = getattr(self.prezzi_tab, "_base_df", None)
+        if isinstance(prezzi_df, pd.DataFrame) and not prezzi_df.empty:
+            def _price_key(value):
+                text = str(value).strip().upper()
+                try:
+                    number = float(text.replace(",", "."))
+                    return str(int(number)) if number.is_integer() else str(number)
+                except (TypeError, ValueError):
+                    return text
+            prezzo_pairs = {
+                (_price_key(row.get("CLARTICOLO", "")), _price_key(row.get("CLCOLORE", "")))
+                for _, row in prezzi_df.iterrows()
+            }
+        price_anomalies = business_logic.find_price_anomalies(df, prezzo_pairs=prezzo_pairs)
         price_problem_colors = len({
             str(item.get("colore", "")).strip()
             for item in price_anomalies

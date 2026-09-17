@@ -34,6 +34,7 @@ from tkinter import filedialog, messagebox, ttk
 from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.utils import find_pdfs, load_settings, logger, make_output_path, save_settings
 from utility.updater import APP_VERSION, ReleaseInfo, check_for_updates_async, download_installer, install_update
+from utility import notifications
 from gui.modern_widgets import RoundedButton
 from utility.utils import keep_window_on_top
 
@@ -297,14 +298,16 @@ class ConverterApp(tk.Tk):
         from gui.tabs.prezzi_tab import PrezziTab
         from gui.tabs.situazione_settimana_tab import SettimanaTab
         from gui.tabs.situazione_tab import SituazioneTab
+        from gui.tabs.master_data_tab import MasterDataTab
 
         def startup_step(text: str) -> None:
             self._startup_label.config(text=text)
             self.update_idletasks()
 
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=4)   # all application pages
-        self.rowconfigure(1, weight=1)   # log area
+        self.rowconfigure(0, weight=0)   # notification bar
+        self.rowconfigure(1, weight=4)   # all application pages
+        self.rowconfigure(2, weight=1)   # log area
 
         style = ttk.Style(self)
         # Use the same renderer that gives Situazione its reliable colored
@@ -361,10 +364,19 @@ class ConverterApp(tk.Tk):
             foreground=[("selected", "#000000"), ("!selected", "#1F2937")],
         )
 
+        notification_bar = ttk.Frame(self, padding=(12, 5))
+        notification_bar.grid(row=0, column=0, sticky="ew")
+        notification_bar.columnconfigure(0, weight=1)
+        self._notification_button = ttk.Button(notification_bar, command=self._open_notifications, danger=False)
+        self._notification_button.grid(row=0, column=1, sticky="e")
+        style.configure("Notification.TButton", background="#b91c1c", foreground="white")
+        style.map("Notification.TButton", background=[("active", "#991b1b")])
+        self._refresh_notification_badge()
+
         # ── All pages use one normal tab bar; Data Elvy is not persistent ──
         startup_step("Loading Data Elvy...")
         notebook = ttk.Notebook(self)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 4))
+        notebook.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 4))
 
         elvy_tab = ttk.Frame(notebook)
         notebook.add(elvy_tab, text="Data Elvy")
@@ -396,6 +408,7 @@ class ConverterApp(tk.Tk):
             ordine_notebook, situazione_tab=None, prefs=self._prefs,
             save_prefs=self._save_prefs, logger=logger,
             on_shared_cache_changed=self._on_shared_cache_changed,
+            on_notification=self._add_notification,
         )
         ordine_notebook.add(self._ordine_med_tab, text="Ordine Med")
 
@@ -424,7 +437,10 @@ class ConverterApp(tk.Tk):
         situazione_notebook = ttk.Notebook(situazione_parent)
         situazione_notebook.pack(fill="both", expand=True)
 
-        self._situazione_tab = SituazioneTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        self._situazione_tab = SituazioneTab(
+            situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed,
+            on_notification=self._add_notification,
+        )
         situazione_notebook.add(self._situazione_tab, text="Situazione Generale")
 
         self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
@@ -439,8 +455,14 @@ class ConverterApp(tk.Tk):
         notebook.add(self._magazino_tab, text="Magazino Filato")
 
         startup_step("Loading Prices...")
-        self._prezzi_tab = PrezziTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
+        self._prezzi_tab = PrezziTab(
+            notebook, on_shared_cache_changed=self._on_shared_cache_changed,
+            on_notification=self._add_notification,
+        )
         notebook.add(self._prezzi_tab, text="Prezzi")
+
+        self._master_data_tab = MasterDataTab(notebook, on_data_changed=self._refresh_notification_badge)
+        notebook.add(self._master_data_tab, text="Master Data")
 
         # Now that Magazino Filato exists, let Situazione auto-fill its
         # "Filato Disponibile" column from it.
@@ -516,6 +538,84 @@ class ConverterApp(tk.Tk):
             # so this may still see slightly-stale data the first time --
             # it'll catch up on the next Situazione refresh regardless.
             self.after(500, self._situazione_tab.refresh_raw_yarn_match_async)
+
+    def _add_notification(self, key: str, title: str, message: str, page: str, severity: str = "medium") -> None:
+        def add_now():
+            notifications.add(key, title, message, page, severity)
+            self._refresh_notification_badge()
+        self.after(0, add_now)
+
+    def _refresh_notification_badge(self) -> None:
+        if not hasattr(self, "_notification_button"):
+            return
+        count = len(notifications.list_open())
+        self._notification_button.configure(
+            text=f"🔔 Notifications ({count})" if count else "🔔 Notifications",
+            danger=bool(count),
+        )
+
+    def _open_notifications(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Notifications")
+        win.geometry("760x360")
+        win.minsize(620, 280)
+        win.resizable(True, True)
+        # Keep this as a normal overlapped Windows window so the native
+        # Minimize, Restore/Maximize, and Close buttons are available.
+        win.overrideredirect(False)
+        try:
+            win.wm_attributes("-toolwindow", False)
+        except tk.TclError:
+            pass
+        win.lift()
+        win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(win, columns=("severity", "title", "page", "message", "created"), show="headings")
+        for col, title, width in (("severity", "Severity", 90), ("title", "Title", 180), ("page", "Page", 120), ("message", "Message", 310), ("created", "Created", 145)):
+            tree.heading(col, text=title); tree.column(col, width=width, anchor="w")
+        tree.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
+        tree.tag_configure("evenrow", background="#ffffff")
+        tree.tag_configure("oddrow", background="#eef4fb")
+        def refresh():
+            tree.delete(*tree.get_children())
+            for index, item in enumerate(notifications.list_open()):
+                tree.insert(
+                    "", "end", iid=item["key"],
+                    values=(item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("message", ""), item.get("created_at", "")),
+                    tags=("oddrow" if index % 2 else "evenrow",),
+                )
+            self._refresh_notification_badge()
+        def resolve_selected():
+            for iid in tree.selection(): notifications.resolve(iid)
+            refresh()
+        def export_excel():
+            items = notifications.list_open()
+            if not items:
+                messagebox.showinfo("Notifications", "There are no open notifications to export.", parent=win)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win, title="Export Notifications", defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")], initialfile="notifications.xlsx",
+            )
+            if not path:
+                return
+            try:
+                from openpyxl import Workbook
+                workbook = Workbook(); sheet = workbook.active; sheet.title = "Notifications"
+                headers = ("Severity", "Title", "Page", "Message", "Created")
+                sheet.append(headers)
+                for item in items:
+                    sheet.append((item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("message", ""), item.get("created_at", "")))
+                sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
+                for cell in sheet[1]: cell.font = cell.font.copy(bold=True)
+                workbook.save(path); workbook.close()
+                messagebox.showinfo("Notifications", f"Export completed:\n{path}", parent=win)
+            except Exception as exc:
+                messagebox.showerror("Export error", str(exc), parent=win)
+        ttk.Button(win, text="Mark Resolved", command=resolve_selected).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Button(win, text="Extract to Excel", command=export_excel).grid(row=1, column=1, padx=8, pady=(0, 8))
+        ttk.Button(win, text="Refresh", command=refresh).grid(row=1, column=2, padx=8, pady=(0, 8))
+        ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=3, sticky="e", padx=8, pady=(0, 8))
+        refresh()
 
     def _refresh_magazino_status(self) -> None:
         cache = load_magazino_cache()
@@ -994,7 +1094,7 @@ class ConverterApp(tk.Tk):
 
     def _build_log_area(self) -> None:
         log_frame = ttk.LabelFrame(self, text="Log", padding=6)
-        log_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(4, 12))
         self._log_frame = log_frame
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -1057,13 +1157,13 @@ class ConverterApp(tk.Tk):
             or biglietti_selected
         ):
             self._log_frame.grid_remove()
-            self.rowconfigure(1, weight=0)
-            self.rowconfigure(0, weight=5)
+            self.rowconfigure(2, weight=0)
+            self.rowconfigure(1, weight=5)
             notebook.configure(height=1)
         else:
             self._log_frame.grid()
-            self.rowconfigure(0, weight=3)
-            self.rowconfigure(1, weight=1)
+            self.rowconfigure(1, weight=3)
+            self.rowconfigure(2, weight=1)
             notebook.configure(height=220)
 
         self._log_text.tag_configure("INFO", foreground="#4FC1FF")

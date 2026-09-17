@@ -28,6 +28,7 @@ from parsers.prod_lookup import load_prod_cache, save_prod_cache
 from utility.utils import keep_window_on_top, logger
 from utility.densita_cache import load_densita_cache
 from utility.path_manager import save_source, source_path
+from utility import notifications
 
 STATUS_COLORS = {
     "Filato": "#e0e0e0",
@@ -139,12 +140,13 @@ class SourceRow(ttk.Frame):
 class SituazioneTab(ttk.Frame):
     """Embeddable 'Situazione' tab — hosted inside gui.py's main Notebook."""
 
-    def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None):
+    def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None, on_notification=None):
         super().__init__(master)
 
         self._configure_styles()
 
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._on_notification = on_notification
         # Set post-construction from gui.py once MagazinoFilatoTab exists
         # (it's built after this tab). Used only to auto-fill the "Filato
         # Disponibile" column -- read lazily, so it's fine if it's not set
@@ -1361,7 +1363,37 @@ class SituazioneTab(ttk.Frame):
 
         def _prezzo_row(row):
             base = biglietti_exporter.prezzo_for(row.get("articolo", ""), row.get("codice", ""), price_lookup)
-            return biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
+            expected = biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
+            current = row.get("prezzo", "")
+            try:
+                current_num = float(str(current).replace(",", ".")) if str(current).strip() else None
+            except (TypeError, ValueError):
+                current_num = None
+            try:
+                expected_num = float(expected) if expected != "" else None
+            except (TypeError, ValueError):
+                expected_num = None
+            article, code = str(row.get("articolo", "")).strip(), str(row.get("codice", "")).strip()
+            if self._on_notification and article and code:
+                identity = f"{article}:{code}:{row.get('bagno', '')}"
+                if expected_num is None:
+                    missing_key = f"situazione-price-missing:{identity}"
+                    if current_num is not None:
+                        self._on_notification(
+                            missing_key, "Missing color price in Prezzi",
+                            f"Articolo {article}, color code {code} has a price in Situazione but no matching price in Prezzi.", "Situazione Generale", "high",
+                        )
+                    else:
+                        # Both sources are blank: this is not an anomaly.
+                        # Also clean up notices created by the earlier, overly
+                        # strict check when the page is refreshed.
+                        notifications.resolve(missing_key)
+                elif current_num is not None and abs(current_num - expected_num) > 0.01:
+                    self._on_notification(
+                        f"situazione-price-mismatch:{identity}:{current_num}:{expected_num}", "Color price differs from Prezzi",
+                        f"Articolo {article}, color code {code}: Situation price {current_num:.2f}, expected {expected_num:.2f} including machine rule.", "Situazione Generale", "high",
+                    )
+            return expected
 
         def _densita_row(row):
             if not densita_map:

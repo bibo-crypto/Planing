@@ -679,7 +679,7 @@ def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
 PRICE_PLACEHOLDER_VALUE = 0.01
 
 
-def find_price_anomalies(df):
+def find_price_anomalies(df, prezzo_pairs=None):
     """Returns a list of dicts (cliente, articolo, colore, bagno, mc,
     prezzo, issue) for every row whose Prezzo needs a human to check it.
     Never raises -- an empty/missing dataframe just returns []."""
@@ -696,6 +696,17 @@ def find_price_anomalies(df):
         except (TypeError, ValueError):
             return None
 
+    # When supplied, this is the set of Articolo+Codice pairs that actually
+    # exist in the active Prezzi file. A blank/zero Situation price is only an
+    # error when the pair exists there; absent pairs are intentionally ignored.
+    def _price_key(value):
+        text = clean_text(value).upper()
+        try:
+            number = float(text.replace(",", "."))
+            return str(int(number)) if number.is_integer() else str(number)
+        except (TypeError, ValueError):
+            return text
+
     out = []
     for _, row in df.iterrows():
         articolo = str(row.get("articolo", "") or "").strip()
@@ -704,10 +715,13 @@ def find_price_anomalies(df):
             continue  # nothing to price-check on a blank row
 
         prezzo_num = _as_number(row.get("prezzo"))
+        pair_exists = True if prezzo_pairs is None else (
+            (_price_key(articolo), _price_key(row.get("codice", "") or colore)) in prezzo_pairs
+        )
         issue = None
         if prezzo_num is not None and abs(prezzo_num - PRICE_PLACEHOLDER_VALUE) < 1e-9:
             issue = f"Prezzo sospetto ({PRICE_PLACEHOLDER_VALUE})"
-        elif prezzo_num is None or prezzo_num == 0:
+        elif pair_exists and (prezzo_num is None or prezzo_num == 0):
             issue = "Prezzo mancante"
 
         if issue:
