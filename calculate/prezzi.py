@@ -135,6 +135,27 @@ def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd
     ).reset_index(drop=True)
 
 
+def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
+    """Return actionable data-quality notices for an uploaded Listini file."""
+    if df is None or df.empty:
+        return [{"key": "prezzi-empty", "title": "Prezzi file is empty", "message": "The active Listini file contains no usable color prices.", "severity": "high"}]
+    issues = []
+    invalid_price = df["PREZZOLPZ"].notna() & (pd.to_numeric(df["PREZZOLPZ"], errors="coerce") <= 0)
+    if invalid_price.any():
+        issues.append({"key": "prezzi-invalid-price", "title": "Invalid prices in Prezzi", "message": f"{int(invalid_price.sum())} row(s) have a zero or negative price.", "severity": "high"})
+    missing_price = df["PREZZOLPZ"].isna()
+    if missing_price.any():
+        issues.append({"key": "prezzi-missing-price", "title": "Missing prices in Prezzi", "message": f"{int(missing_price.sum())} active row(s) have no price.", "severity": "high"})
+    for (articolo, colore), group in df.groupby(["CLARTICOLO", "CLCOLORE"]):
+        prices = group["PREZZOLPZ"].dropna().unique()
+        levels = group["LIVELLOLPZ"].dropna().unique()
+        if len(prices) > 1:
+            issues.append({"key": f"prezzi-conflict-price:{articolo}:{colore}", "title": "Conflicting color prices", "message": f"Articolo {articolo}, colore {colore} has {len(prices)} different prices.", "severity": "high"})
+        if len(levels) > 1:
+            issues.append({"key": f"prezzi-conflict-level:{articolo}:{colore}", "title": "Conflicting color levels", "message": f"Articolo {articolo}, colore {colore} has {len(levels)} different LVL values.", "severity": "medium"})
+    return issues
+
+
 def build_price_lookup(df: pd.DataFrame) -> dict[tuple[str, str], tuple]:
     lookup: dict[tuple[str, str], tuple] = {}
     if df is None or df.empty:

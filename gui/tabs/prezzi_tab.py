@@ -26,9 +26,10 @@ HEADERS = logic.HEADERS
 class PrezziTab(ttk.Frame):
     """Embeddable 'Prezzi' tab."""
 
-    def __init__(self, master, on_shared_cache_changed=None):
+    def __init__(self, master, on_shared_cache_changed=None, on_notification=None):
         super().__init__(master)
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._on_notification = on_notification
         self._base_df = pd.DataFrame()
         self.prezzi_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
@@ -168,6 +169,9 @@ class PrezziTab(ttk.Frame):
                 self.prezzi_df = df
                 self._loaded_source_path = normalized_path
                 self.status_var.set(f"{Path(path).name} — {len(df)} price rows")
+                if self._on_notification:
+                    for issue in logic.validate_price_data(df):
+                        self._on_notification(issue["key"], issue["title"], issue["message"], "Prezzi", issue["severity"])
                 if save_cache:
                     save_prezzi_cache(path)
                     save_source("listini", path)

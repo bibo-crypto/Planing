@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 import zipfile
 
 
-DEFAULT_APP_VERSION = "1.0.0"
+DEFAULT_APP_VERSION = "1.0.2"
 GITHUB_REPOSITORY = "bibo-crypto/Planing"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
@@ -207,11 +207,14 @@ def install_update(zip_path: Path, install_dir: Path, new_version: str) -> None:
         backup_dir = install_dir.parent / "Planing_Backup"
         script = f"""$ErrorActionPreference = 'Stop'
 $log = Join-Path $env:TEMP 'Planing_Update.log'
-# Give the old process time to fully exit and release its file locks
-# before the very first copy attempt -- a cold machine (or one under
-# antivirus real-time scanning) can take noticeably longer than a dev
-# box to let go of the exe/DLLs.
+# Give the old process time to fully exit and release its file locks, then
+# explicitly wait until no old Planing process remains before copying. The
+# fixed delay alone was not sufficient on slower machines/antivirus scans.
 Start-Sleep -Seconds 5
+for ($check = 1; $check -le 30; $check++) {{
+    if (-not (Get-Process -Name 'Planing' -ErrorAction SilentlyContinue)) {{ break }}
+    Start-Sleep -Seconds 2
+}}
 $source = {_powershell_quote(source_dir)}
 $target = {_powershell_quote(install_dir)}
 $backup = {_powershell_quote(backup_dir)}

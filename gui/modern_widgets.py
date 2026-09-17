@@ -14,6 +14,7 @@ class RoundedButton(tk.Canvas):
         self._text = str(text)
         self._command = command
         self._state = "normal"
+        self._danger = bool(kwargs.pop("danger", False))
         button_font = kwargs.pop("font", ("Segoe UI", 10, "bold"))
         self._font = tkfont.Font(font=button_font)
         self._surface = self._frame_background(master)
@@ -62,9 +63,11 @@ class RoundedButton(tk.Canvas):
         if disabled:
             fill, outline, foreground = "#dbe3ec", "#c4cfdb", "#7b8794"
         elif self._hovered:
-            fill, outline, foreground = "#1d4ed8", "#1e40af", "#ffffff"
+            fill, outline, foreground = (("#991b1b", "#7f1d1d", "#ffffff") if self._danger
+                                         else ("#1d4ed8", "#1e40af", "#ffffff"))
         else:
-            fill, outline, foreground = "#f8fafc", "#9fb2c5", "#16324f"
+            fill, outline, foreground = (("#dc2626", "#991b1b", "#ffffff") if self._danger
+                                         else ("#f8fafc", "#9fb2c5", "#16324f"))
 
         # A clean rectangular control keeps the hover/active area exactly
         # aligned with the visible button bounds.
@@ -101,6 +104,8 @@ class RoundedButton(tk.Canvas):
             self._command = options.pop("command")
         if "state" in options:
             self._state = str(options.pop("state"))
+        if "danger" in options:
+            self._danger = bool(options.pop("danger"))
         if options:
             super().configure(**options)
         self._draw()

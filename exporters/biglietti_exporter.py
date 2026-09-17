@@ -383,7 +383,9 @@ prezzo_for = _prezzo_for
 # field or Ordine MED's) that get a $2 surcharge on top of the Listini
 # price. Shared here since both Ordine MED's 'PREZZO + 2$' column and
 # Situazione's own Prezzo column apply the exact same rule.
-PREZZO_SURCHARGE_MACHINES = {24, 32, 56}
+# The same machines may appear as capacity (24/32/56) or as the operator's
+# machine number (12/9/10) in Situazione and the editing dialogs.
+PREZZO_SURCHARGE_MACHINES = {9, 10, 12, 24, 32, 56}
 
 
 def apply_machine_surcharge(price: Any, machine: Any) -> Any:

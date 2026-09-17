@@ -9,7 +9,7 @@
 ; ============================================================
 
 #define AppName      "Planing"
-#define AppVersion   "1.0.1"
+#define AppVersion   "1.0.2"
 #define AppPublisher "Delta Dyeing S.A.E."
 #define AppExeName   "Planing.exe"
 #define SourceDir    "dist\Planing"

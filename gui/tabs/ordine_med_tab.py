@@ -25,13 +25,14 @@ from utility.path_manager import save_source, source_path
 
 
 class OrdineMedTab(ttk.Frame):
-    def __init__(self, parent, situazione_tab=None, prefs: dict | None = None, save_prefs=None, logger=None, on_shared_cache_changed=None):
+    def __init__(self, parent, situazione_tab=None, prefs: dict | None = None, save_prefs=None, logger=None, on_shared_cache_changed=None, on_notification=None):
         super().__init__(parent)
         self._situazione_tab = situazione_tab
         self._prefs = prefs or {}
         self._save_prefs = save_prefs or (lambda **_kw: None)
         self._logger = logger
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._on_notification = on_notification
         self.ordine_path: Path | None = None
         self.output_path: Path | None = None
         self.erp_folder: Path | None = None
@@ -264,6 +265,15 @@ class OrdineMedTab(ttk.Frame):
             if self.magazino_path and self.magazino_path.is_file():
                 stock_map = ordine_med.load_filato_disponibile(self.magazino_path)
             availability = ordine_med.compute_filato_availability(records, densita_map, stock_map)
+            missing_articles = sorted({a.articolo for a in availability if a.mag_rocche is None})
+            if missing_articles and self._on_notification:
+                self._on_notification(
+                    "ordine-med-filato-missing:" + ",".join(missing_articles),
+                    "Filato X Tinturia missing in Magazino Filato",
+                    "The following article(s) are not present in Magazino Filato: " + ", ".join(missing_articles),
+                    "Ordine Med",
+                    "high",
+                )
 
             output_dir = self.output_path
             output_file = output_dir / "Ordine_MED.xlsx"
