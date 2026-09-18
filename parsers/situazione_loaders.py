@@ -1,5 +1,5 @@
 """
-data_loaders.py
+situazione_loaders.py
 Reads each of the 6 raw source files, finds the real header row (these ERP
 exports sometimes have a title row or a duplicated header row above the
 data), validates that the expected columns exist, and returns a clean
@@ -116,7 +116,7 @@ def load_wincoint_orders(path):
         "codice": _s(df.iloc[:, 5]),        # Wincoint column F -> Codice
         "colore": _s(df.iloc[:, 6]),        # Wincoint column G -> Colore
         "ordine": _s(df["Ordine"]) if "Ordine" in df.columns else "",  # no positional fallback: wrong index risks silently duplicating Codice
-        "riga": _s(df["Riga"]),
+        "riga": _s(df["Riga"]) if "Riga" in df.columns else "",
         "data": pd.to_datetime(df["Data"], errors="coerce"),
         "consegna": pd.to_datetime(df["Consegna"], errors="coerce"),
         "partita": _s(df["Partita"]),

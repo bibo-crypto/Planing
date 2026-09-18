@@ -75,6 +75,9 @@ from utility.utils import APP_DATA_DIR, clean_text, logger
 
 CACHE_FILE = APP_DATA_DIR / "settings" / "dfm_color_cache.json"
 
+# Only rows whose ARTICOLODFM starts with this prefix are relevant to Elvy.
+ELVY_ARTICLE_PREFIX = "C130"
+
 
 def _cache_file_for(prefix: str) -> Path:
     """Elvy's C130 cache keeps its original filename (backward compatible);
@@ -82,9 +85,6 @@ def _cache_file_for(prefix: str) -> Path:
     if prefix == ELVY_ARTICLE_PREFIX:
         return CACHE_FILE
     return APP_DATA_DIR / "settings" / f"dfm_color_cache_{prefix}.json"
-
-# Only rows whose ARTICOLODFM starts with this prefix are relevant to Elvy.
-ELVY_ARTICLE_PREFIX = "C130"
 
 REQUIRED_COLUMNS = ("ARTICOLODFM", "COLOREDFM", "CLDESCR", "DESCRIZARTICOLOLI", "DATAINS")
 

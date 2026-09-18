@@ -81,6 +81,7 @@ class OrdineMedRow:
     livello: Any = ""
     check_articolo: str = ""
     prezzo_plus2: Any = ""
+    _roc_with_polmoni: int = 0
 
 
 def _normalize_abbin(value: Any) -> Any:
@@ -151,14 +152,14 @@ def compute_mc_and_gruppo(records: list[OrdineMedRow]) -> None:
     groups: dict[Any, list[OrdineMedRow]] = {}
     for r in records:
         roc = r.rocc + _polmoni_multiplier(r.polmoni)
-        r._roc_with_polmoni = roc  # type: ignore[attr-defined]
+        r._roc_with_polmoni = roc
         if r.abbin not in (None, ""):
             groups.setdefault(r.abbin, []).append(r)
         else:
             r.mc = roc
             r.gruppo_macchina = GRUPPO_MACCHINA_TABLE.get(roc)
     for abbin, members in groups.items():
-        total = sum(m._roc_with_polmoni for m in members)  # type: ignore[attr-defined]
+        total = sum(m._roc_with_polmoni for m in members)
         gm = GRUPPO_MACCHINA_TABLE.get(total)
         for m in members:
             m.mc = total
@@ -262,7 +263,7 @@ def compute_prezzo_plus2(records: list[OrdineMedRow]) -> None:
         r.prezzo_plus2 = apply_machine_surcharge(r.prezzo, r.mc)
 
 
-_DFM_PAIRS_CACHE: tuple[str, int, int, set] | None = None
+_DFM_PAIRS_CACHE: tuple[str, int, int, set[tuple[str, str]]] | None = None
 
 
 def load_dfm_articolo_colore(path: Path) -> set[tuple[str, str]]:

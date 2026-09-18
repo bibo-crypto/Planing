@@ -538,11 +538,12 @@ class SituazioneTab(ttk.Frame):
 
         search_row = ttk.Frame(window)
         search_row.pack(fill="x", padx=10, pady=(10, 6))
-        ttk.Label(search_row, text="Partita:").pack(side="left", padx=(0, 6))
+        ttk.Label(search_row, text="Search Partita:").pack(side="left", padx=(0, 6))
         search_var = tk.StringVar(value=initial_partita)
         window._search_var = search_var
         entry = ttk.Entry(search_row, textvariable=search_var, width=24)
         entry.pack(side="left")
+        ttk.Button(search_row, text="Clear", width=6, command=lambda: search_var.set("")).pack(side="left", padx=(4, 0))
         status = ttk.Label(search_row, text="")
         status.pack(side="left", padx=(10, 0))
 
@@ -586,6 +587,7 @@ class SituazioneTab(ttk.Frame):
                 tree.insert("", "end", values=tuple(row[c] for c in columns))
 
         window._do_search = do_search
+        search_var.trace_add("write", lambda *_: do_search())
         entry.bind("<Return>", lambda _event: do_search())
         ttk.Button(search_row, text="Search", command=do_search).pack(side="left", padx=(10, 0))
 
@@ -1565,10 +1567,11 @@ class SituazioneTab(ttk.Frame):
         top.pack(fill="x", padx=8, pady=8)
         ttk.Label(top, text=(f"{len(suggestions)} righe — stesso Codice/Colore, Titolo compatibile; limite extra 20% (oltre = ⚠)"),
                   foreground="#344054").pack(side="left")
-        ttk.Label(top, text="Auto search:").pack(side="left", padx=(18, 4))
+        ttk.Label(top, text="Search:").pack(side="left", padx=(18, 4))
         search_var = tk.StringVar()
         search_entry = ttk.Entry(top, textvariable=search_var, width=24)
         search_entry.pack(side="left")
+        ttk.Button(top, text="Clear", width=6, command=lambda: search_var.set("")).pack(side="left", padx=(4, 0))
         ttk.Button(top, text="Export Abbina", command=lambda: self._export_abbina(suggestions)).pack(side="right")
 
         cols = ["titolo", "codice", "colore", "rocche", "partita", "bagno", "abbina",
