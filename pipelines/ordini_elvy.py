@@ -223,38 +223,39 @@ def read_filato_tinturia_sheet(source_path: Path) -> list[RawYarnMatch]:
     import openpyxl  # local import: this module doesn't need openpyxl otherwise
 
     wb = openpyxl.load_workbook(source_path, data_only=True)
-    if "Filato x Tinturia" not in wb.sheetnames:
+    try:
+        if "Filato x Tinturia" not in wb.sheetnames:
+            raise ValueError(f"{source_path.name} has no \"Filato x Tinturia\" sheet.")
+        ws = wb["Filato x Tinturia"]
+
+        header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+        col_attr: dict[int, str] = {}
+        for cell in header_cells:
+            if cell.value is None:
+                continue
+            attr = _FILATO_HEADER_TO_ATTR.get(str(cell.value).strip().lower())
+            if attr:
+                col_attr[cell.column] = attr
+
+        rows: list[RawYarnMatch] = []
+        for row_idx in range(2, ws.max_row + 1):
+            values = {
+                attr: ws.cell(row=row_idx, column=col_idx).value
+                for col_idx, attr in col_attr.items()
+            }
+            if not any(v not in (None, "") for v in values.values()):
+                continue
+            rows.append(RawYarnMatch(
+                articolo=str(values.get("articolo") or ""),
+                titolo=str(values.get("titolo") or ""),
+                partita=str(values.get("partita") or ""),
+                rocce=float(values.get("rocce") or 0),
+                peso=float(values.get("peso") or 0),
+                label=str(values.get("label") or "تحضير خام"),
+            ))
+        return rows
+    finally:
         wb.close()
-        raise ValueError(f"{source_path.name} has no \"Filato x Tinturia\" sheet.")
-    ws = wb["Filato x Tinturia"]
-
-    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
-    col_attr: dict[int, str] = {}
-    for cell in header_cells:
-        if cell.value is None:
-            continue
-        attr = _FILATO_HEADER_TO_ATTR.get(str(cell.value).strip().lower())
-        if attr:
-            col_attr[cell.column] = attr
-
-    rows: list[RawYarnMatch] = []
-    for row_idx in range(2, ws.max_row + 1):
-        values = {
-            attr: ws.cell(row=row_idx, column=col_idx).value
-            for col_idx, attr in col_attr.items()
-        }
-        if not any(v not in (None, "") for v in values.values()):
-            continue
-        rows.append(RawYarnMatch(
-            articolo=str(values.get("articolo") or ""),
-            titolo=str(values.get("titolo") or ""),
-            partita=str(values.get("partita") or ""),
-            rocce=float(values.get("rocce") or 0),
-            peso=float(values.get("peso") or 0),
-            label=str(values.get("label") or "تحضير خام"),
-        ))
-    wb.close()
-    return rows
 
 
 def update_existing_filato_file(target_path: Path, matches: list[RawYarnMatch]) -> int:
@@ -436,22 +437,22 @@ def match_raw_yarn(
 
     matches: list[RawYarnMatch] = []
 
-    def _assign(idxs, batch, quantity_used):
+    def _assign(idxs, batch, quantity_used, art_g):
         for i in idxs:
             ordini_rows[i].commento = ordini_rows[i].commento.replace("PG-X", f"PG-{batch['partita']}")
-        articolo_c_for_lookup = "C" + articolo_g[1:] if articolo_g.upper().startswith("G") else articolo_g
+        articolo_c_for_lookup = "C" + art_g[1:] if art_g.upper().startswith("G") else art_g
         titolo = (codes_map or {}).get(articolo_c_for_lookup, "")
         if batch_capacity_attr == "rocche":
             peso_used = batch["peso"] * (quantity_used / batch["rocche"]) if batch["rocche"] else 0.0
             rocce_used = quantity_used
         else:
             peso_used = quantity_used
-            rocce_used = quantity_used
+            rocce_used = batch["rocche"] * (quantity_used / batch["peso"]) if batch.get("peso") else 0.0
         matches.append(RawYarnMatch(
-            articolo=articolo_g,
+            articolo=art_g,
             titolo=titolo,
             partita=batch["partita"],
-            rocce=rocce_used,
+            rocce=round(rocce_used, 2),
             peso=round(peso_used, 2),
         ))
 
@@ -467,7 +468,7 @@ def match_raw_yarn(
         )
         if candidates:
             batch = candidates[0]
-            _assign(idxs, batch, total_needed)
+            _assign(idxs, batch, total_needed, articolo_g)
             batches.remove(batch)
             continue
 
@@ -480,7 +481,7 @@ def match_raw_yarn(
             )
             if fit:
                 batch = fit[0]
-                _assign([i], batch, need)
+                _assign([i], batch, need, articolo_g)
                 batches.remove(batch)
             # else: leave as PG-X -- nothing in stock covers this row yet
 
