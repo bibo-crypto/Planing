@@ -586,6 +586,11 @@ class BigliettiTab(ttk.Frame):
         ttk.Label(search_bar, text="Partita GG:").grid(row=0, column=3, sticky="w", padx=(18, 4))
         partita_gg_var = tk.StringVar()
         ttk.Entry(search_bar, textvariable=partita_gg_var, width=14).grid(row=0, column=4, sticky="w")
+        ttk.Button(search_bar, text="SAVE", width=10, command=lambda: save_pg_x()).grid(row=0, column=5, sticky="e", padx=(6, 0))
+        ttk.Button(
+            search_bar, text="⚡ Smart Auto-Assign",
+            command=lambda: self._smart_auto_assign_pg_x(window, datasets, refresh_records, rebuild, partita_gg_var),
+        ).grid(row=0, column=6, sticky="e", padx=(6, 0))
         excel_columns = (
             "Dispo/Riga", "Cliente", "Articolo", "Titolo", "Formato", "Ordine", "Codice",
             "Colore", "Rocche", "KG", "M/C", "Partita Col", "Consegna", "Commento",
@@ -740,8 +745,6 @@ class BigliettiTab(ttk.Frame):
             if not partita_col or not partita_gg:
                 return messagebox.showwarning("Missing Data", "Search for one Partita Col and enter its Partita GG.", parent=window)
             self._save_pg_x_in_background(window, partita_col, partita_gg, datasets, refresh_records, rebuild, partita_gg_var, allow_article_mismatch)
-
-        ttk.Button(search_bar, text="SAVE", width=10, command=save_pg_x).grid(row=0, column=5, sticky="e", padx=(6, 0))
 
         def edit_pg_x_row(event):
             if current_sheet["name"] not in ("PG-X", "Orders"):
@@ -939,6 +942,10 @@ class BigliettiTab(ttk.Frame):
                 datasets, refresh_records, rebuild,
             ),
         ).pack(side="left", padx=(14, 4))
+        ttk.Button(
+            actions, text="📦 Export Pick List",
+            command=lambda: self._export_pick_list_shared(window, selected, record_by_iid, current_sheet["name"]),
+        ).pack(side="left", padx=4)
         ttk.Button(
             actions, text="🖨  Print Selected Biglietti",
             command=lambda: self._print_selected_shared(
@@ -1252,6 +1259,276 @@ class BigliettiTab(ttk.Frame):
             self.after(0, lambda exc=exc: messagebox.showerror("Biglietti Error", str(exc)))
         finally:
             self.after(0, lambda: self.convert_btn.config(state="normal"))
+
+    def _smart_auto_assign_pg_x(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
+        """Automatically match available raw yarn in Magazino Filato with PG-X rows,
+        display an interactive approval modal, and move matched rows to Orders."""
+        pgx_records = datasets.get("PG-X", [])
+        if not pgx_records:
+            return messagebox.showinfo("Smart Auto-Assign", "There are no PG-X rows in the current order dataset.", parent=parent_window)
+
+        try:
+            _codes, _densita, _vmm, _prices, magazino_summary = self._load_common_sources()
+        except Exception as exc:
+            return messagebox.showerror("Magazino Load Error", f"Could not load Magazino Filato stock:\n{exc}", parent=parent_window)
+
+        if magazino_summary is None or magazino_summary.empty:
+            return messagebox.showinfo("No Stock Data", "Magazino Filato stock is empty or not uploaded.", parent=parent_window)
+
+        stock_pool = {}
+        for row in magazino_summary.itertuples(index=False):
+            art = str(getattr(row, "articolo", "") or "").strip().upper()
+            partita = str(getattr(row, "partita", "") or "").strip()
+            rocche = float(getattr(row, "mag_rocche", 0) or 0)
+            peso = float(getattr(row, "mag_peso", 0) or 0)
+            if art and partita and rocche > 0:
+                stock_pool.setdefault(art, []).append({"partita": partita, "rocche": rocche, "peso": peso})
+
+        for art in stock_pool:
+            stock_pool[art].sort(key=lambda b: b["rocche"])
+
+        suggestions = []
+        used_capacity = {}
+
+        for record in pgx_records:
+            raw_b = str(record.raw_batch or "").strip().upper().replace(" ", "")
+            if raw_b not in {"", "X", "PG-X", "PGX"}:
+                continue
+
+            raw_art = str(record.article or "").strip().upper()
+            if raw_art.startswith("C"):
+                raw_art = "G" + raw_art[1:]
+
+            need_rocche = float(record.quantity_cones or 0)
+            candidates = stock_pool.get(raw_art, [])
+
+            matching_batch = None
+            for b in candidates:
+                rem = b["rocche"] - used_capacity.get(b["partita"], 0)
+                if rem >= need_rocche:
+                    matching_batch = b
+                    break
+
+            if matching_batch:
+                used_capacity[matching_batch["partita"]] = used_capacity.get(matching_batch["partita"], 0) + need_rocche
+                suggestions.append({
+                    "record": record,
+                    "partita_col": str(record.colored_batch or ""),
+                    "cliente": str(record.customer_name or ""),
+                    "articolo": str(record.article or ""),
+                    "rocche": record.quantity_cones,
+                    "suggested_partita": matching_batch["partita"],
+                    "available_rocche": matching_batch["rocche"],
+                })
+
+        if not suggestions:
+            return messagebox.showinfo("Smart Auto-Assign", "No matching raw-yarn stock found in Magazino Filato for current PG-X rows.", parent=parent_window)
+
+        preview = tk.Toplevel(parent_window)
+        preview.title("⚡ Smart Auto-Assign Matches")
+        preview.geometry("860x460")
+        preview.minsize(700, 350)
+        preview.transient(parent_window)
+        preview.grab_set()
+
+        header_frame = ttk.Frame(preview, padding=10)
+        header_frame.pack(fill="x")
+        ttk.Label(
+            header_frame,
+            text=f"Found {len(suggestions)} auto-match(es) for PG-X rows in Magazino Filato!\nReview and select matches to approve:",
+            font=("Segoe UI", 10, "bold"), foreground="#16324f",
+        ).pack(anchor="w")
+
+        table_frame = ttk.Frame(preview, padding=(10, 0, 10, 10))
+        table_frame.pack(fill="both", expand=True)
+
+        columns = ("check", "partita_col", "cliente", "articolo", "rocche", "suggested_partita", "available_rocche")
+        headings = {
+            "check": "Assign", "partita_col": "Partita Col", "cliente": "Cliente",
+            "articolo": "Articolo", "rocche": "Rocche Needed",
+            "suggested_partita": "Suggested Partita GG", "available_rocche": "Stock Rocche",
+        }
+        widths = {"check": 65, "partita_col": 110, "cliente": 160, "articolo": 110, "rocche": 110, "suggested_partita": 140, "available_rocche": 110}
+
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
+        for col in columns:
+            tree.heading(col, text=headings[col])
+            tree.column(col, width=widths[col], anchor="center")
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        checked = {i: True for i in range(len(suggestions))}
+
+        def render_tree():
+            tree.delete(*tree.get_children())
+            for idx, item in enumerate(suggestions):
+                chk = "☑" if checked[idx] else "☐"
+                values = (chk, item["partita_col"], item["cliente"], item["articolo"], item["rocche"], item["suggested_partita"], f"{item['available_rocche']:g}")
+                tree.insert("", "end", iid=str(idx), values=values)
+
+        render_tree()
+
+        def toggle_check(event):
+            iid = tree.identify_row(event.y)
+            if iid:
+                idx = int(iid)
+                checked[idx] = not checked[idx]
+                render_tree()
+
+        tree.bind("<ButtonRelease-1>", toggle_check)
+
+        btn_frame = ttk.Frame(preview, padding=10)
+        btn_frame.pack(fill="x")
+
+        def approve_matches():
+            selected_suggestions = [suggestions[i] for i, is_chk in checked.items() if is_chk]
+            if not selected_suggestions:
+                return messagebox.showwarning("No Matches Selected", "Select at least one match to approve.", parent=preview)
+            preview.destroy()
+            self._apply_auto_assigned_matches(parent_window, selected_suggestions, datasets, refresh_records, rebuild, partita_gg_var)
+
+        ttk.Button(btn_frame, text=f"✅ Approve & Assign Matches ({len(suggestions)})", command=approve_matches).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=preview.destroy).pack(side="right", padx=4)
+
+    def _apply_auto_assigned_matches(self, parent_window, selected_suggestions, datasets, refresh_records, rebuild, partita_gg_var):
+        loading = tk.Toplevel(parent_window)
+        loading.title("Assigning Stock...")
+        loading.geometry("340x100")
+        keep_window_on_top(loading)
+        ttk.Label(loading, text="Assigning Partita GG & moving rows to Orders...", padding=20).pack()
+
+        def worker():
+            try:
+                _codes, densita_map, vmm_ratio_map, _prices, magazino_summary = self._load_common_sources()
+                updated_count = 0
+                for item in selected_suggestions:
+                    partita_col = item["partita_col"]
+                    partita_gg = item["suggested_partita"]
+                    res = save_pg_x_partita(
+                        self.shared_excel_path, partita_col, partita_gg,
+                        densita_map=densita_map, vmm_ratio_map=vmm_ratio_map,
+                        magazino_summary=magazino_summary,
+                        allow_article_mismatch=False,
+                    )
+                    updated_count += res.get("updated", 0)
+
+                new_datasets = {
+                    "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                    "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                }
+                self.after(0, lambda: finish(loading, new_datasets, updated_count))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: fail(loading, exc))
+
+        def finish(loading, new_datasets, updated_count):
+            if loading.winfo_exists():
+                loading.destroy()
+            refresh_records(new_datasets)
+            partita_gg_var.set("")
+            rebuild()
+            messagebox.showinfo("Auto-Assign Complete", f"Successfully assigned Partita GG & moved {updated_count} row(s) to Orders!", parent=parent_window)
+
+        def fail(loading, exc):
+            if loading.winfo_exists():
+                loading.destroy()
+            messagebox.showerror("Auto-Assign Error", str(exc), parent=parent_window)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _export_pick_list_shared(self, parent_window, selected: dict[str, bool], record_by_iid: dict[str, object], current_sheet_name: str):
+        """Export a formatted Excel Pick List (إذن سحب خيط خام من المخزن) for warehouse staff."""
+        checked_records = [record_by_iid[iid] for iid, is_selected in selected.items() if is_selected]
+        if not checked_records:
+            checked_records = [record for iid, record in record_by_iid.items() if record_by_iid.get(iid)]
+
+        if not checked_records:
+            return messagebox.showwarning("No Data", "There are no records to export.", parent=parent_window)
+
+        path = filedialog.asksaveasfilename(
+            parent=parent_window,
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile="Pick_List_Raw_Yarn.xlsx",
+            title="Export Raw Yarn Pick List (إذن سحب خام)",
+        )
+        if not path:
+            return
+
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Pick List"
+        ws.sheet_view.rightToLeft = False
+
+        ws.merge_cells("A1:J1")
+        title_cell = ws["A1"]
+        title_cell.value = "إذن سحب خيط خام من المخزن — Raw Yarn Pick List"
+        title_cell.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+        title_cell.fill = PatternFill("solid", fgColor="16324F")
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 35
+
+        headers = [
+            "Dispo / Riga", "Cliente", "Articolo (Raw)", "Partita GG",
+            "Rocche Needed", "Peso (KG)", "M/C", "Ordine", "Partita Col", "Consegna"
+        ]
+        ws.append(headers)
+        ws.row_dimensions[2].height = 25
+
+        header_fill = PatternFill("solid", fgColor="2C5282")
+        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        thin_border = Border(
+            left=Side(style="thin", color="CBD5E0"),
+            right=Side(style="thin", color="CBD5E0"),
+            top=Side(style="thin", color="CBD5E0"),
+            bottom=Side(style="thin", color="CBD5E0"),
+        )
+
+        for col_idx, text in enumerate(headers, start=1):
+            cell = ws.cell(row=2, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+        stripe_fill = PatternFill("solid", fgColor="F7FAFC")
+        white_fill = PatternFill("solid", fgColor="FFFFFF")
+
+        for idx, rec in enumerate(checked_records, start=3):
+            raw_art = str(rec.article or "").strip().upper()
+            if raw_art.startswith("C"):
+                raw_art = "G" + raw_art[1:]
+
+            row_vals = [
+                rec.dispo, rec.customer_name, raw_art, rec.raw_batch,
+                rec.quantity_cones, rec.kg, rec.machine, rec.order_no,
+                rec.colored_batch, rec.delivery
+            ]
+            ws.append(row_vals)
+            ws.row_dimensions[idx].height = 22
+            fill = stripe_fill if idx % 2 == 0 else white_fill
+
+            for col_idx in range(1, 11):
+                cell = ws.cell(row=idx, column=col_idx)
+                cell.fill = fill
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            col_letter = get_column_letter(col[0].column)
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+        wb.save(path)
+        wb.close()
+        messagebox.showinfo("Pick List Exported", f"Raw Yarn Pick List successfully created:\n{path}", parent=parent_window)
 
     def _pick_articoli(self):
         p = self._pick_file("Select Articoli.xlsx")
