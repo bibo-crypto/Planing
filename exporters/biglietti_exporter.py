@@ -1316,8 +1316,15 @@ def save_pg_x_partita(
     vmm_ratio_map: dict[int, float] | None = None,
     magazino_summary=None,
     allow_article_mismatch: bool = False,
+    lotto: str = "",
 ) -> dict[str, Any]:
-    """Assign raw yarn to a PG-X color, enrich it, and move it to Orders."""
+    """Assign raw yarn to a PG-X color, enrich it, and move it to Orders.
+
+    ``lotto`` is an optional identifier extracted from ``Commento``.  When it
+    is supplied, callers may validate it against the warehouse summary before
+    calling this function; the final Partita GG is always the selected stock
+    batch.
+    """
     from openpyxl import load_workbook
 
     densita_map = densita_map or {}
@@ -1365,6 +1372,18 @@ def save_pg_x_partita(
         rocche = _number(pg_ws.cell(row=row_idx, column=rocche_col).value) if rocche_col else 0
         values = {header: pg_ws.cell(row=row_idx, column=col_idx).value for header, col_idx in source_map.items()}
         values["Partita GG"] = partita_gg
+        comment_header = next((h for h in order_headers if _key(h) == _key("Commento")), None)
+        if comment_header:
+            # Preserve the suffix (PM-X, PO-123, etc.) while replacing the
+            # complete token immediately after PG-.  PG-X-PMX becomes
+            # PG-158922-PM-X, as required by the ERP import convention.
+            original_comment = _clean(values.get(comment_header))
+            if original_comment:
+                replaced = re.sub(r"(?i)(PG-)([^\s-]+)-?PM-?X",
+                                  lambda m: f"{m.group(1)}{partita_gg}-PM-X", original_comment, count=1)
+                if replaced == original_comment:
+                    replaced = re.sub(r"(?i)(PG-)[^-\s]+", rf"\g<1>{partita_gg}", original_comment, count=1)
+                values[comment_header] = replaced
         if magazino_summary is not None:
             color_article = _clean(values.get("Articolo")).upper()
             expected_raw_article = "G" + color_article[1:] if color_article.startswith("C") else color_article
@@ -1390,6 +1409,12 @@ def save_pg_x_partita(
         if batch_number is not None and int(batch_number) in vmm_ratio_map:
             values["VMM22"] = round(vmm_ratio_map[int(batch_number)] * (rocche or 0), 2)
         moved_rows.append([values.get(header, "") for header in order_headers])
+
+    # The old implementation updated the PG-X row in place but never
+    # appended the prepared row to Orders, so the UI claimed success while
+    # the assigned color disappeared on the next reload.
+    for row in moved_rows:
+        orders_ws.append(row)
 
     for row_idx, row in zip(matching_rows, moved_rows):
         values = dict(zip(order_headers, row))

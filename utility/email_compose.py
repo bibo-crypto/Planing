@@ -175,3 +175,28 @@ def open_outlook_email(template: EmailTemplate, attachments: list[Path], sender_
             "its own and finish adding your email account there; after that "
             "this button will attach to it directly."
         ) from exc
+
+
+def send_outlook_email(template: EmailTemplate, attachments: list[Path], sender_email: str = "") -> None:
+    """Send a prepared Outlook message; intended for an explicitly enabled schedule."""
+    try:
+        outlook = _outlook_application()
+        mail = outlook.CreateItem(0)
+        mail.To = template.to
+        mail.CC = template.cc
+        mail.Subject = template.subject
+        mail.Body = template.body
+        if sender_email.strip():
+            selected = next((account for account in outlook.Session.Accounts
+                             if str(getattr(account, "SmtpAddress", "")).strip().casefold() == sender_email.strip().casefold()), None)
+            if selected is None:
+                raise RuntimeError(f"The Outlook account '{sender_email}' is not connected on this computer.")
+            mail.SendUsingAccount = selected
+        for path in attachments:
+            if path and Path(path).is_file():
+                mail.Attachments.Add(str(Path(path).resolve()))
+        mail.Send()
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Could not send the Outlook email: {exc}") from exc

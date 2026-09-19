@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import re
 import tkinter as tk
 from datetime import date, datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ for _exporter_function in (
 from utility.articoli_cache import load_articoli_cache, save_articoli_cache
 from utility.densita_cache import load_densita_cache, save_densita_cache
 from utility.magazino_cache import load_magazino_cache
+from utility.lotti_cache import load_lotti_cache
 from utility.prezzi_cache import load_prezzi_cache
 from utility.path_manager import save_source, source_path
 from utility.email_compose import (
@@ -38,7 +40,9 @@ from utility.email_compose import (
     get_outlook_accounts,
     open_outlook_account_setup,
     open_outlook_email,
+    send_outlook_email,
 )
+from calculate.order_report import export_report, pg_x_demand, report_path, schedule_due, schedule_stamp
 from utility.utils import keep_window_on_top, lazy_call
 
 # Filato x Tinturia here follows the same convention as Ordine Kamal/Ordine
@@ -83,6 +87,7 @@ class BigliettiTab(ttk.Frame):
         self._last_client_files: dict[str, list[Path]] = {"elvy": [], "med": [], "el_kamal": []}
         self._build()
         self._restore()
+        self.after(60000, self._run_pgx_report_schedule)
 
     def _build(self):
         # This page is taller than the available client area on smaller
@@ -173,6 +178,7 @@ class BigliettiTab(ttk.Frame):
         self.shared_excel_label = ttk.Label(shared_box, text="Not selected — Convert will append here", foreground="grey", anchor="w")
         self.shared_excel_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
         ttk.Button(shared_box, text="📋  Show Orders", command=self._show_shared_orders, width=24).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(shared_box, text="📊  PG-X Orders Report", command=self._show_pgx_report, width=24).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         action_box = ttk.LabelFrame(content, text=" 6. Generate ", style="Section.TLabelframe")
         action_box.pack(fill="x", padx=4, pady=(8, 4))
@@ -527,6 +533,107 @@ class BigliettiTab(ttk.Frame):
         loading.transient(self.winfo_toplevel())
         ttk.Label(loading, text="Loading orders...", anchor="center").pack(expand=True, fill="both", padx=20, pady=20)
         threading.Thread(target=self._load_shared_orders_worker, args=(self.shared_excel_path, loading), daemon=True).start()
+
+    def _show_pgx_report(self):
+        """Show total open PG-X demand per Titolo and configure delivery."""
+        if not self.shared_excel_path or not self.shared_excel_path.is_file():
+            return messagebox.showwarning("Missing Shared Excel", "Select the shared Excel file first.")
+        try:
+            records = load_create_excel_records(self.shared_excel_path, sheet_name="PG-X")
+            frame = pg_x_demand(records)
+        except Exception as exc:
+            return messagebox.showerror("PG-X Report Error", str(exc))
+        if frame.empty:
+            return messagebox.showinfo("PG-X Report", "There are no open PG-X rows.")
+
+        window = tk.Toplevel(self)
+        window.title("PG-X Orders Report")
+        window.geometry("980x600")
+        window.minsize(760, 420)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        ttk.Label(window, text="Open raw-yarn demand grouped by Titolo", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=10)
+        table_frame = ttk.Frame(window, padding=(12, 0, 12, 8))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1); table_frame.columnconfigure(0, weight=1)
+        columns = list(frame.columns)
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=180 if col == "Titolo" else 120, anchor="center")
+        for row in frame.itertuples(index=False, name=None):
+            tree.insert("", "end", values=tuple(round(v, 2) if isinstance(v, float) else v for v in row))
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        settings = dict(self._prefs.get("pgx_report_schedule", {}) or {})
+        form = ttk.LabelFrame(window, text="Email report schedule", padding=8)
+        form.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        for col in range(7): form.columnconfigure(col, weight=1 if col == 1 else 0)
+        recipient = tk.StringVar(value=str(settings.get("recipient", "")))
+        frequency = tk.StringVar(value=str(settings.get("frequency", "daily")))
+        send_time = tk.StringVar(value=str(settings.get("time", "08:00")))
+        enabled = tk.BooleanVar(value=bool(settings.get("enabled", False)))
+        ttk.Label(form, text="To:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=recipient, width=34).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Label(form, text="Frequency:").grid(row=0, column=2, sticky="e", padx=(8, 3))
+        ttk.Combobox(form, textvariable=frequency, values=("daily", "weekly"), state="readonly", width=10).grid(row=0, column=3, sticky="w")
+        ttk.Label(form, text="Time (HH:MM):").grid(row=0, column=4, sticky="e", padx=(8, 3))
+        ttk.Entry(form, textvariable=send_time, width=8).grid(row=0, column=5, sticky="w")
+        ttk.Checkbutton(form, text="Enable", variable=enabled).grid(row=0, column=6, sticky="w", padx=8)
+
+        def save_schedule():
+            value = {"enabled": enabled.get(), "recipient": recipient.get().strip(), "frequency": frequency.get(), "time": send_time.get().strip(), "last_sent": settings.get("last_sent", "")}
+            self._save_prefs(pgx_report_schedule=value)
+            settings.update(value)
+            messagebox.showinfo("PG-X Report", "Schedule saved. The application will prepare the Outlook report at the selected time.", parent=window)
+
+        def prepare_email():
+            path = export_report(frame, report_path(self.shared_excel_path))
+            template = EmailTemplate(to=recipient.get().strip(), subject="PG-X Orders Report", body="Attached is the current PG-X raw-yarn demand report.")
+            try:
+                open_outlook_email(template, [path], self._sender_email)
+            except Exception as exc:
+                messagebox.showerror("Email", str(exc), parent=window)
+
+        def send_now():
+            if not recipient.get().strip():
+                return messagebox.showwarning("Email", "Enter a recipient first.", parent=window)
+            if not messagebox.askyesno("Send PG-X report", f"Send the report now to {recipient.get().strip()}?", parent=window):
+                return
+            try:
+                path = export_report(frame, report_path(self.shared_excel_path))
+                send_outlook_email(EmailTemplate(to=recipient.get().strip(), subject="PG-X Orders Report", body="Attached is the current PG-X raw-yarn demand report."), [path], self._sender_email)
+                messagebox.showinfo("Email", "Report sent successfully.", parent=window)
+            except Exception as exc:
+                messagebox.showerror("Email", str(exc), parent=window)
+
+        buttons = ttk.Frame(window, padding=(12, 0, 12, 12)); buttons.grid(row=3, column=0, sticky="ew")
+        ttk.Button(buttons, text="Save Schedule", command=save_schedule).pack(side="left")
+        ttk.Button(buttons, text="Prepare Email Now", command=prepare_email).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Send Email Now", command=send_now).pack(side="left")
+        ttk.Button(buttons, text="Export Excel", command=lambda: messagebox.showinfo("PG-X Report", f"Saved to:\n{export_report(frame, report_path(self.shared_excel_path))}", parent=window)).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+
+    def _run_pgx_report_schedule(self):
+        """Prepare the configured report once per scheduled day."""
+        try:
+            schedule = dict(self._prefs.get("pgx_report_schedule", {}) or {})
+            if schedule_due(schedule):
+                records = load_create_excel_records(self.shared_excel_path, sheet_name="PG-X") if self.shared_excel_path and self.shared_excel_path.is_file() else []
+                frame = pg_x_demand(records)
+                if not frame.empty:
+                    path = export_report(frame, report_path(self.shared_excel_path))
+                    template = EmailTemplate(to=schedule["recipient"], subject="PG-X Orders Report", body="Attached is the scheduled PG-X raw-yarn demand report.")
+                    send_outlook_email(template, [path], self._sender_email)
+                    schedule["last_sent"] = schedule_stamp()
+                    self._save_prefs(pgx_report_schedule=schedule)
+        except Exception as exc:
+            self._logger.exception("Scheduled PG-X report failed: %s", exc)
+        finally:
+            self.after(60000, self._run_pgx_report_schedule)
 
     def _load_shared_orders_worker(self, path: Path, loading: tk.Toplevel):
         try:
@@ -1276,13 +1383,18 @@ class BigliettiTab(ttk.Frame):
             return messagebox.showinfo("No Stock Data", "Magazino Filato stock is empty or not uploaded.", parent=parent_window)
 
         stock_pool = {}
+        stock_by_lotto = {}
         for row in magazino_summary.itertuples(index=False):
             art = str(getattr(row, "articolo", "") or "").strip().upper()
             partita = str(getattr(row, "partita", "") or "").strip()
+            lotto = str(getattr(row, "lotto", "") or "").strip()
             rocche = float(getattr(row, "mag_rocche", 0) or 0)
             peso = float(getattr(row, "mag_peso", 0) or 0)
             if art and partita and rocche > 0:
-                stock_pool.setdefault(art, []).append({"partita": partita, "rocche": rocche, "peso": peso})
+                item = {"partita": partita, "rocche": rocche, "peso": peso, "lotto": lotto, "articolo": art}
+                stock_pool.setdefault(art, []).append(item)
+                if lotto:
+                    stock_by_lotto.setdefault(lotto.casefold(), []).append(item)
 
         for art in stock_pool:
             stock_pool[art].sort(key=lambda b: b["rocche"])
@@ -1300,7 +1412,14 @@ class BigliettiTab(ttk.Frame):
                 raw_art = "G" + raw_art[1:]
 
             need_rocche = float(record.quantity_cones or 0)
-            candidates = stock_pool.get(raw_art, [])
+            comment = str(getattr(record, "commento", "") or getattr(record, "additional_raw", "") or "")
+            lotto_match = re.search(r"(?i)PG-([^-\s]+)", comment)
+            requested_lotto = lotto_match.group(1).strip() if lotto_match else ""
+            candidates = stock_by_lotto.get(requested_lotto.casefold(), []) if requested_lotto and requested_lotto.upper() != "X" else []
+            # Lotto is authoritative when present. If no matching Lotto exists,
+            # use the requested color's raw article as the fallback.
+            if not candidates:
+                candidates = stock_pool.get(raw_art, [])
 
             matching_batch = None
             for b in candidates:
@@ -1592,6 +1711,16 @@ class BigliettiTab(ttk.Frame):
             from calculate import magazino as magazino_logic
             magazino_df, _errors = magazino_logic.load_magazino(Path(magazino_path), articolo_prefix=None)
             magazino_summary = magazino_logic.summarize_by_partita(magazino_df)
+            # Keep Lotto attached to the warehouse summary when the optional
+            # LOTTI source is available. This lets PG-X resolve a Commento
+            # token (PG-<Lotto>-...) before falling back to article matching.
+            lotti_path = load_lotti_cache().get("source_path", "")
+            if lotti_path and Path(lotti_path).is_file():
+                from calculate import lotti as lotti_logic
+                lotti_df, _lotti_errors = lotti_logic.load_lotti(Path(lotti_path))
+                lotti_summary = lotti_logic.summarize_by_partita(lotti_df)
+                if not lotti_summary.empty:
+                    magazino_summary = magazino_summary.merge(lotti_summary, on="partita", how="left")
         price_lookup, _price_source = load_prezzo_lookup()
         return codes_map, densita_map, vmm_ratio_map, price_lookup, magazino_summary
 

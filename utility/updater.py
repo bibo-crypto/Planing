@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 import zipfile
 
 
-DEFAULT_APP_VERSION = "1.0.2"
+DEFAULT_APP_VERSION = "1.0.3"
 GITHUB_REPOSITORY = "bibo-crypto/Planing"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
@@ -26,6 +26,8 @@ def version_file_path() -> Path:
     """Return the installed version file, supporting PyInstaller's _internal layout."""
     if getattr(sys, "frozen", False):
         install_dir = Path(sys.executable).resolve().parent
+        # The external file is authoritative: the updater can replace it
+        # without rebuilding the PyInstaller internal archive.
         for candidate in (install_dir / "version.txt", install_dir / "_internal" / "version.txt"):
             if candidate.is_file():
                 return candidate
@@ -41,6 +43,19 @@ def get_installed_version() -> str:
     except OSError:
         pass
     return DEFAULT_APP_VERSION
+
+
+def write_version_file(version: str, target: Path | None = None) -> Path:
+    """Atomically write the installed version and return the written path."""
+    path = target or version_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(str(version).strip().lstrip("vV") + "\n", encoding="utf-8")
+    temporary.replace(path)
+    written = path.read_text(encoding="utf-8").strip().lstrip("vV")
+    if written != str(version).strip().lstrip("vV"):
+        raise RuntimeError(f"The version file could not be verified at {path}.")
+    return path
 
 
 APP_VERSION = get_installed_version()
@@ -249,7 +264,13 @@ try {{
     }}
 
     if ($copied) {{
-        Set-Content -LiteralPath (Join-Path $target 'version.txt') -Value {_powershell_quote(new_version)} -Encoding UTF8
+        $versionPath = Join-Path $target 'version.txt'
+        $versionValue = {_powershell_quote(new_version)}
+        $versionTemp = Join-Path $target ('.version.' + $PID + '.tmp')
+        Set-Content -LiteralPath $versionTemp -Value $versionValue -Encoding UTF8
+        Move-Item -LiteralPath $versionTemp -Destination $versionPath -Force
+        $writtenVersion = (Get-Content -LiteralPath $versionPath -Raw).Trim().TrimStart('v','V')
+        if ($writtenVersion -ne $versionValue.Trim().TrimStart('v','V')) {{ throw "version.txt verification failed: '$writtenVersion'" }}
         Start-Process -FilePath $exePath -WorkingDirectory $target
         # Antivirus commonly intercepts a freshly-written, unsigned exe on
         # its first launch -- it can run its own scan/sandbox pass, kill
