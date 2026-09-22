@@ -22,6 +22,7 @@ Bolla tab
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 import logging
 import queue
@@ -256,7 +257,19 @@ class ConverterApp(tk.Tk):
                 Path(sys.executable).resolve().parent,
                 self._pending_update_version,
             )
+            # self.destroy() alone stops mainloop() but does not guarantee
+            # the OS process actually terminates -- if anything is still
+            # holding a reference (a lingering thread, a live COM object
+            # from the Outlook integration, etc.), Windows can leave this
+            # process running in the background, still holding the exe/DLL
+            # file locks the update script needs released. That makes every
+            # copy attempt fail, so the "update" silently never applies and
+            # a manual relaunch just finds the same old version asking to
+            # update again. sys.exit(0) forces the interpreter -- and the
+            # process -- to actually end here. (Same fix already proven in
+            # DyeMaster Pro's updater for this exact symptom.)
             self.destroy()
+            sys.exit(0)
         except Exception as exc:  # noqa: BLE001
             if getattr(self, "_update_window", None) and self._update_window.winfo_exists():
                 self._update_window.destroy()
@@ -297,6 +310,7 @@ class ConverterApp(tk.Tk):
         from gui.tabs.overview_tab import OverviewTab
         from gui.tabs.prezzi_tab import PrezziTab
         from gui.tabs.situazione_settimana_tab import SettimanaTab
+        from gui.tabs.weekly_machine_plan_tab import WeeklyMachinePlanTab
         from gui.tabs.situazione_tab import SituazioneTab
         from gui.tabs.master_data_tab import MasterDataTab
 
@@ -387,6 +401,7 @@ class ConverterApp(tk.Tk):
         self._biglietti_tab = BigliettiTab(
             notebook, self._prefs, self._save_prefs, logger,
             on_shared_cache_changed=self._on_shared_cache_changed,
+            on_notification=self._add_notification,
         )
         notebook.add(self._biglietti_tab, text="Create (EXCEL+Biglietti)")
 
@@ -446,6 +461,9 @@ class ConverterApp(tk.Tk):
         self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         situazione_notebook.add(self._settimana_tab, text="Situazione Settimanale")
 
+        self._weekly_machine_plan_tab = WeeklyMachinePlanTab(situazione_notebook, self._settimana_tab)
+        situazione_notebook.add(self._weekly_machine_plan_tab, text="Piano Macchine")
+
         # Ordine Med's Consegna auto-scheduling needs Situazione's live
         # current_df + Copertura data, which doesn't exist until now.
         self._ordine_med_tab._situazione_tab = self._situazione_tab
@@ -500,6 +518,11 @@ class ConverterApp(tk.Tk):
             try:
                 if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._settimana_tab):
                     self._settimana_tab.on_shown()
+            except tk.TclError:
+                pass
+            try:
+                if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._weekly_machine_plan_tab):
+                    self._weekly_machine_plan_tab.refresh()
             except tk.TclError:
                 pass
             try:
@@ -607,7 +630,7 @@ class ConverterApp(tk.Tk):
                     sheet.append((item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("message", ""), item.get("created_at", "")))
                 sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
                 for cell in sheet[1]: cell.font = cell.font.copy(bold=True)
-                workbook.save(path); workbook.close()
+                safe_save_workbook(workbook, path); workbook.close()
                 messagebox.showinfo("Notifications", f"Export completed:\n{path}", parent=win)
             except Exception as exc:
                 messagebox.showerror("Export error", str(exc), parent=win)

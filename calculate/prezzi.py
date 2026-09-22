@@ -55,10 +55,68 @@ def load_prezzi(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:
     if cache_key is not None and cache_key in _PREZZI_CACHE:
         return _PREZZI_CACHE[cache_key]
 
+    disk_hit = _load_disk_cache(cache_key) if cache_key is not None else None
+    if disk_hit is not None:
+        if cache_key is not None:
+            _PREZZI_CACHE[cache_key] = disk_hit
+        return disk_hit
+
     result = _load_prezzi_uncached(path)
     if cache_key is not None and result[0] is not None:
         _PREZZI_CACHE[cache_key] = result
+        _save_disk_cache(cache_key, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Persistent (on-disk) cache -- _PREZZI_CACHE above only survives for the
+# life of the running process, so it cannot help the very first Listini
+# read after opening the app, which the app's own startup profiling
+# (startup.prof/startup_after.prof) showed as the single largest chunk of
+# launch time (Listini is commonly a legacy .xls export, forced onto the
+# slow pure-Python xlrd engine). Mirroring that parsed result to a small
+# on-disk cache -- keyed by the same (path, mtime, size), invalidated the
+# same way -- means a re-launch against an unchanged Listini file skips the
+# slow Excel parse entirely, similar in spirit to Situazione's own SQLite
+# "show the DB snapshot immediately" pattern.
+# ---------------------------------------------------------------------------
+_DISK_CACHE_DIR = None
+
+
+def _disk_cache_dir() -> Path:
+    global _DISK_CACHE_DIR
+    if _DISK_CACHE_DIR is None:
+        from utility.utils import APP_DATA_DIR
+        _DISK_CACHE_DIR = APP_DATA_DIR / "cache"
+        _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _DISK_CACHE_DIR
+
+
+def _disk_cache_path(cache_key: tuple) -> Path:
+    import hashlib
+    digest = hashlib.sha1("|".join(str(part) for part in cache_key).encode("utf-8")).hexdigest()
+    return _disk_cache_dir() / f"prezzi_{digest}.pkl"
+
+
+def _load_disk_cache(cache_key: tuple):
+    path = _disk_cache_path(cache_key)
+    if not path.is_file():
+        return None
+    try:
+        df = pd.read_pickle(path)
+    except Exception:  # noqa: BLE001 -- a corrupt/stale cache file must never block loading
+        return None
+    return df, []
+
+
+def _save_disk_cache(cache_key: tuple, result: tuple) -> None:
+    df, errors = result
+    if df is None or errors:
+        return
+    try:
+        df.to_pickle(_disk_cache_path(cache_key))
+    except Exception:  # noqa: BLE001 -- caching is best-effort, never blocks the real result
+        pass
 
 
 def _load_prezzi_uncached(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:

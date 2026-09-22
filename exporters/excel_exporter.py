@@ -15,6 +15,7 @@ Formatting applied
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 from datetime import datetime
 from pathlib import Path
@@ -338,7 +339,7 @@ class ExcelExporter(_LegacyMethodShims):
                         cell.alignment = Alignment(horizontal="center", vertical="center")
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(self.output_path)
+        safe_save_workbook(wb, self.output_path)
         logger.info("Export completed: %s", self.output_path)
 
     # ------------------------------------------------------------------

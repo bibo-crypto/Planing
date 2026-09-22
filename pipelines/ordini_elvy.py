@@ -25,6 +25,7 @@ GRUPPO MACCHINA      — the physical machine number for the row's Abbina
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 import re
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from pathlib import Path
 
 from calculate.abbina_calculator import MACHINE_CODES
 from parsers.pdf_parser import OrderRow
+from utility.master_data import finished_articolo_for, raw_articolo_for
 from utility.utils import clean_text
 
 CLIENTE_CODE = 3009
@@ -202,7 +204,7 @@ def update_existing_ordini_file(target_path: Path, ordini_rows: list[OrdiniElvyR
             if isinstance(value, datetime):
                 cell.number_format = "DD/MM/YYYY"
 
-    wb.save(target_path)
+    safe_save_workbook(wb, target_path)
     wb.close()
     return len(ordini_rows)
 
@@ -296,7 +298,7 @@ def update_existing_filato_file(target_path: Path, matches: list[RawYarnMatch]) 
         for col_idx, attr in col_attr.items():
             ws.cell(row=row_idx, column=col_idx).value = getattr(match, attr, None)
 
-    wb.save(target_path)
+    safe_save_workbook(wb, target_path)
     wb.close()
     return len(matches)
 
@@ -326,7 +328,7 @@ def export_ordini_full(target_path: Path, ordini_rows: list) -> int:
     freeze_and_filter(ws, ORDINI_ELVY_COLUMNS)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(target_path)
+    safe_save_workbook(wb, target_path)
     wb.close()
     return len(ordini_rows)
 
@@ -372,7 +374,7 @@ def export_filato_full(
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(target_path)
+    safe_save_workbook(wb, target_path)
     wb.close()
     return len(matches)
 
@@ -432,7 +434,9 @@ def match_raw_yarn(
         articolo_c = clean_text(row.articolo_delta).upper()
         if not articolo_c.startswith("C"):
             continue
-        articolo_g = "G" + articolo_c[1:]
+        articolo_g = raw_articolo_for(articolo_c)
+        if not articolo_g.startswith("G"):
+            continue
         groups.setdefault(articolo_g, []).append(i)
 
     matches: list[RawYarnMatch] = []
@@ -440,7 +444,7 @@ def match_raw_yarn(
     def _assign(idxs, batch, quantity_used, art_g):
         for i in idxs:
             ordini_rows[i].commento = ordini_rows[i].commento.replace("PG-X", f"PG-{batch['partita']}")
-        articolo_c_for_lookup = "C" + art_g[1:] if art_g.upper().startswith("G") else art_g
+        articolo_c_for_lookup = finished_articolo_for(art_g)
         titolo = (codes_map or {}).get(articolo_c_for_lookup, "")
         if batch_capacity_attr == "rocche":
             peso_used = batch["peso"] * (quantity_used / batch["rocche"]) if batch["rocche"] else 0.0

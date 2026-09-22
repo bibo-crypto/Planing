@@ -355,16 +355,21 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
 
     df["new_comment"] = df.apply(_row_new_comment, axis=1)
 
-    # Custom flag column: "Check" when the visible report fields identify a
-    # genuine quality delay: C.Q == OO, New Comment == C.Q, and more than
-    # 4 days have passed in Q.C without shipment.
+    # Custom flag column: "Check" when a color has already cleared Q.C.
+    # (C.Q is anything other than "OO"), Qualita' recorded a data_qualita
+    # for it, there is still no Data Uscita (no invoice/exit yet), and more
+    # than 3 days have passed since that data_qualita. This mirrors the
+    # Overview tab's "Colori pronti da spedire (senza uscita)" rule -- both
+    # are meant to catch the same real-world case (matched by qualita_df's
+    # partita col) -- fixed from the previous C.Q == "OO" / 4-day / tinto-
+    # based version, which flagged the opposite case (still queued, not yet
+    # past Q.C) instead of "cleared Q.C. but not shipped".
     def _custom_flag(r):
-        cq = r.get("cq")
-        tinto = r["tinto"] if pd.notna(r["tinto"]) else None
+        cq = str(r.get("cq") or "").strip().upper()
+        dq = r["data_qualita"] if pd.notna(r["data_qualita"]) else None
         du = r["data_uscita"] if pd.notna(r["data_uscita"]) else None
-        new_comment = str(r.get("new_comment") or "").strip().casefold()
-        if cq == "OO" and new_comment == "c.q" and tinto is not None and du is None:
-            if (today - tinto).days > 4:
+        if cq and cq != "OO" and dq is not None and du is None:
+            if (today - dq).days > 3:
                 return "Check"
         return ""
 
@@ -386,7 +391,7 @@ def compute_situation(orders_df, dfm_df=None, data_prod_df=None,
     keep = ["partita", "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
             "data", "delivery_date", "consegna", "rocche", "mc", "comment", "cq", "bagno", "tinto",
             "planedate", "data_qualita", "data_uscita", "custom", "days_in_qc", "ritardo_consegna",
-            "old_comment", "new_comment"]
+            "old_comment", "new_comment", "prezzo"]
     for c in keep:
         if c not in df.columns:
             df[c] = ""
@@ -409,11 +414,16 @@ _LOTTO_IN_COMMENT_RE = re.compile(r"PG-X\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
 
 
 def _finished_articolo_to_raw(articolo) -> str | None:
-    """C1701234 -> G1701234, same C->G rule used by ordini_elvy.match_raw_yarn()."""
+    """Resolve a finished colour's Articolo to its raw-yarn Articolo, via
+    utility.master_data.raw_articolo_for() -- the Delave override table
+    first (Delave colours don't share digits with their raw yarn the way a
+    normal C010032S -> G010032S colour does), then the plain C -> G rule."""
     a = clean_text(articolo).upper()
-    if a.startswith("C") and len(a) > 1:
-        return "G" + a[1:]
-    return None
+    if not a:
+        return None
+    from utility.master_data import raw_articolo_for
+    resolved = raw_articolo_for(a)
+    return resolved if resolved and resolved != a else None
 
 
 def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
@@ -663,6 +673,49 @@ def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
     if merged.empty:
         return {}
     return merged.groupby("machine_number").size().to_dict()
+
+
+def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFrame:
+    """Build the dyeing queue in Copertura order, two colors per machine/day.
+
+    Friday is skipped.  The queue is joined by normalized Bagno, while the
+    displayed color/order fields come from Situazione Generale.
+    """
+    columns = ["machine", "dye_date", "bagno", "colore", "titolo", "articolo", "partita", "rocche", "cliente", "ordine", "riga"]
+    if situation_df is None or situation_df.empty or copertura_df is None or copertura_df.empty:
+        return pd.DataFrame(columns=columns)
+    if not {"bagno", "machine"}.issubset(copertura_df.columns) or "bagno" not in situation_df.columns:
+        return pd.DataFrame(columns=columns)
+    left = situation_df.copy().reset_index(drop=True)
+    right = copertura_df.copy().reset_index(drop=True)
+    left["_bagno_key"] = left["bagno"].map(bagno_key)
+    right["_bagno_key"] = right["bagno"].map(bagno_key)
+    right["_copertura_order"] = right.index
+    right["_machine_number"] = right["machine"].map(machine_number_from_label)
+    right = right[right["_machine_number"].between(3, 12, inclusive="both")]
+    right = right.drop_duplicates("_bagno_key", keep="first")
+    merged = left.merge(right[["_bagno_key", "_machine_number", "_copertura_order"]], on="_bagno_key", how="inner")
+    if merged.empty:
+        return pd.DataFrame(columns=columns)
+    merged = merged.sort_values(["_machine_number", "_copertura_order", "_bagno_key"], kind="stable")
+    start = today or datetime.now().date()
+    dates = {}
+    for machine, group in merged.groupby("_machine_number", sort=True):
+        day = start
+        for index, row_index in enumerate(group.index):
+            slot = index % 2
+            if slot == 0:
+                while day.weekday() == 4:
+                    day += timedelta(days=1)
+            dates[row_index] = day
+            if slot == 1:
+                day += timedelta(days=1)
+    merged["dye_date"] = merged.index.map(lambda idx: dates[idx].strftime("%Y-%m-%d"))
+    merged["machine"] = merged["_machine_number"].astype(int)
+    for col in columns:
+        if col not in merged.columns:
+            merged[col] = ""
+    return merged[columns].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

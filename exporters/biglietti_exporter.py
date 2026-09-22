@@ -27,6 +27,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from calculate.constants import MACHINE_CAPACITIES
+from utility.excel_io import safe_save_workbook
+from utility.master_data import raw_articolo_for
 
 
 def _clean(v: Any) -> str:
@@ -507,6 +509,7 @@ class OrderRecord:
     vmm22: float | int | None = None
     prezzo: Any = ""
     delivery_date: Any = ""
+    print_flag: str = ""
 
 
 def _read_sheet_rows(ws) -> list[dict[str, Any]]:
@@ -999,7 +1002,7 @@ def export_workbook(
         days_until_highlight_columns={"Delivery Date": 4},
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
 
 
@@ -1012,7 +1015,7 @@ CREATE_EXCEL_HEADERS = [
     "Colore", "Rocche", "KG", "M/C", "Partita Col", "Consegna",
     "Commento", "Bagno", "Partita GG", "Delivery Date", "Partita MED",
     "Cliente MED", "POLMON", "Color Tube", "VMM22", "Prezzo",
-    "Densita` (360-390)",
+    "Densita` (360-390)", "Print",
 ]
 
 
@@ -1026,7 +1029,7 @@ def _create_excel_row(record: OrderRecord, customer: str) -> list[Any]:
         record.kg, record.machine, record.colored_batch, record.delivery,
         record.commento, record.bagno, record.raw_batch, record.delivery_date,
         record.partita_med, record.cliente_med, polmon, record.color_tube,
-        record.vmm22, record.prezzo, record.densita,
+        record.vmm22, record.prezzo, record.densita, record.print_flag,
     ]
 
 
@@ -1067,6 +1070,10 @@ def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -
         headers = list(CREATE_EXCEL_HEADERS)
         ws.append(headers)
 
+    if "Print" not in headers:
+        headers.append("Print")
+        ws.cell(row=1, column=len(headers)).value = "Print"
+
     pg_ws = wb["PG-X"] if "PG-X" in wb.sheetnames else wb.create_sheet("PG-X")
     if pg_ws.max_row == 1 and all(c.value is None for c in pg_ws[1]):
         pg_ws.delete_rows(1)
@@ -1078,6 +1085,9 @@ def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -
             pg_ws.delete_rows(1, pg_ws.max_row)
         pg_headers = list(headers)
         pg_ws.append(pg_headers)
+    elif "Print" not in pg_headers:
+        pg_headers.append("Print")
+        pg_ws.cell(row=1, column=len(pg_headers)).value = "Print"
 
     # Migrate legacy shared files: rows without Partita GG belong on PG-X.
     raw_col = next((i + 1 for i, h in enumerate(headers) if _key(h) == _key("Partita GG")), None)
@@ -1137,9 +1147,36 @@ def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -
 
     sort_sheet(ws, headers)
     sort_sheet(pg_ws, pg_headers)
-    wb.save(path)
+    safe_save_workbook(wb, path)
+    _sync_workbook_history(path, wb)
     wb.close()
     return {"added": added, "skipped": skipped, "total": ws.max_row - 1 + pg_ws.max_row - 1}
+
+
+def _sync_workbook_history(path: Path, wb) -> None:
+    """Best-effort mirror of the live Create workbook into SQLite history."""
+    try:
+        from utility.orders_db import sync_rows
+        for sheet_name in ("Orders", "PG-X"):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            headers = [_clean(cell.value) for cell in ws[1]]
+            rows = [dict(zip(headers, values)) for values in ws.iter_rows(min_row=2, values_only=True)]
+            sync_rows(path, sheet_name, rows)
+    except Exception:
+        # History must never prevent the operational Excel export from saving.
+        pass
+
+
+def sync_workbook_history(path: Path) -> None:
+    """Import an existing Create workbook into SQLite without changing it."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        _sync_workbook_history(path, wb)
+    finally:
+        wb.close()
 
 
 def load_create_excel_records(path: Path, partita_gg: str = "", sheet_name: str = "Orders") -> list[OrderRecord]:
@@ -1177,6 +1214,7 @@ def load_create_excel_records(path: Path, partita_gg: str = "", sheet_name: str 
             kg=_number(_get(row, "KG")), color_tube=_clean(_get(row, "Color Tube")),
             vmm22=_number(_get(row, "VMM22")), prezzo=_get(row, "Prezzo"),
             densita=_get(row, "Densita` (360-390)"), delivery_date=_get(row, "Delivery Date"),
+            print_flag=_clean(_get(row, "Print")),
         ))
     if not out and not _clean(partita_gg):
         return []
@@ -1218,7 +1256,7 @@ def update_pg_x_row(path: Path, partita_col: str, updates: dict[str, Any]) -> in
                 for row_idx in matches:
                     ws.cell(row=row_idx, column=column).value = value
         _style_sheet(ws, date_columns=("Consegna", "Delivery Date"))
-        wb.save(path)
+        safe_save_workbook(wb, path)
         return len(matches)
     finally:
         wb.close()
@@ -1274,7 +1312,7 @@ def update_order_row(
             if not color_article and article_col_idx:
                 color_article = _clean(orders_ws.cell(row=matches[0], column=article_col_idx).value)
             color_article = color_article.upper()
-            expected_raw = "G" + color_article[1:] if color_article.startswith("C") else color_article
+            expected_raw = raw_articolo_for(color_article)
             batch_key = _partita_key(new_gg)
             matching_stock = magazino_summary[
                 (magazino_summary["articolo"].astype(str).str.strip().str.upper() == expected_raw)
@@ -1302,7 +1340,8 @@ def update_order_row(
 
         _style_sheet(orders_ws, date_columns=("Consegna", "Delivery Date"))
         _style_sheet(pg_ws, date_columns=("Consegna", "Delivery Date"))
-        wb.save(path)
+        safe_save_workbook(wb, path)
+        _sync_workbook_history(path, wb)
         return {"updated": len(matches), "moved_to_pgx": moved_to_pgx}
     finally:
         wb.close()
@@ -1386,7 +1425,7 @@ def save_pg_x_partita(
                 values[comment_header] = replaced
         if magazino_summary is not None:
             color_article = _clean(values.get("Articolo")).upper()
-            expected_raw_article = "G" + color_article[1:] if color_article.startswith("C") else color_article
+            expected_raw_article = raw_articolo_for(color_article)
             batch_key = str(int(batch_number)) if batch_number is not None else _clean(partita_gg)
             matching_stock = magazino_summary[
                 (magazino_summary["articolo"].astype(str).str.strip().str.upper() == expected_raw_article)
@@ -1433,7 +1472,8 @@ def save_pg_x_partita(
 
     sort_sheet(pg_ws, pg_headers)
     sort_sheet(orders_ws, order_headers)
-    wb.save(path)
+    safe_save_workbook(wb, path)
+    _sync_workbook_history(path, wb)
     wb.close()
     return {"updated": len(matching_rows), "partita_gg": partita_gg, "available": available_total}
 
@@ -1467,7 +1507,8 @@ def move_pg_x_to_orders(path: Path, partita_col: str) -> int:
             existing.add(_partita_key(row[order_col - 1]))
     for row_idx in reversed(matches):
         pg_ws.delete_rows(row_idx, 1)
-    wb.save(path)
+    safe_save_workbook(wb, path)
+    _sync_workbook_history(path, wb)
     wb.close()
     return len(matches)
 
@@ -1490,9 +1531,14 @@ def delete_pg_x_row(path: Path, partita_col: str) -> int:
     if not matches:
         wb.close()
         raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+    try:
+        from utility.orders_db import archive
+        archive(path, "PG-X", [ws.cell(row=r, column=col_idx).value for r in matches], reason="deleted")
+    except Exception:
+        pass
     for row_idx in reversed(matches):
         ws.delete_rows(row_idx, 1)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
     return len(matches)
 
@@ -1515,10 +1561,15 @@ def delete_shipped_shared_rows(path: Path, partita_cols, sheet_name: str) -> int
             row_idx for row_idx in range(2, ws.max_row + 1)
             if _partita_key(ws.cell(row=row_idx, column=col_idx).value) in shipped
         ]
+        try:
+            from utility.orders_db import archive
+            archive(path, sheet_name, [ws.cell(row=r, column=col_idx).value for r in matches], reason="shipped/invoiced")
+        except Exception:
+            pass
         for row_idx in reversed(matches):
             ws.delete_rows(row_idx, 1)
         _style_sheet(ws, date_columns=("Consegna", "Delivery Date"))
-        wb.save(path)
+        safe_save_workbook(wb, path)
         return len(matches)
     finally:
         wb.close()
@@ -1540,7 +1591,7 @@ def export_filato_workbook(
         ws.append([r[h] for h in headers])
     _style_sheet(ws)
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
 
 

@@ -123,6 +123,11 @@ def load_wincoint_orders(path):
         "rocche": df["Ordinata"],
         "comment": _s(df["Descrizione aggiuntiva ordine"]),
         "cq": _s(df["Bagno"]),
+        # The price actually entered in Wincoint for this Articolo+Codice
+        # (per-machine surcharge already baked in on the ERP side, if any).
+        # Optional/name-based like Ordine/Riga: some exports omit it, and a
+        # missing column must never break the rest of the load.
+        "prezzo": _s(df["Prezzo"]) if "Prezzo" in df.columns else "",
     })
     return out, []
 

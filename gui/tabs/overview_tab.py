@@ -33,6 +33,7 @@ and `tree.get_children()`, so it can be reused as-is on any other
 ttk.Treeview in the app, not just the ones built here.
 """
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -44,6 +45,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from utility.utils import load_settings, parse_number
+from utility import notifications
 import calculate.situazione as business_logic
 
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
@@ -65,7 +67,7 @@ HEADERS_IT = {
     "days_in_qc": "Giorni in C.Q",
     "days_to_delivery": "Giorni alla consegna",
     "ritardo_consegna": "Ritardo (gg)",
-    "prezzo": "Prezzo", "issue": "Problema",
+    "prezzo": "Prezzo Ord.", "prezzo_lisini": "Prezzo Listini", "issue": "Problema",
 }
 CHECK_COLUMNS = [
     "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
@@ -107,7 +109,7 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
         ws.title = "Overview"
         _write_typed_excel_table(ws, df)
         ws.freeze_panes = "A2"
-        wb.save(path)
+        safe_save_workbook(wb, path)
         wb.close()
     except Exception as exc:  # noqa: BLE001
         messagebox.showerror("Export Failed", str(exc), parent=parent)
@@ -284,6 +286,9 @@ class OverviewTab(ttk.Frame):
         self._lbl_updated = ttk.Label(toolbar, text="", foreground="#667085", font=("Segoe UI", 9))
         self._lbl_updated.pack(side="right")
 
+        self._notification_frame = ttk.LabelFrame(self, text=" Notifications ", padding=(8, 5))
+        self._notification_frame.pack(side="top", fill="x", padx=8, pady=(0, 4))
+
         outer = ttk.Frame(self)
         outer.pack(side="top", fill="both", expand=True, padx=4, pady=4)
 
@@ -375,6 +380,7 @@ class OverviewTab(ttk.Frame):
             getattr(self.magazino_tab, "_data_revision", 0),
             getattr(self.prezzi_tab, "_loaded_source_path", ""),
             len(prezzi_df) if isinstance(prezzi_df, pd.DataFrame) else 0,
+            len(notifications.list_open()),
         )
 
     def _on_choose_data_folder(self) -> None:
@@ -519,7 +525,28 @@ class OverviewTab(ttk.Frame):
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
+    def _render_notifications(self) -> None:
+        for child in self._notification_frame.winfo_children():
+            child.destroy()
+        items = notifications.list_open()
+        if not items:
+            ttk.Label(self._notification_frame, text="No open notifications", foreground="#2e7d32").pack(anchor="w")
+            return
+        for item in items[:8]:
+            row = ttk.Frame(self._notification_frame)
+            row.pack(fill="x", pady=1)
+            color = "#c62828" if item.get("severity") == "high" else "#9a3412"
+            ttk.Label(row, text=f"{item.get('title', 'Notification')}: ", foreground=color, font=("Segoe UI", 9, "bold")).pack(side="left")
+            ttk.Label(row, text=item.get("message", ""), foreground="#344054").pack(side="left", fill="x", expand=True)
+            key = item.get("key", "")
+            ttk.Button(row, text="Resolve", width=9, command=lambda key=key: self._resolve_notification(key)).pack(side="right")
+
+    def _resolve_notification(self, key: str) -> None:
+        notifications.resolve(key)
+        self.refresh(force=True)
+
     def _render(self, df: pd.DataFrame, magazino: pd.DataFrame) -> None:
+        self._render_notifications()
         for frame in (self._cards_frame, self._tables_frame):
             for widget in frame.winfo_children():
                 widget.destroy()
@@ -646,7 +673,7 @@ class OverviewTab(ttk.Frame):
 
         self._add_table(
             "Colori pronti da spedire (senza uscita)",
-            ready_df, ["cliente", "codice", "colore", "titolo", "prezzo", "partita", "rocche", "mc", "bagno"],
+            ready_df, ["cliente", "codice", "colore", "titolo", "prezzo", "prezzo_lisini", "partita", "rocche", "mc", "bagno"],
             "colori_pronti.xlsx",
         )
         self._add_table(
@@ -686,28 +713,12 @@ class OverviewTab(ttk.Frame):
         )
 
     def _add_machine_summary(self, situation_df: pd.DataFrame) -> None:
-        """Render Copertura machine totals as compact Overview cards."""
+        """Render clickable Copertura machine totals as schedule cards."""
         copertura = getattr(self.situazione_tab, "loaded_frames", {}).get("copertura")
+        schedule = business_logic.build_machine_schedule(situation_df, copertura)
         counts = {machine: 0 for machine in range(3, 13)}
-        if isinstance(copertura, pd.DataFrame) and not copertura.empty and not situation_df.empty:
-            if {"bagno", "machine"}.issubset(copertura.columns) and "bagno" in situation_df.columns:
-                def key(value):
-                    digits = "".join(ch for ch in str(value or "") if ch.isdigit()).lstrip("0")
-                    return digits or str(value or "").strip().casefold()
-
-                left = situation_df.copy()
-                right = copertura.copy()
-                left["_bagno_key"] = left["bagno"].map(key)
-                right["_bagno_key"] = right["bagno"].map(key)
-                joined = left.merge(right[["_bagno_key", "machine"]].drop_duplicates("_bagno_key"), on="_bagno_key", how="inner")
-
-                # Same parser the Copertura popup uses (business_logic.
-                # machine_number_from_label) -- kept in one place so a
-                # "5" vs "3305" style label is read identically in both
-                # views instead of silently under-counting here.
-                joined["_machine_number"] = joined["machine"].map(business_logic.machine_number_from_label)
-                valid = joined[joined["_machine_number"].between(3, 12, inclusive="both")]
-                counts.update(valid["_machine_number"].value_counts().to_dict())
+        if not schedule.empty:
+            counts.update(schedule["machine"].value_counts().to_dict())
 
         frame = tk.LabelFrame(
             self._cards_frame, text="Copertura macchine", bg="#f8fafc", fg="#16324f",
@@ -733,13 +744,62 @@ class OverviewTab(ttk.Frame):
             card.grid(row=0, column=index, padx=3, pady=3, sticky="ew")
             card.grid_propagate(False)
             frame.columnconfigure(index, weight=1, minsize=106)
+            click = lambda _event, selected_machine=machine: self._open_machine_schedule(selected_machine, schedule)
+            card.bind("<Button-1>", click)
             tk.Label(card, text=f"M{machine}", bg=card["bg"], fg="#991b1b" if empty else "#16324f",
                      font=("Segoe UI", 10, "bold"), anchor="center").pack(fill="x")
+            for child in card.winfo_children():
+                child.bind("<Button-1>", click)
             tk.Label(card, text=f"{count} colori", bg=card["bg"], fg="#991b1b" if empty else "#344054",
                      font=("Segoe UI", 12, "bold"), anchor="center").pack(fill="x")
             tk.Label(card, text=f"Fino al: {covered_until(count)}", bg=card["bg"],
                      fg="#991b1b" if empty else "#667085",
                      font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x", pady=(3, 0))
+
+            for child in card.winfo_children():
+                child.bind("<Button-1>", click)
+
+    def _open_machine_schedule(self, machine: int, schedule: pd.DataFrame) -> None:
+        """Show the Copertura-ordered dyeing sequence for one machine."""
+        window = tk.Toplevel(self)
+        window.title(f"Copertura macchine — M{machine}")
+        window.geometry("1180x620")
+        window.minsize(850, 420)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        ttk.Label(window, text=f"Dyeing schedule for Machine {machine} — 2 colors/day; Friday off", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        toolbar = ttk.Frame(window)
+        toolbar.grid(row=0, column=0, sticky="e", padx=10, pady=8)
+        search = tk.StringVar()
+        ttk.Label(toolbar, text="Search:").pack(side="left")
+        entry = ttk.Entry(toolbar, textvariable=search, width=28)
+        entry.pack(side="left", padx=5)
+        columns = ["dye_date", "machine", "bagno", "colore", "titolo", "articolo", "partita", "rocche", "cliente", "ordine", "riga"]
+        tree = ttk.Treeview(window, columns=columns, show="headings")
+        labels = {"dye_date": "Data tintura", "machine": "M/C", "bagno": "Bagno", "colore": "Colore", "titolo": "Titolo", "articolo": "Articolo", "partita": "Partita", "rocche": "Rocche", "cliente": "Cliente", "ordine": "Ordine", "riga": "Riga"}
+        for col in columns:
+            tree.heading(col, text=labels[col])
+            tree.column(col, width=115 if col not in {"titolo", "colore"} else 170, anchor="center")
+        tree.grid(row=1, column=0, sticky="nsew", padx=10)
+        scroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scroll.set)
+
+        machine_df = schedule[schedule["machine"] == machine].copy() if not schedule.empty else schedule
+        def render(*_args):
+            tree.delete(*tree.get_children())
+            term = search.get().strip().casefold()
+            for row in machine_df.itertuples(index=False, name=None):
+                values = tuple("" if value is None else value for value in row)
+                if not term or term in " ".join(str(value).casefold() for value in values):
+                    tree.insert("", "end", values=values)
+        search.trace_add("write", render)
+        render()
+        buttons = ttk.Frame(window, padding=10)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(buttons, text="Clear", command=lambda: search.set("")).pack(side="left")
+        ttk.Button(buttons, text="Export Excel", command=lambda: export_treeview_to_excel(tree, f"machine_{machine}_dyeing_schedule.xlsx", window)).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
 
     def _price_change_count(self) -> int:
         """Return the number of Listini price transitions over the alert threshold."""
