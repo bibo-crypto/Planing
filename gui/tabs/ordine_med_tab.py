@@ -5,6 +5,7 @@ ordine_med.py for the full reverse-engineering notes.
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 import threading
 from pathlib import Path

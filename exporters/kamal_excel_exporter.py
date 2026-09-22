@@ -6,12 +6,14 @@ mirroring Ordini ELVY's structure), and -- if raw yarn stock was supplied
 -- a "Filato x Tinturia" sheet listing what was assigned.
 """
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 from pathlib import Path
 from typing import Sequence
 
 import openpyxl
 from utility.utils import clean_text
+from utility.master_data import raw_articolo_for
 
 from exporters.excel_exporter import (
     FILATO_TINTURIA_COLUMNS,
@@ -149,7 +151,7 @@ class KamalExcelExporter:
                         cell.alignment = Alignment(horizontal="center", vertical="center")
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(self.output_path)
+        safe_save_workbook(wb, self.output_path)
         logger.info("Export completed: %s", self.output_path)
 
     def _build_lotto_matches(self, kamal_rows: list[OrdineKamalRow]) -> list[RawYarnMatch]:
@@ -165,11 +167,7 @@ class KamalExcelExporter:
             partita = self._extract_partita(commento)
             if not partita or partita.upper() == "X":
                 continue
-            articolo = (
-                "G" + row.articolo_delta[1:]
-                if row.articolo_delta.upper().startswith("C")
-                else row.articolo_delta
-            )
+            articolo = raw_articolo_for(row.articolo_delta) if row.articolo_delta.upper().startswith("C") else row.articolo_delta
             titolo = (self.codes_map or {}).get(row.articolo_delta, "")
             key = (articolo, titolo, partita)
             assigned[key] = assigned.get(key, 0.0) + (row.peso_kg or 0.0)

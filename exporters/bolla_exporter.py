@@ -13,6 +13,7 @@ autofilter, auto-sized columns) so both document types feel consistent.
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 from pathlib import Path
 from typing import Sequence
@@ -174,5 +175,5 @@ class BollaExporter:
         _write_sheet(ws_totals, self.totals, TOTALS_COLUMNS)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(self.output_path)
+        safe_save_workbook(wb, self.output_path)
         logger.info("Export completed: %s", self.output_path)

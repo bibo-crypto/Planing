@@ -20,6 +20,7 @@ Not replicated (left as follow-ups, flagged rather than guessed at):
 """
 
 from __future__ import annotations
+from utility.excel_io import safe_save_workbook
 
 import re
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ import openpyxl
 
 from exporters.biglietti_exporter import _clean, _get, _key, _number, _read_sheet_rows  # noqa: F401 -- shared normalization helpers
 from calculate.constants import ABBINA_MACHINE_CODES
+from utility.master_data import raw_articolo_for
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +414,7 @@ def compute_filato_availability(
             pt_grg = int(_number(r.pt_grg))
         except (TypeError, ValueError):
             continue
-        art_g = ("G" + r.articolo[1:]) if r.articolo[:1] == "C" else r.articolo
+        art_g = raw_articolo_for(r.articolo) if r.articolo[:1].upper() == "C" else r.articolo
         # Key: (art_g, pt_grg) only -- Titolo is stored on first-seen and NOT
         # used as a discriminator, preventing the same batch from being counted
         # twice when different order rows carry slightly different Titolo text.
@@ -503,7 +505,7 @@ def export_erp_order_workbook(path: Path, records: list[OrdineMedRow]) -> None:
         ws.append([full[header] for header in SYSTEM_IMPORT_HEADERS])
     _style_sheet(ws, date_columns=("CONSEGNA", "DATA RICONSEGNA"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
 
 
@@ -546,7 +548,7 @@ def export_filato_availability_workbook(
                 ws.freeze_panes = source_ws.freeze_panes
                 ws.auto_filter.ref = source_ws.auto_filter.ref
                 path.parent.mkdir(parents=True, exist_ok=True)
-                wb.save(path)
+                safe_save_workbook(wb, path)
                 wb.close()
                 return
         finally:
@@ -566,7 +568,7 @@ def export_filato_availability_workbook(
             f"A2:H{ws.max_row}", FormulaRule(formula=['$H2="NO"'], fill=red_fill)
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
 
 
@@ -611,7 +613,7 @@ def export_ordine_med_workbook(
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
+    safe_save_workbook(wb, path)
     wb.close()
 
 

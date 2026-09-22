@@ -459,6 +459,6 @@ class SettimanaTab(ttk.Frame):
         ws.column_dimensions[get_column_letter(ref_col + 1)].width = 12
         ws.column_dimensions[get_column_letter(ref_col + 2)].width = 12
 
-        wb.save(path)
+        safe_save_workbook(wb, path)
         logger.info("Situazione Settimana: exported to %s", path)
         messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")

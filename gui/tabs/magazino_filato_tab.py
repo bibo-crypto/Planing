@@ -460,6 +460,6 @@ class MagazinoFilatoTab(ttk.Frame):
         for i in range(1, len(COLUMNS) + 1):
             ws.column_dimensions[get_column_letter(i)].width = 16
 
-        wb.save(path)
+        safe_save_workbook(wb, path)
         logger.info("Magazino Filato: exported to %s", path)
         messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")

@@ -342,7 +342,7 @@ class PrezziTab(ttk.Frame):
         for i, c in enumerate(COLUMNS, start=1):
             ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 16)
 
-        wb.save(path)
+        safe_save_workbook(wb, path)
 
     # ------------------------------------------------------------------
     # Price-change anomalies

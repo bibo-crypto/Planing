@@ -22,7 +22,7 @@ for _exporter_function in (
     "export_word", "export_workbook", "load_articoli_marca_lookup",
     "load_articoli_titolo_map", "load_densita_query", "load_el_kamal_order", "load_order",
     "load_prezzo_lookup", "load_vmm22_ratio_from_magazino", "_filato_rows",
-    "append_create_excel", "load_create_excel_records", "save_pg_x_partita",
+    "append_create_excel", "load_create_excel_records", "sync_workbook_history", "save_pg_x_partita",
     "update_pg_x_row", "update_order_row", "move_pg_x_to_orders", "delete_pg_x_row",
     "delete_shipped_shared_rows",
 ):
@@ -44,6 +44,8 @@ from utility.email_compose import (
 )
 from calculate.order_report import export_report, pg_x_demand, report_path, schedule_due, schedule_stamp
 from utility.utils import keep_window_on_top, lazy_call
+from utility.excel_io import safe_save_workbook
+from utility.master_data import finished_articolo_for, raw_articolo_for
 
 # Filato x Tinturia here follows the same convention as Ordine Kamal/Ordine
 # ELVY: a fixed filename, cleared and rewritten with only this run's rows
@@ -63,12 +65,13 @@ def _split_pg_x_records(records):
 
 
 class BigliettiTab(ttk.Frame):
-    def __init__(self, parent: tk.Misc, prefs: dict, save_prefs, logger, on_shared_cache_changed=None):
+    def __init__(self, parent: tk.Misc, prefs: dict, save_prefs, logger, on_shared_cache_changed=None, on_notification=None):
         super().__init__(parent, padding=12)
         self._prefs = prefs
         self._save_prefs = save_prefs
         self._logger = logger
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._on_notification = on_notification
         self.data_path: Path | None = None
         self.dispo_path: Path | None = None
         self.template_path: Path | None = None
@@ -637,6 +640,7 @@ class BigliettiTab(ttk.Frame):
 
     def _load_shared_orders_worker(self, path: Path, loading: tk.Toplevel):
         try:
+            sync_workbook_history(path)
             datasets = {
                 "Orders": load_create_excel_records(path, sheet_name="Orders"),
                 "PG-X": load_create_excel_records(path, sheet_name="PG-X"),
@@ -698,11 +702,15 @@ class BigliettiTab(ttk.Frame):
             search_bar, text="⚡ Smart Auto-Assign",
             command=lambda: self._smart_auto_assign_pg_x(window, datasets, refresh_records, rebuild, partita_gg_var),
         ).grid(row=0, column=6, sticky="e", padx=(6, 0))
+        ttk.Button(
+            search_bar, text="📤 Upload PG-X GG",
+            command=lambda: self._upload_pgx_gg_file(window, datasets, refresh_records, rebuild, partita_gg_var),
+        ).grid(row=0, column=7, sticky="e", padx=(6, 0))
         excel_columns = (
             "Dispo/Riga", "Cliente", "Articolo", "Titolo", "Formato", "Ordine", "Codice",
             "Colore", "Rocche", "KG", "M/C", "Partita Col", "Consegna", "Commento",
             "Bagno", "Partita GG", "Delivery Date", "Partita MED", "Cliente MED", "POLMON",
-            "Color Tube", "VMM22", "Prezzo", "Densita` (360-390)",
+            "Color Tube", "VMM22", "Prezzo", "Densita` (360-390)", "Print",
         )
         columns = ("select",) + tuple(f"excel_{index}" for index in range(len(excel_columns)))
         tree_style = ttk.Style(window)
@@ -768,6 +776,7 @@ class BigliettiTab(ttk.Frame):
                 "Delivery Date": record.delivery_date, "Partita MED": record.partita_med,
                 "Cliente MED": record.cliente_med, "POLMON": polmon, "Color Tube": record.color_tube,
                 "VMM22": record.vmm22, "Prezzo": record.prezzo, "Densita` (360-390)": record.densita,
+                "Print": record.print_flag,
             }
 
             def display_value(name, value):
@@ -873,16 +882,18 @@ class BigliettiTab(ttk.Frame):
             ttk.Label(form, text=str(record.colored_batch)).grid(row=0, column=1, sticky="w", pady=5)
             fields = (
                 ("Articolo", str(record.article or "")),
+                ("Titolo", str(record.title or "")),
                 ("Partita GG", str(record.raw_batch or "")),
                 ("Bagno", str(record.bagno or "")),
                 ("Rocche", "" if record.quantity_cones is None else str(record.quantity_cones)),
                 ("M/C", str(record.machine or "")),
             )
             entries = {}
+            print_var = tk.BooleanVar(value=str(record.print_flag or "").strip().casefold() in {"1", "yes", "si", "true", "☑"})
             machine_choices = tuple(str(machine) for machine in range(3, 13))
             for row_idx, (label, value) in enumerate(fields, start=1):
                 ttk.Label(form, text=f"{label}:").grid(row=row_idx, column=0, sticky="w", pady=5)
-                if label in {"Articolo", "Partita GG"}:
+                if label in {"Articolo", "Titolo", "Partita GG"}:
                     entry = ttk.Combobox(form, width=30, state="normal")
                 elif label == "M/C":
                     entry = ttk.Combobox(form, width=30, values=machine_choices, state="normal")
@@ -893,14 +904,20 @@ class BigliettiTab(ttk.Frame):
                 entries[label] = entry
 
             status_row = len(fields) + 1
+            ttk.Checkbutton(form, text="Print", variable=print_var).grid(row=status_row, column=1, sticky="w", pady=(2, 4))
+            status_row += 1
             expected_raw = str(record.article or "").strip().upper()
-            expected_raw = "G" + expected_raw[1:] if expected_raw.startswith("C") else expected_raw
+            expected_raw = raw_articolo_for(expected_raw)
             availability_var = tk.StringVar(value=f"Expected raw article: {expected_raw} — loading Magazino...")
             availability_label = ttk.Label(form, textvariable=availability_var, foreground="#666666", wraplength=340)
             availability_label.grid(row=status_row, column=0, columnspan=2, sticky="w", pady=(2, 4))
             stock_by_partita = {}
             partita_choices_by_article = {}
             articolo_choices = set()
+            titolo_by_articolo = {}
+            articolo_by_titolo = {}
+            titolo_choices = set()
+            sync_state = {"busy": False}
             availability_state = {"ready": False, "valid": False, "article_mismatch": False}
 
             def normal_partita(value):
@@ -914,7 +931,7 @@ class BigliettiTab(ttk.Frame):
             def refresh_availability(*_args):
                 key = normal_partita(entries["Partita GG"].get())
                 article = entries["Articolo"].get().strip().upper()
-                expected = "G" + article[1:] if article.startswith("C") else article
+                expected = raw_articolo_for(article)
                 if not availability_state["ready"]:
                     availability_var.set(f"Expected raw article: {expected} — loading Magazino...")
                     return
@@ -943,7 +960,7 @@ class BigliettiTab(ttk.Frame):
 
             def refresh_partita_choices(*_args):
                 article = entries["Articolo"].get().strip().upper()
-                expected = "G" + article[1:] if article.startswith("C") else article
+                expected = raw_articolo_for(article)
                 choices = sorted(
                     partita_choices_by_article.get(expected, set()),
                     key=lambda value: (normal_partita(value).casefold(), str(value)),
@@ -952,10 +969,53 @@ class BigliettiTab(ttk.Frame):
 
             def refresh_articolo_choices(*_args):
                 entries["Articolo"]["values"] = sorted(articolo_choices, key=str.casefold)
+                entries["Titolo"]["values"] = sorted(titolo_choices, key=str.casefold)
+
+            def normalize_article(value):
+                article = str(value or "").strip().upper()
+                return "C" + article[1:] if article.startswith("G") else article
+
+            def refresh_linked_article_title(_event=None):
+                if sync_state["busy"]:
+                    return
+                sync_state["busy"] = True
+                try:
+                    article = normalize_article(entries["Articolo"].get())
+                    title = titolo_by_articolo.get(article, "")
+                    if title:
+                        entries["Titolo"].set(title)
+                finally:
+                    sync_state["busy"] = False
+
+            def refresh_linked_title_article(_event=None):
+                if sync_state["busy"]:
+                    return
+                sync_state["busy"] = True
+                try:
+                    title = entries["Titolo"].get().strip()
+                    article = articolo_by_titolo.get(title.casefold(), "")
+                    if article:
+                        entries["Articolo"].set(article)
+                        refresh_partita_choices()
+                        refresh_availability()
+                finally:
+                    sync_state["busy"] = False
 
             def load_stock():
                 try:
                     _codes, _density, _vmm, _prices, summary = self._load_common_sources()
+                    try:
+                        source_map = load_articoli_marca_lookup() or load_articoli_titolo_map()
+                        for source_article, source_title in source_map.items():
+                            article_key = normalize_article(source_article)
+                            title_text = str(source_title or "").strip()
+                            if article_key and title_text:
+                                titolo_by_articolo[article_key] = title_text
+                                articolo_by_titolo.setdefault(title_text.casefold(), article_key)
+                                titolo_choices.add(title_text)
+                                articolo_choices.add(article_key)
+                    except Exception:
+                        pass
                     if summary is not None:
                         for row in summary.itertuples(index=False):
                             article = str(getattr(row, "articolo", "") or "").strip().upper()
@@ -963,7 +1023,7 @@ class BigliettiTab(ttk.Frame):
                             available = float(getattr(row, "mag_rocche", 0) or 0)
                             stock_by_partita.setdefault(partita, []).append((available, article))
                             if article:
-                                articolo_choices.add("C" + article[1:] if article.startswith("G") else article)
+                                articolo_choices.add(finished_articolo_for(article) if article.startswith("G") else article)
                             if partita:
                                 partita_choices_by_article.setdefault(article, set()).add(partita)
                     self.after(0, lambda: (availability_state.update(ready=True), refresh_articolo_choices(), refresh_partita_choices(), refresh_availability()))
@@ -977,10 +1037,22 @@ class BigliettiTab(ttk.Frame):
             entries["Articolo"].bind("<KeyRelease>", refresh_availability, add="+")
             entries["Articolo"].bind("<<ComboboxSelected>>", refresh_partita_choices)
             entries["Articolo"].bind("<<ComboboxSelected>>", refresh_availability, add="+")
+            entries["Articolo"].bind("<KeyRelease>", refresh_linked_article_title, add="+")
+            entries["Articolo"].bind("<<ComboboxSelected>>", refresh_linked_article_title, add="+")
+            entries["Titolo"].bind("<KeyRelease>", refresh_linked_title_article)
+            entries["Titolo"].bind("<<ComboboxSelected>>", refresh_linked_title_article)
             threading.Thread(target=load_stock, daemon=True).start()
 
             def save_from_editor():
                 values = {label: entry.get().strip() for label, entry in entries.items()}
+                try:
+                    title_map = load_articoli_marca_lookup() or load_articoli_titolo_map()
+                    article_key = values.get("Articolo", "").strip().upper()
+                    title_key = raw_articolo_for(article_key) if article_key.startswith("C") else article_key
+                    values["Titolo"] = title_map.get(article_key, title_map.get(title_key, values.get("Titolo", "")))
+                except Exception:
+                    pass
+                values["Print"] = "☑" if print_var.get() else ""
                 value = values["Partita GG"]
                 if value and not availability_state["ready"]:
                     return messagebox.showwarning("Magazino", "Wait for Magazino availability to load.", parent=editor)
@@ -1023,7 +1095,12 @@ class BigliettiTab(ttk.Frame):
         tree.bind("<ButtonRelease-1>", toggle)
         actions = ttk.Frame(window, padding=(10, 0, 10, 10))
         actions.grid(row=2, column=0, sticky="ew")
-        ttk.Label(actions, text="Click Print to select or unselect each color.").pack(side="left")
+        actions.columnconfigure(0, weight=1)
+        button_bar = ttk.Frame(actions)
+        button_bar.grid(row=0, column=0, sticky="ew")
+        for col in range(7):
+            button_bar.columnconfigure(col, weight=1)
+        ttk.Label(actions, text="Click Print to select or unselect each color.").grid(row=1, column=0, sticky="w", pady=(5, 0))
         def pg_x_action(action):
             if current_sheet["name"] != "PG-X":
                 return messagebox.showwarning("PG-X Only", "This action is available only on the PG-X page.", parent=window)
@@ -1040,27 +1117,35 @@ class BigliettiTab(ttk.Frame):
                 window, action, partita_col, datasets, refresh_records, rebuild,
             )
 
-        ttk.Button(actions, text="Send to Orders", command=lambda: pg_x_action("move")).pack(side="left", padx=(16, 4))
-        ttk.Button(actions, text="Delete", command=lambda: pg_x_action("delete")).pack(side="left", padx=4)
+        ttk.Button(button_bar, text="Send to Orders", command=lambda: pg_x_action("move"), width=16).grid(row=0, column=0, padx=3, sticky="ew")
+        ttk.Button(button_bar, text="Delete", command=lambda: pg_x_action("delete"), width=12).grid(row=0, column=1, padx=3, sticky="ew")
         ttk.Button(
-            actions, text="Delete Shipped Colors", style="Danger.TButton",
+            button_bar, text="Delete Shipped Colors", style="Danger.TButton", width=18,
             command=lambda: self._delete_shipped_colors(
                 window, current_sheet["name"], record_by_iid, sheet_by_iid,
                 datasets, refresh_records, rebuild,
             ),
-        ).pack(side="left", padx=(14, 4))
+        ).grid(row=0, column=2, padx=3, sticky="ew")
         ttk.Button(
-            actions, text="📦 Export Pick List",
+            button_bar, text="📦 Export Pick List", width=16,
             command=lambda: self._export_pick_list_shared(window, selected, record_by_iid, current_sheet["name"]),
-        ).pack(side="left", padx=4)
+        ).grid(row=0, column=3, padx=3, sticky="ew")
         ttk.Button(
-            actions, text="🖨  Print Selected Biglietti",
+            button_bar, text="🧶 Filato X Tinturia", width=18,
+            command=lambda: self._export_pgx_filato_shared(window, current_sheet["name"], record_by_iid),
+        ).grid(row=0, column=4, padx=3, sticky="ew")
+        ttk.Button(
+            button_bar, text="🖨 Print Assigned PG-X", width=19,
+            command=lambda: self._print_assigned_pgx(window, current_sheet["name"], record_by_iid),
+        ).grid(row=0, column=5, padx=3, sticky="ew")
+        ttk.Button(
+            button_bar, text="🖨 Print Selected Biglietti", width=21,
             command=lambda: self._print_selected_shared(
                 window, selected, record_by_iid,
                 move_assigned_pg_x=current_sheet["name"] == "PG-X",
             ),
-        ).pack(side="right")
-        ttk.Button(actions, text="Close", command=window.destroy).pack(side="right", padx=(0, 8))
+        ).grid(row=1, column=5, padx=3, pady=(6, 0), sticky="ew")
+        ttk.Button(button_bar, text="Close", command=window.destroy, width=12).grid(row=1, column=6, padx=3, pady=(6, 0), sticky="ew")
 
     @staticmethod
     def _toggle_child_maximize(window: tk.Toplevel) -> None:
@@ -1110,6 +1195,8 @@ class BigliettiTab(ttk.Frame):
 
         updates = {
             "Articolo": values.get("Articolo", ""),
+            "Titolo": values.get("Titolo", ""),
+            "Print": values.get("Print", ""),
             "Partita GG": values.get("Partita GG", ""),
             "Bagno": values.get("Bagno", ""),
             "Rocche": as_number(values.get("Rocche", "")),
@@ -1163,6 +1250,9 @@ class BigliettiTab(ttk.Frame):
 
         def fail(exc):
             self._pg_x_saving = False
+            text = str(exc)
+            if self._on_notification and ("does not belong to article" in text or "open or locked" in text or "Cannot save" in text):
+                self._on_notification("pgx-save-error", "PG-X save needs attention", text, "Create (EXCEL+Biglietti)", "high")
             messagebox.showerror("PG-X Save Error", str(exc), parent=window)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1202,6 +1292,9 @@ class BigliettiTab(ttk.Frame):
 
         def fail(exc):
             self._pg_x_saving = False
+            text = str(exc)
+            if self._on_notification and ("does not belong to article" in text or "open or locked" in text or "Cannot save" in text):
+                self._on_notification("pgx-save-error", "PG-X save needs attention", text, "Create (EXCEL+Biglietti)", "high")
             messagebox.showerror("PG-X Save Error", str(exc), parent=window)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1367,6 +1460,45 @@ class BigliettiTab(ttk.Frame):
         finally:
             self.after(0, lambda: self.convert_btn.config(state="normal"))
 
+    def _upload_pgx_gg_file(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
+        """Read a two-column Partita Col/Partita GG file and assign every PG-X row."""
+        path = filedialog.askopenfilename(parent=parent_window, title="Upload PG-X Partita file", filetypes=[("Excel files", "*.xlsx *.xlsm")])
+        if not path:
+            return
+        import openpyxl
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            ws = wb.active
+            headers = [str(cell.value or "").strip().casefold().replace(" ", "") for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+            col_col = next((i for i, value in enumerate(headers) if value in {"partitacol", "partita-col", "partita"}), None)
+            col_gg = next((i for i, value in enumerate(headers) if value in {"partitagg", "partita-gg", "rawbatch"}), None)
+            if col_col is None or col_gg is None:
+                wb.close()
+                return messagebox.showerror("PG-X Upload", "The file must contain exactly the required headers: Partita Col and Partita GG.", parent=parent_window)
+            pairs = [(row[col_col], row[col_gg]) for row in ws.iter_rows(min_row=2, values_only=True) if row[col_col] not in (None, "") and row[col_gg] not in (None, "")]
+            wb.close()
+        except Exception as exc:
+            return messagebox.showerror("PG-X Upload", str(exc), parent=parent_window)
+        if not pairs:
+            return messagebox.showinfo("PG-X Upload", "No Partita Col/Partita GG rows were found.", parent=parent_window)
+
+        def worker():
+            try:
+                _codes, densita_map, vmm_ratio_map, _prices, summary = self._load_common_sources()
+                updated = 0
+                errors = []
+                for partita_col, partita_gg in pairs:
+                    try:
+                        result = save_pg_x_partita(self.shared_excel_path, str(partita_col), str(partita_gg), densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, magazino_summary=summary, allow_article_mismatch=False)
+                        updated += int(result.get("updated", 0))
+                    except Exception as exc:
+                        errors.append(f"{partita_col}: {exc}")
+                new_datasets = {"Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"), "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X")}
+                self.after(0, lambda: (refresh_records(new_datasets), rebuild(), messagebox.showinfo("PG-X Upload", f"Assigned {updated} row(s)." + ("\n\nErrors:\n" + "\n".join(errors) if errors else ""), parent=parent_window)))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: messagebox.showerror("PG-X Upload", str(exc), parent=parent_window))
+        threading.Thread(target=worker, daemon=True).start()
+
     def _smart_auto_assign_pg_x(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
         """Automatically match available raw yarn in Magazino Filato with PG-X rows,
         display an interactive approval modal, and move matched rows to Orders."""
@@ -1409,7 +1541,7 @@ class BigliettiTab(ttk.Frame):
 
             raw_art = str(record.article or "").strip().upper()
             if raw_art.startswith("C"):
-                raw_art = "G" + raw_art[1:]
+                raw_art = raw_articolo_for(raw_art)
 
             need_rocche = float(record.quantity_cones or 0)
             comment = str(getattr(record, "commento", "") or getattr(record, "additional_raw", "") or "")
@@ -1554,9 +1686,45 @@ class BigliettiTab(ttk.Frame):
         def fail(loading, exc):
             if loading.winfo_exists():
                 loading.destroy()
+            text = str(exc)
+            if self._on_notification and ("does not belong to article" in text or "open or locked" in text or "Cannot save" in text):
+                self._on_notification("pgx-save-error", "PG-X assignment needs attention", text, "Create (EXCEL+Biglietti)", "high")
             messagebox.showerror("Auto-Assign Error", str(exc), parent=parent_window)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _assigned_pgx_records(self, current_sheet_name: str, record_by_iid: dict[str, object]):
+        if current_sheet_name != "PG-X":
+            return []
+        return [
+            record for record in record_by_iid.values()
+            if str(record.raw_batch or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
+        ]
+
+    def _export_pgx_filato_shared(self, parent_window, current_sheet_name: str, record_by_iid: dict[str, object]):
+        """Rewrite the shared Filato X Tinturia.xlsx using assigned PG-X rows."""
+        records = self._assigned_pgx_records(current_sheet_name, record_by_iid)
+        if not records:
+            return messagebox.showinfo("Filato X Tinturia", "No PG-X row has a Partita GG yet.", parent=parent_window)
+        try:
+            _codes, _density, _vmm, _prices, summary = self._load_common_sources()
+            rows = _filato_rows(records, [], summary)
+            path = self.shared_excel_path.parent / "Filato X Tinturia.xlsx"
+            export_filato_full(path, [
+                RawYarnMatch(articolo=str(row.get("Articolo", "")), titolo=str(row.get("Titolo", "")), partita=str(row.get("Partita", "")), rocce=float(row.get("Rocche", 0) or 0), peso=float(row.get("Peso", 0) or 0), label=str(row.get("تحضير خام", "تحضير خام")))
+                for row in rows
+            ])
+            messagebox.showinfo("Filato X Tinturia", f"File rewritten with {len(rows)} assigned row(s):\n{path}", parent=parent_window)
+        except Exception as exc:
+            messagebox.showerror("Filato X Tinturia", str(exc), parent=parent_window)
+
+    def _print_assigned_pgx(self, window, current_sheet_name: str, record_by_iid: dict[str, object]):
+        records = self._assigned_pgx_records(current_sheet_name, record_by_iid)
+        if not records:
+            return messagebox.showinfo("Print Assigned PG-X", "No PG-X row has a Partita GG yet.", parent=window)
+        selected = {str(index): True for index, _record in enumerate(records)}
+        by_iid = {str(index): record for index, record in enumerate(records)}
+        self._print_selected_shared(window, selected, by_iid, move_assigned_pg_x=False)
 
     def _export_pick_list_shared(self, parent_window, selected: dict[str, bool], record_by_iid: dict[str, object], current_sheet_name: str):
         """Export a formatted Excel Pick List (إذن سحب خيط خام من المخزن) for warehouse staff."""
@@ -1623,7 +1791,7 @@ class BigliettiTab(ttk.Frame):
         for idx, rec in enumerate(checked_records, start=3):
             raw_art = str(rec.article or "").strip().upper()
             if raw_art.startswith("C"):
-                raw_art = "G" + raw_art[1:]
+                raw_art = raw_articolo_for(raw_art)
 
             row_vals = [
                 rec.dispo, rec.customer_name, raw_art, rec.raw_batch,
@@ -1645,7 +1813,7 @@ class BigliettiTab(ttk.Frame):
             col_letter = get_column_letter(col[0].column)
             ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
-        wb.save(path)
+        safe_save_workbook(wb, path)
         wb.close()
         messagebox.showinfo("Pick List Exported", f"Raw Yarn Pick List successfully created:\n{path}", parent=parent_window)
 

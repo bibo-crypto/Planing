@@ -69,7 +69,8 @@ COLUMN_SPEC = [
     ("titolo", "Titolo", "text"),
     ("codice", "Codice", "number"),
     ("colore", "Colore", "text"),
-    ("prezzo", "Prezzo", "text"),
+    ("prezzo", "Prezzo Ord.", "text"),
+    ("prezzo_lisini", "Prezzo Listini", "text"),
     ("densita", "Densita` (360-390)", "number"),
     ("ordine", "Ordine", "text"),
     ("riga", "Riga", "number"),
@@ -1338,15 +1339,24 @@ class SituazioneTab(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _recompute_prezzo_densita_for_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Fill Prezzo (by Articolo+Codice, from the same Listini used by
-        the Biglietti tab's Prezzi source) and Densita`(360-390) (by
-        Partita, from the Densita' Query workbook uploaded on either the
-        Biglietti or Situazione tab -- best-effort, never blocks: blank if
-        the relevant source has not been uploaded yet."""
+        """Fill Prezzo Listini (by Articolo+Codice, from the same Listini
+        used by the Biglietti tab's Prezzi source, plus the $2 machine
+        surcharge on 24/32/56) and Densita`(360-390) (by Partita, from the
+        Densita' Query workbook uploaded on either the Biglietti or
+        Situazione tab) -- best-effort, never blocks: blank if the relevant
+        source has not been uploaded yet.
+
+        IMPORTANT: this never touches the "prezzo" column (Prezzo Ord.) --
+        that is the price actually entered in Wincoint (read in
+        situazione_loaders.load_wincoint_orders and carried straight
+        through by compute_situation/the DB). "prezzo_lisini" is only the
+        expected value computed here, kept in its own column so the two can
+        be compared and shown side by side, and so a mismatch survives being
+        looked at rather than silently overwriting the real Wincoint price."""
         import exporters.biglietti_exporter as biglietti_exporter
         result = frame.copy()
         if result.empty:
-            result["prezzo"] = ""
+            result["prezzo_lisini"] = ""
             result["densita"] = ""
             return result
         try:
@@ -1383,7 +1393,7 @@ class SituazioneTab(ttk.Frame):
                     if current_num is not None:
                         self._on_notification(
                             missing_key, "Missing color price in Prezzi",
-                            f"Articolo {article}, color code {code} has a price in Situazione but no matching price in Prezzi.", "Situazione Generale", "high",
+                            f"Articolo {article}, color code {code} has a price (Prezzo Ord.) in Situazione but no matching price in Prezzi/Listini.", "Situazione Generale", "high",
                         )
                     else:
                         # Both sources are blank: this is not an anomaly.
@@ -1393,7 +1403,7 @@ class SituazioneTab(ttk.Frame):
                 elif current_num is not None and abs(current_num - expected_num) > 0.01:
                     self._on_notification(
                         f"situazione-price-mismatch:{identity}:{current_num}:{expected_num}", "Color price differs from Prezzi",
-                        f"Articolo {article}, color code {code}: Situation price {current_num:.2f}, expected {expected_num:.2f} including machine rule.", "Situazione Generale", "high",
+                        f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f}, expected {expected_num:.2f} from Listini (machine rule included).", "Situazione Generale", "high",
                     )
             return expected
 
@@ -1406,7 +1416,7 @@ class SituazioneTab(ttk.Frame):
                 return ""
             return densita_map.get(key, {}).get("densita", "")
 
-        result["prezzo"] = result.apply(_prezzo_row, axis=1)
+        result["prezzo_lisini"] = result.apply(_prezzo_row, axis=1)
         result["densita"] = result.apply(_densita_row, axis=1)
         return result
 
@@ -1433,7 +1443,7 @@ class SituazioneTab(ttk.Frame):
                     return
                 if not self.winfo_exists() or len(self.current_df) != len(result):
                     return
-                self.current_df["prezzo"] = result["prezzo"].to_numpy()
+                self.current_df["prezzo_lisini"] = result["prezzo_lisini"].to_numpy()
                 self.current_df["densita"] = result["densita"].to_numpy()
                 self._data_revision += 1
                 self._render_tree(self.current_df)
@@ -1453,9 +1463,22 @@ class SituazioneTab(ttk.Frame):
             self.sort_state["bagno"] = False  # next click on Bagno heading reverses to Z-A
         self._recompute_raw_yarn_match()
         self.current_df = business_logic.compute_delivery_dates(self.current_df)
-        self.current_df["prezzo"] = ""
+        # "prezzo" (Prezzo Ord.) is the real Wincoint price and already
+        # comes from the DB row itself -- it must NOT be blanked here.
+        # "prezzo_lisini" (the Listini-derived expected price) is the only
+        # one that needs a placeholder until the async lookup below fills
+        # it in and, critically, runs the mismatch check against "prezzo".
+        if "prezzo" not in self.current_df.columns:
+            self.current_df["prezzo"] = ""
+        self.current_df["prezzo_lisini"] = ""
         self.current_df["densita"] = ""
         self._render_tree(self.current_df)
+        # Recompute Prezzo Listini (and fire the price-mismatch notification)
+        # after every load from the DB -- not just once at tab startup. This
+        # is what used to be missing: a plain Refresh left Prezzo Listini
+        # blank and the comparison never ran until the Listini file was
+        # re-uploaded or the app restarted.
+        self._recompute_prezzo_densita_async()
         for callback in tuple(self._table_loaded_callbacks):
             try:
                 callback()
@@ -1690,7 +1713,7 @@ class SituazioneTab(ttk.Frame):
             width = min(max(max(len(value) for value in values) + 3, len(header) + 2, 10), 45)
             ws.column_dimensions[letter].width = width
         ws.row_dimensions[1].height = 28
-        wb.save(path)
+        safe_save_workbook(wb, path)
         messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")
 
     def _open_yarn_shortage(self):
@@ -1860,7 +1883,7 @@ class SituazioneTab(ttk.Frame):
             longest = max([len(header)] + [len(v) for v in values]) if values else len(header)
             ws.column_dimensions[letter].width = min(max(longest + 2, 10), 35)
 
-        wb.save(path)
+        safe_save_workbook(wb, path)
         logger.info("Situazione: exported %d visible rows to %s", len(export_df), path)
         messagebox.showinfo("Completed", f"Export completed successfully:\n{path}")
 

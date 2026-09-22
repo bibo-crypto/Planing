@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS partita_state (
     ritardo_consegna TEXT,
     old_comment     TEXT,
     new_comment     TEXT,
+    prezzo          TEXT,
     last_seen_at    TEXT,
     row_hash        TEXT
 );
@@ -121,6 +122,15 @@ def init_db():
         pass  # column already exists
     try:
         conn.execute("ALTER TABLE upload_log ADD COLUMN file_path TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        # Prezzo Ord. -- the price actually entered in Wincoint, read from
+        # the source file (see situazione_loaders.load_wincoint_orders).
+        # Existing installs get this column added on next launch; older
+        # rows simply read back with an empty prezzo until their next Refresh.
+        conn.execute("ALTER TABLE partita_state ADD COLUMN prezzo TEXT")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
@@ -238,8 +248,8 @@ def upsert_states(rows):
             """INSERT INTO partita_state
                (partita, cliente, articolo, titolo, codice, colore, ordine, riga, data, consegna,
                 rocche, mc, comment, cq, bagno, tinto, planedate, data_qualita, data_uscita, custom,
-                days_in_qc, ritardo_consegna, old_comment, new_comment, last_seen_at, row_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                days_in_qc, ritardo_consegna, old_comment, new_comment, prezzo, last_seen_at, row_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(partita) DO UPDATE SET
                  cliente=excluded.cliente, articolo=excluded.articolo, titolo=excluded.titolo,
                  codice=excluded.codice, colore=excluded.colore, ordine=excluded.ordine,
@@ -251,6 +261,7 @@ def upsert_states(rows):
                  days_in_qc=excluded.days_in_qc,
                  ritardo_consegna=excluded.ritardo_consegna,
                  old_comment=excluded.old_comment, new_comment=excluded.new_comment,
+                 prezzo=excluded.prezzo,
                  last_seen_at=excluded.last_seen_at, row_hash=excluded.row_hash
             """,
             (partita, row.get("cliente", ""), row.get("articolo", ""), row.get("titolo", ""),
@@ -259,7 +270,7 @@ def upsert_states(rows):
              row.get("comment", ""), row.get("cq", ""), row.get("bagno", ""), row.get("tinto", ""),
              row.get("planedate", ""), row.get("data_qualita", ""), row.get("data_uscita", ""),
              row.get("custom", ""), row.get("days_in_qc", ""), row.get("ritardo_consegna", ""),
-             old_comment, new_comment, now, row.get("row_hash", "")),
+             old_comment, new_comment, row.get("prezzo", ""), now, row.get("row_hash", "")),
         )
 
     if history_rows:
