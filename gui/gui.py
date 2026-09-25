@@ -310,7 +310,6 @@ class ConverterApp(tk.Tk):
         from gui.tabs.overview_tab import OverviewTab
         from gui.tabs.prezzi_tab import PrezziTab
         from gui.tabs.situazione_settimana_tab import SettimanaTab
-        from gui.tabs.weekly_machine_plan_tab import WeeklyMachinePlanTab
         from gui.tabs.situazione_tab import SituazioneTab
         from gui.tabs.master_data_tab import MasterDataTab
 
@@ -461,9 +460,6 @@ class ConverterApp(tk.Tk):
         self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         situazione_notebook.add(self._settimana_tab, text="Situazione Settimanale")
 
-        self._weekly_machine_plan_tab = WeeklyMachinePlanTab(situazione_notebook, self._settimana_tab)
-        situazione_notebook.add(self._weekly_machine_plan_tab, text="Piano Macchine")
-
         # Ordine Med's Consegna auto-scheduling needs Situazione's live
         # current_df + Copertura data, which doesn't exist until now.
         self._ordine_med_tab._situazione_tab = self._situazione_tab
@@ -521,11 +517,6 @@ class ConverterApp(tk.Tk):
             except tk.TclError:
                 pass
             try:
-                if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._weekly_machine_plan_tab):
-                    self._weekly_machine_plan_tab.refresh()
-            except tk.TclError:
-                pass
-            try:
                 if notebook.select() == str(self._overview_tab):
                     self._overview_tab.on_shown()
             except tk.TclError:
@@ -562,9 +553,9 @@ class ConverterApp(tk.Tk):
             # it'll catch up on the next Situazione refresh regardless.
             self.after(500, self._situazione_tab.refresh_raw_yarn_match_async)
 
-    def _add_notification(self, key: str, title: str, message: str, page: str, severity: str = "medium") -> None:
+    def _add_notification(self, key: str, title: str, message: str, page: str, severity: str = "medium", partita_colore: str = "") -> None:
         def add_now():
-            notifications.add(key, title, message, page, severity)
+            notifications.add(key, title, message, page, severity, partita_colore=partita_colore)
             self._refresh_notification_badge()
         self.after(0, add_now)
 
@@ -580,8 +571,8 @@ class ConverterApp(tk.Tk):
     def _open_notifications(self) -> None:
         win = tk.Toplevel(self)
         win.title("Notifications")
-        win.geometry("760x360")
-        win.minsize(620, 280)
+        win.geometry("860x380")
+        win.minsize(680, 280)
         win.resizable(True, True)
         # Keep this as a normal overlapped Windows window so the native
         # Minimize, Restore/Maximize, and Close buttons are available.
@@ -592,9 +583,9 @@ class ConverterApp(tk.Tk):
             pass
         win.lift()
         win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
-        tree = ttk.Treeview(win, columns=("severity", "title", "page", "message", "created"), show="headings")
-        for col, title, width in (("severity", "Severity", 90), ("title", "Title", 180), ("page", "Page", 120), ("message", "Message", 310), ("created", "Created", 145)):
-            tree.heading(col, text=title); tree.column(col, width=width, anchor="w")
+        tree = ttk.Treeview(win, columns=("severity", "title", "page", "partita_colore", "message", "created"), show="headings")
+        for col, title, width in (("severity", "Severity", 80), ("title", "Title", 160), ("page", "Page", 110), ("partita_colore", "Partita Colore", 110), ("message", "Message", 270), ("created", "Created", 130)):
+            tree.heading(col, text=title); tree.column(col, width=width, anchor="center" if col in {"severity", "page", "partita_colore", "created"} else "w")
         tree.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
         tree.tag_configure("evenrow", background="#ffffff")
         tree.tag_configure("oddrow", background="#eef4fb")
@@ -603,7 +594,7 @@ class ConverterApp(tk.Tk):
             for index, item in enumerate(notifications.list_open()):
                 tree.insert(
                     "", "end", iid=item["key"],
-                    values=(item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("message", ""), item.get("created_at", "")),
+                    values=(item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")),
                     tags=("oddrow" if index % 2 else "evenrow",),
                 )
             self._refresh_notification_badge()
@@ -624,10 +615,10 @@ class ConverterApp(tk.Tk):
             try:
                 from openpyxl import Workbook
                 workbook = Workbook(); sheet = workbook.active; sheet.title = "Notifications"
-                headers = ("Severity", "Title", "Page", "Message", "Created")
+                headers = ("Severity", "Title", "Page", "Partita Colore", "Message", "Created")
                 sheet.append(headers)
                 for item in items:
-                    sheet.append((item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("message", ""), item.get("created_at", "")))
+                    sheet.append((item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")))
                 sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
                 for cell in sheet[1]: cell.font = cell.font.copy(bold=True)
                 safe_save_workbook(workbook, path); workbook.close()

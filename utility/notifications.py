@@ -31,12 +31,28 @@ def list_open() -> list[dict]:
     return [item for item in _read() if not item.get("resolved")]
 
 
-def add(key: str, title: str, message: str, page: str, severity: str = "medium") -> bool:
+def add(key: str, title: str, message: str, page: str, severity: str = "medium", partita_colore: str = "") -> bool:
     items = _read()
     if any(item.get("key") == key and not item.get("resolved") for item in items):
         return False
+    if not partita_colore or partita_colore.strip() in ("", "None", "nan"):
+        import re
+        partita_colore = ""
+        # Try extracting Partita/Bagno or color code from message text
+        m = re.search(r"(?i)(?:Partita|color code|code)\s+([A-Z0-9_\-\/]+)", message)
+        if m:
+            partita_colore = m.group(1).strip()
+        else:
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[0].startswith("situazione-price"):
+                cand = parts[3] if len(parts) > 3 and not parts[3].replace(".", "").isdigit() else parts[2]
+                if cand and cand not in ("None", "nan"):
+                    partita_colore = cand
+        if not partita_colore:
+            partita_colore = "N/A"
     items.append({
         "key": key, "title": title, "message": message, "page": page,
+        "partita_colore": partita_colore,
         "severity": severity, "created_at": datetime.now().isoformat(timespec="seconds"),
         "resolved": False,
     })

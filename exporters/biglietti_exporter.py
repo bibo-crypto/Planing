@@ -337,7 +337,7 @@ def _add_days_skip_friday(start_date, days_to_add: int):
 
 def _compute_delivery_date(raw_batch: Any, prezzo: Any, machine: Any, today=None) -> Any:
     if not _clean(raw_batch):
-        return "Bending for yarn"
+        return "Pending for yarn"
     today = today or datetime.now().date()
     try:
         mc = int(_number(machine))
@@ -1332,6 +1332,17 @@ def update_order_row(
 
         moved_to_pgx = partita_gg_submitted and not new_gg
         if moved_to_pgx:
+            # These columns are only ever populated by save_pg_x_partita()
+            # when a raw yarn batch gets assigned (see there): KG and VMM22
+            # are computed from that batch's Rocche, and Densita`/Color Tube
+            # are looked up from it. Clearing Partita GG must clear them
+            # back out too -- otherwise the row moves back to PG-X still
+            # showing stale numbers from the raw yarn that was just removed.
+            for header in ("KG", "Densita` (360-390)", "Color Tube", "VMM22"):
+                column = header_col(order_headers, header)
+                if column:
+                    for row_idx in matches:
+                        orders_ws.cell(row=row_idx, column=column).value = ""
             for row_idx in matches:
                 pg_values = {header: orders_ws.cell(row=row_idx, column=idx + 1).value for idx, header in enumerate(order_headers)}
                 pg_ws.append([pg_values.get(header, "") for header in pg_headers])
@@ -1496,8 +1507,15 @@ def move_pg_x_to_orders(path: Path, partita_col: str) -> int:
     wanted = _partita_key(partita_col)
     matches = [r for r in range(2, pg_ws.max_row + 1) if _partita_key(pg_ws.cell(r, pg_col).value) == wanted]
     if not matches:
+        # Not an error: this happens whenever the row already moved out of
+        # PG-X between when the caller decided to move it and when this
+        # runs -- e.g. Smart Auto-Assign's save_pg_x_partita() already moves
+        # a row to Orders the moment it assigns a raw batch, so a
+        # subsequent "move assigned rows to Orders" pass (Print Assigned
+        # PG-X) can reach a row that isn't in PG-X anymore. Nothing to move
+        # is a no-op success, not a crash.
         wb.close()
-        raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
+        return 0
     existing = {_partita_key(orders_ws.cell(r, order_col).value) for r in range(2, orders_ws.max_row + 1)}
     for row_idx in matches:
         values = {header: pg_ws.cell(row_idx, idx + 1).value for idx, header in enumerate(pg_headers)}
@@ -1667,7 +1685,7 @@ def _style_sheet(
                 col_letter = ws.cell(row=1, column=header.index(col_name) + 1).column_letter
                 rng = f"{col_letter}2:{col_letter}{last_row}"
                 first = f"{col_letter}2"
-                # ISNUMBER guards against text placeholders (e.g. "Bending
+                # ISNUMBER guards against text placeholders (e.g. "Pending
                 # for yarn" when the delivery date can't be computed yet)
                 # -- those aren't a real date, so they must never be
                 # subtracted from TODAY() or Excel shows a #VALUE! error.

@@ -60,7 +60,7 @@ def compute_delivery_date(row, today=None):
     is_pgx = comment.upper().startswith("PG-X")
     yarn_match = clean_text(row.get("raw_yarn_match", ""))
     if is_pgx and not yarn_match:
-        return "Bending for yarn"
+        return "Pending for yarn"
 
     today = pd.Timestamp(today or datetime.now().date()).normalize()
     start_date = _parse_delivery_date(row.get("data"))
@@ -732,33 +732,34 @@ def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFra
 PRICE_PLACEHOLDER_VALUE = 0.01
 
 
-def find_price_anomalies(df, prezzo_pairs=None):
+def find_price_anomalies(df):
     """Returns a list of dicts (cliente, articolo, colore, bagno, mc,
-    prezzo, issue) for every row whose Prezzo needs a human to check it.
-    Never raises -- an empty/missing dataframe just returns []."""
+    prezzo, prezzo_lisini, issue) for every row whose price needs a human
+    to check it. Never raises -- an empty/missing dataframe just returns [].
+
+    Compares "prezzo" (Prezzo Ord. -- the price actually entered in
+    Wincoint, see situazione_loaders.load_wincoint_orders) against
+    "prezzo_lisini" (the Listini/Prezzi-file lookup, machine surcharge
+    included -- see situazione_tab._recompute_prezzo_densita_for_frame).
+    Wincoint commonly leaves its own price blank and relies on Listini as
+    the source of truth, so a blank "prezzo" next to a real "prezzo_lisini"
+    is normal and NOT flagged -- only a genuine mismatch, a placeholder
+    value, or no Listini match at all counts as an anomaly."""
     if df is None or df.empty:
         return []
-    if "prezzo" not in df.columns:
+    if "prezzo" not in df.columns and "prezzo_lisini" not in df.columns:
         return []
 
     def _as_number(value):
         try:
             if value in (None, ""):
                 return None
-            return float(str(value).replace(",", "."))
+            text = str(value).replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
+            if not text:
+                return None
+            return float(text)
         except (TypeError, ValueError):
             return None
-
-    # When supplied, this is the set of Articolo+Codice pairs that actually
-    # exist in the active Prezzi file. A blank/zero Situation price is only an
-    # error when the pair exists there; absent pairs are intentionally ignored.
-    def _price_key(value):
-        text = clean_text(value).upper()
-        try:
-            number = float(text.replace(",", "."))
-            return str(int(number)) if number.is_integer() else str(number)
-        except (TypeError, ValueError):
-            return text
 
     out = []
     for _, row in df.iterrows():
@@ -768,14 +769,12 @@ def find_price_anomalies(df, prezzo_pairs=None):
             continue  # nothing to price-check on a blank row
 
         prezzo_num = _as_number(row.get("prezzo"))
-        pair_exists = True if prezzo_pairs is None else (
-            (_price_key(articolo), _price_key(row.get("codice", "") or colore)) in prezzo_pairs
-        )
+        prezzo_lisini_num = _as_number(row.get("prezzo_lisini"))
         issue = None
         if prezzo_num is not None and abs(prezzo_num - PRICE_PLACEHOLDER_VALUE) < 1e-9:
             issue = f"Prezzo sospetto ({PRICE_PLACEHOLDER_VALUE})"
-        elif pair_exists and (prezzo_num is None or prezzo_num == 0):
-            issue = "Prezzo mancante"
+        elif prezzo_num is not None and prezzo_lisini_num is not None and abs(prezzo_num - prezzo_lisini_num) > 0.01:
+            issue = f"Prezzo Ord. ({prezzo_num:g}) diverso da Prezzo Listini ({prezzo_lisini_num:g})"
 
         if issue:
             out.append({
@@ -788,6 +787,7 @@ def find_price_anomalies(df, prezzo_pairs=None):
                 "bagno": row.get("bagno", ""),
                 "mc": row.get("mc", ""),
                 "prezzo": row.get("prezzo", ""),
+                "prezzo_lisini": row.get("prezzo_lisini", ""),
                 "issue": issue,
             })
     return out

@@ -666,6 +666,7 @@ class SituazioneTab(ttk.Frame):
         for status, color in STATUS_COLORS.items():
             self.tree.tag_configure(status, background=color)
         self.tree.tag_configure("Ritinta", background="#d9c6f0")
+        self.tree.tag_configure("price_error", background="#fee2e2", foreground="#991b1b")
         self.tree.tag_configure("stripe", background="#f3f6fa")
         self.tree.tag_configure("normal", background="#ffffff")
 
@@ -1259,6 +1260,54 @@ class SituazioneTab(ttk.Frame):
         )
         self._load_table_from_db()
 
+    def _notify_raw_yarn_available(self) -> None:
+        """Fire a notification for every row whose Filato Disponibile
+        (raw_yarn_match) column has a real match -- yarn that a PG-X-
+        flagged color was waiting for is now available in Magazino Filato.
+        Keyed by partita so re-runs update/replace the same notice rather
+        than piling up duplicates while the match is still there."""
+        if not self._on_notification or self.current_df.empty or "raw_yarn_match" not in self.current_df.columns:
+            return
+        matched = self.current_df[self.current_df["raw_yarn_match"].astype(str).str.strip() != ""]
+        for _, row in matched.iterrows():
+            partita = str(row.get("partita", "")).strip()
+            if not partita:
+                continue
+            self._on_notification(
+                f"situazione-raw-yarn-available:{partita}",
+                "Filato disponibile per un colore in attesa",
+                f"Partita {partita} (Bagno {row.get('bagno', '')}, Articolo {row.get('articolo', '')}): "
+                f"filato disponibile in Magazino — {row.get('raw_yarn_match', '')}.",
+                "Situazione Generale", "medium",
+            )
+
+    def _notify_abbina_pending(self, suggestions: pd.DataFrame | None = None) -> None:
+        """Fire one aggregate notification when the "Da abbinare" matching
+        window (see _open_abbina) currently has suggestions waiting --
+        computed here too so it surfaces without the user having to open
+        that window first. Pass a precomputed suggestions frame when the
+        caller already has one (e.g. from a background thread); otherwise
+        it's computed on the calling thread, so prefer passing one in from
+        anywhere already running off the UI thread."""
+        if not self._on_notification or self.current_df.empty:
+            return
+        if suggestions is None:
+            try:
+                suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Situazione: Da abbinare check failed: %s", exc)
+                return
+        if suggestions is None or suggestions.empty:
+            notifications.resolve("situazione-abbina-pending")
+            return
+        groups = suggestions.apply(lambda row: f"{row.get('codice', '')}|{row.get('colore', '')}", axis=1).nunique()
+        self._on_notification(
+            "situazione-abbina-pending",
+            "Colori da abbinare",
+            f"{groups} gruppo/i colore ({len(suggestions)} riga/e) in attesa di abbinamento — vedi \"Da abbinare\".",
+            "Situazione Generale", "medium",
+        )
+
     def _recompute_raw_yarn_match(self) -> None:
         """Fill "Filato Disponibile" for PG-X rows from Magazino Filato's
         current stock -- best-effort, never blocks: if Magazino hasn't been
@@ -1278,6 +1327,7 @@ class SituazioneTab(ttk.Frame):
         except Exception as exc:  # noqa: BLE001
             logger.error("Situazione: raw yarn auto-match failed: %s", exc)
             self.current_df["raw_yarn_match"] = ""
+        self._notify_raw_yarn_available()
 
     def refresh_raw_yarn_match(self) -> None:
         """Public hook: re-run the Filato Disponibile match against whatever
@@ -1321,6 +1371,13 @@ class SituazioneTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 matches = [""] * len(snapshot)
                 error = exc
+            try:
+                # Computed here (background thread), not in apply_result, so
+                # this can't add latency to the UI thread -- Da abbinare's
+                # matching pass is not necessarily cheap.
+                abbina_suggestions = build_suggestions(snapshot, max_extra_percent=0.20)
+            except Exception:  # noqa: BLE001
+                abbina_suggestions = None
 
             def apply_result():
                 self._raw_match_syncing = False
@@ -1333,12 +1390,14 @@ class SituazioneTab(ttk.Frame):
                 self.current_df = business_logic.compute_delivery_dates(self.current_df)
                 self._data_revision += 1
                 self._render_tree(self.current_df)
+                self._notify_raw_yarn_available()
+                self._notify_abbina_pending(abbina_suggestions)
 
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _recompute_prezzo_densita_for_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def _recompute_prezzo_densita_for_frame(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple]]:
         """Fill Prezzo Listini (by Articolo+Codice, from the same Listini
         used by the Biglietti tab's Prezzi source, plus the $2 machine
         surcharge on 24/32/56) and Densita`(360-390) (by Partita, from the
@@ -1352,13 +1411,22 @@ class SituazioneTab(ttk.Frame):
         through by compute_situation/the DB). "prezzo_lisini" is only the
         expected value computed here, kept in its own column so the two can
         be compared and shown side by side, and so a mismatch survives being
-        looked at rather than silently overwriting the real Wincoint price."""
+        looked at rather than silently overwriting the real Wincoint price.
+
+        Returns (result_df, pending_notifications): this runs on a
+        background thread when called from _recompute_prezzo_densita_async,
+        and self._on_notification ultimately reaches a Tk widget's
+        .after() -- calling that from a non-main thread is not something
+        Tkinter guarantees, so notifications are only collected here and
+        must be fired by the caller on the main thread (see
+        _fire_prezzo_notifications)."""
         import exporters.biglietti_exporter as biglietti_exporter
         result = frame.copy()
+        pending: list[tuple] = []
         if result.empty:
             result["prezzo_lisini"] = ""
             result["densita"] = ""
-            return result
+            return result, pending
         try:
             price_lookup, _source = biglietti_exporter.load_prezzo_lookup()
         except Exception as exc:  # noqa: BLE001
@@ -1378,33 +1446,37 @@ class SituazioneTab(ttk.Frame):
             expected = biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
             current = row.get("prezzo", "")
             try:
-                current_num = float(str(current).replace(",", ".")) if str(current).strip() else None
+                curr_clean = str(current or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
+                current_num = float(curr_clean) if curr_clean else None
             except (TypeError, ValueError):
                 current_num = None
             try:
-                expected_num = float(expected) if expected != "" else None
+                exp_clean = str(expected or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
+                expected_num = float(exp_clean) if exp_clean else None
             except (TypeError, ValueError):
                 expected_num = None
-            article, code = str(row.get("articolo", "")).strip(), str(row.get("codice", "")).strip()
-            if self._on_notification and article and code:
-                identity = f"{article}:{code}:{row.get('bagno', '')}"
+            article = str(row.get("articolo", "")).strip()
+            code = str(row.get("codice", "")).strip()
+            colore = str(row.get("colore", "")).strip()
+            partita = str(row.get("partita", "")).strip()
+            partita_col = partita if partita else (colore if colore else code)
+            if partita and colore and partita != colore:
+                partita_col = f"{partita} ({colore})"
+            if article and code:
+                identity = f"{article}:{code}:{partita_col}"
+                missing_key = f"situazione-price-missing:{identity}"
                 if expected_num is None:
-                    missing_key = f"situazione-price-missing:{identity}"
-                    if current_num is not None:
-                        self._on_notification(
-                            missing_key, "Missing color price in Prezzi",
-                            f"Articolo {article}, color code {code} has a price (Prezzo Ord.) in Situazione but no matching price in Prezzi/Listini.", "Situazione Generale", "high",
-                        )
-                    else:
-                        # Both sources are blank: this is not an anomaly.
-                        # Also clean up notices created by the earlier, overly
-                        # strict check when the page is refreshed.
-                        notifications.resolve(missing_key)
-                elif current_num is not None and abs(current_num - expected_num) > 0.01:
-                    self._on_notification(
-                        f"situazione-price-mismatch:{identity}:{current_num}:{expected_num}", "Color price differs from Prezzi",
-                        f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f}, expected {expected_num:.2f} from Listini (machine rule included).", "Situazione Generale", "high",
-                    )
+                    pending.append(("resolve", missing_key))
+                elif current_num is not None and abs(current_num - 0.01) < 1e-9:
+                    pending.append((
+                        "add", f"situazione-price-suspicious:{identity}", "Prezzo Ord. sospetto (0.01)",
+                        f"Articolo {article}, color code {code}: Prezzo Ord. è 0.01.", "Situazione Generale", "high", partita_col,
+                    ))
+                elif current_num is not None and expected_num is not None and abs(current_num - expected_num) > 0.01:
+                    pending.append((
+                        "add", f"situazione-price-mismatch:{identity}:{current_num}:{expected_num}", "Color price differs from Prezzi",
+                        f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f}, expected {expected_num:.2f} from Listini (machine rule included).", "Situazione Generale", "high", partita_col,
+                    ))
             return expected
 
         def _densita_row(row):
@@ -1418,10 +1490,20 @@ class SituazioneTab(ttk.Frame):
 
         result["prezzo_lisini"] = result.apply(_prezzo_row, axis=1)
         result["densita"] = result.apply(_densita_row, axis=1)
-        return result
+        return result, pending
+
+    def _fire_prezzo_notifications(self, pending: list[tuple]) -> None:
+        """Runs on the main thread only (see _recompute_prezzo_densita_for_frame's
+        docstring) -- the actual self._on_notification/notifications.resolve calls."""
+        for entry in pending:
+            if entry[0] == "add" and self._on_notification:
+                self._on_notification(*entry[1:])
+            elif entry[0] == "resolve":
+                notifications.resolve(entry[1])
 
     def _recompute_prezzo_densita(self) -> None:
-        self.current_df = self._recompute_prezzo_densita_for_frame(self.current_df)
+        self.current_df, pending = self._recompute_prezzo_densita_for_frame(self.current_df)
+        self._fire_prezzo_notifications(pending)
 
     def _recompute_prezzo_densita_async(self) -> None:
         if self._price_densita_syncing or self.current_df.empty:
@@ -1431,10 +1513,10 @@ class SituazioneTab(ttk.Frame):
 
         def worker():
             try:
-                result = self._recompute_prezzo_densita_for_frame(snapshot)
+                result, pending = self._recompute_prezzo_densita_for_frame(snapshot)
                 error = None
             except Exception as exc:  # noqa: BLE001
-                result, error = None, exc
+                result, pending, error = None, [], exc
 
             def apply_result():
                 self._price_densita_syncing = False
@@ -1447,6 +1529,7 @@ class SituazioneTab(ttk.Frame):
                 self.current_df["densita"] = result["densita"].to_numpy()
                 self._data_revision += 1
                 self._render_tree(self.current_df)
+                self._fire_prezzo_notifications(pending)  # main thread: safe to touch Tk here
 
             self.after(0, apply_result)
 
@@ -1515,6 +1598,29 @@ class SituazioneTab(ttk.Frame):
                 formatted = parsed.dt.strftime("%d/%m/%Y")
                 display_df[date_column] = formatted.where(parsed.notna(), original)
         rows = list(display_df.itertuples(index=False, name=None))
+        prezzo_idx = self.columns.index("prezzo") if "prezzo" in self.columns else None
+        prezzo_lisini_idx = self.columns.index("prezzo_lisini") if "prezzo_lisini" in self.columns else None
+
+        def _is_price_error(row_vals):
+            if prezzo_idx is None or prezzo_lisini_idx is None:
+                return False
+            p_val, pl_val = row_vals[prezzo_idx], row_vals[prezzo_lisini_idx]
+            try:
+                p_clean = str(p_val or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
+                p_num = float(p_clean) if p_clean else None
+            except (TypeError, ValueError):
+                p_num = None
+            try:
+                pl_clean = str(pl_val or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
+                pl_num = float(pl_clean) if pl_clean else None
+            except (TypeError, ValueError):
+                pl_num = None
+
+            if p_num is not None and abs(p_num - 0.01) < 1e-9:
+                return True
+            if p_num is not None and pl_num is not None and abs(p_num - pl_num) > 0.01:
+                return True
+            return False
 
         def insert_chunk(start=0):
             if generation != self._tree_render_generation:
@@ -1524,7 +1630,9 @@ class SituazioneTab(ttk.Frame):
                 values = rows[index]
                 status = values[self.columns.index("new_comment")]
                 tag = "Ritinta" if str(status).startswith("Ritinta") else status
-                if not tag:
+                if _is_price_error(values):
+                    tag = "price_error"
+                elif not tag:
                     tag = "stripe" if index % 2 else ""
                 self.tree.insert("", "end", values=values, tags=((tag,) if tag else ()))
             if end < len(rows):

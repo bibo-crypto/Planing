@@ -182,6 +182,7 @@ class BigliettiTab(ttk.Frame):
         self.shared_excel_label.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
         ttk.Button(shared_box, text="📋  Show Orders", command=self._show_shared_orders, width=24).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Button(shared_box, text="📊  PG-X Orders Report", command=self._show_pgx_report, width=24).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(shared_box, text="🧾  Extract Shipped/Invoiced History", command=self._show_shipped_history, width=24).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         action_box = ttk.LabelFrame(content, text=" 6. Generate ", style="Section.TLabelframe")
         action_box.pack(fill="x", padx=4, pady=(8, 4))
@@ -537,6 +538,113 @@ class BigliettiTab(ttk.Frame):
         ttk.Label(loading, text="Loading orders...", anchor="center").pack(expand=True, fill="both", padx=20, pady=20)
         threading.Thread(target=self._load_shared_orders_worker, args=(self.shared_excel_path, loading), daemon=True).start()
 
+    def _show_shipped_history(self):
+        """List every archived order whose invoice/shipment already went
+        out (SQLite history -- see utility.orders_db.list_shipped), with
+        the same search/clear/sort/export toolbar as the other lists."""
+        from utility.orders_db import list_shipped
+        import json as _json
+        try:
+            rows = list_shipped()
+        except Exception as exc:
+            return messagebox.showerror("Extract Shipped/Invoiced History", str(exc))
+        if not rows:
+            return messagebox.showinfo("Extract Shipped/Invoiced History", "No shipped/invoiced orders in history yet.")
+
+        parsed = []
+        for row in rows:
+            try:
+                payload = _json.loads(row.get("order_json") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            payload = dict(payload)
+            payload["Sheet"] = row.get("sheet_name", "")
+            payload["Archived At"] = row.get("archived_at", "")
+            parsed.append(payload)
+
+        # Union of columns across every row, in first-seen order, with the
+        # archival metadata columns pinned last.
+        columns: list[str] = []
+        for payload in parsed:
+            for key in payload:
+                if key not in columns:
+                    columns.append(key)
+        for pinned in ("Sheet", "Archived At"):
+            if pinned in columns:
+                columns.remove(pinned)
+                columns.append(pinned)
+
+        window = tk.Toplevel(self)
+        window.title("Extract Shipped/Invoiced History")
+        window.geometry("1180x620")
+        window.minsize(850, 420)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        ttk.Label(window, text=f"{len(parsed)} shipped/invoiced row(s)", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        toolbar = ttk.Frame(window)
+        toolbar.grid(row=0, column=0, sticky="e", padx=10, pady=8)
+        search = tk.StringVar()
+        ttk.Label(toolbar, text="Search:").pack(side="left")
+        ttk.Entry(toolbar, textvariable=search, width=28).pack(side="left", padx=5)
+        ttk.Button(toolbar, text="Clear", command=lambda: search.set("")).pack(side="left", padx=(5, 0))
+
+        tree = ttk.Treeview(window, columns=columns, show="headings")
+        sort_state: dict[str, bool] = {}
+
+        def sort_col(col):
+            nonlocal parsed
+            ascending = sort_state.get(col, True)
+            parsed = sorted(parsed, key=lambda p: str(p.get(col, "")), reverse=not ascending)
+            sort_state[col] = not ascending
+            render()
+
+        for col in columns:
+            tree.heading(col, text=col, command=lambda c=col: sort_col(c))
+            tree.column(col, width=120, anchor="center")
+        tree.grid(row=1, column=0, sticky="nsew", padx=10)
+        vscroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
+        vscroll.grid(row=1, column=1, sticky="ns")
+        hscroll = ttk.Scrollbar(window, orient="horizontal", command=tree.xview)
+        hscroll.grid(row=2, column=0, sticky="ew", padx=10)
+        tree.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+        def render(*_args):
+            tree.delete(*tree.get_children())
+            term = search.get().strip().casefold()
+            for payload in parsed:
+                values = tuple(str(payload.get(c, "")) for c in columns)
+                if not term or term in " ".join(values).casefold():
+                    tree.insert("", "end", values=values)
+        search.trace_add("write", render)
+        render()
+
+        buttons = ttk.Frame(window, padding=10)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        def export():
+            path = filedialog.asksaveasfilename(
+                title="Export to Excel", defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")], initialfile="Shipped_Invoiced_History.xlsx",
+            )
+            if not path:
+                return
+            try:
+                import openpyxl
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "History"
+                ws.append(columns)
+                for payload in parsed:
+                    ws.append([payload.get(c, "") for c in columns])
+                safe_save_workbook(wb, path)
+                wb.close()
+            except Exception as exc:
+                return messagebox.showerror("Export Failed", str(exc), parent=window)
+            messagebox.showinfo("Export Completed", f"Exported to:\n{path}", parent=window)
+
+        ttk.Button(buttons, text="Export Excel", command=export).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+
     def _show_pgx_report(self):
         """Show total open PG-X demand per Titolo and configure delivery."""
         if not self.shared_excel_path or not self.shared_excel_path.is_file():
@@ -871,7 +979,7 @@ class BigliettiTab(ttk.Frame):
             record = record_by_iid[iid]
             editor = tk.Toplevel(window)
             editor.title(f"Edit {current_sheet['name']} Color")
-            editor.geometry("470x300")
+            editor.geometry("470x350")
             editor.resizable(False, False)
             editor.transient(window)
             editor.grab_set()
@@ -1108,9 +1216,18 @@ class BigliettiTab(ttk.Frame):
             if not selection:
                 return messagebox.showwarning("No Row Selected", "Click a PG-X row first.", parent=window)
             iid = selection[0]
-            partita_col = str(record_by_iid[iid].colored_batch)
+            record = record_by_iid[iid]
+            partita_col = str(record.colored_batch)
             if action == "delete" and not messagebox.askyesno(
                 "Delete PG-X Row", f"Delete Partita Col {partita_col} from PG-X?", parent=window
+            ):
+                return
+            raw_b = str(record.raw_batch or "").strip().upper().replace(" ", "")
+            if action == "move" and raw_b in {"", "X", "PG-X", "PGX"} and not messagebox.askyesno(
+                "No Raw Yarn Assigned",
+                f"Partita Col {partita_col} still has no raw yarn (Partita GG) assigned.\n\n"
+                "Send it to Orders anyway?",
+                parent=window,
             ):
                 return
             self._pg_x_row_action_in_background(
@@ -1127,25 +1244,16 @@ class BigliettiTab(ttk.Frame):
             ),
         ).grid(row=0, column=2, padx=3, sticky="ew")
         ttk.Button(
-            button_bar, text="📦 Export Pick List", width=16,
-            command=lambda: self._export_pick_list_shared(window, selected, record_by_iid, current_sheet["name"]),
-        ).grid(row=0, column=3, padx=3, sticky="ew")
-        ttk.Button(
-            button_bar, text="🧶 Filato X Tinturia", width=18,
-            command=lambda: self._export_pgx_filato_shared(window, current_sheet["name"], record_by_iid),
-        ).grid(row=0, column=4, padx=3, sticky="ew")
-        ttk.Button(
             button_bar, text="🖨 Print Assigned PG-X", width=19,
-            command=lambda: self._print_assigned_pgx(window, current_sheet["name"], record_by_iid),
-        ).grid(row=0, column=5, padx=3, sticky="ew")
+            command=lambda: self._print_assigned_pgx(window, current_sheet["name"], record_by_iid, sheet_by_iid),
+        ).grid(row=0, column=3, padx=3, sticky="ew")
         ttk.Button(
             button_bar, text="🖨 Print Selected Biglietti", width=21,
             command=lambda: self._print_selected_shared(
                 window, selected, record_by_iid,
                 move_assigned_pg_x=current_sheet["name"] == "PG-X",
             ),
-        ).grid(row=1, column=5, padx=3, pady=(6, 0), sticky="ew")
-        ttk.Button(button_bar, text="Close", command=window.destroy, width=12).grid(row=1, column=6, padx=3, pady=(6, 0), sticky="ew")
+        ).grid(row=0, column=4, padx=3, sticky="ew")
 
     @staticmethod
     def _toggle_child_maximize(window: tk.Toplevel) -> None:
@@ -1445,20 +1553,65 @@ class BigliettiTab(ttk.Frame):
         ).start()
 
     def _worker_shared_biglietti(self, records, destination: Path, pg_x_partita_cols=None):
+        lines = []
+        had_error = False
         try:
             export_word(destination, self.template_path, records, stem="Selected Orders")
-            moved = 0
-            for partita_col in pg_x_partita_cols or []:
-                moved += move_pg_x_to_orders(self.shared_excel_path, partita_col)
             self._set_status(f"Created {len(records)} selected Biglietti.")
-            moved_text = f"\nMoved {moved} PG-X row(s) to Orders." if moved else ""
-            self.after(0, lambda: messagebox.showinfo("Biglietti", f"Created:\n{destination}{moved_text}"))
+            lines.append(f"Created:\n{destination}")
         except Exception as exc:
-            self._logger.exception("Shared Excel Biglietti failed")
-            self._set_status(f"Error: {exc}")
-            self.after(0, lambda exc=exc: messagebox.showerror("Biglietti Error", str(exc)))
-        finally:
-            self.after(0, lambda: self.convert_btn.config(state="normal"))
+            self._logger.exception("Shared Excel Biglietti (Word) failed")
+            had_error = True
+            lines.append(f"Biglietti (.docx) FAILED:\n{exc}")
+
+        # Same file/logic as the old standalone "Filato X Tinturia" button:
+        # the raw yarn to prepare for whichever rows are being printed here,
+        # restricted to the ones that actually have a raw batch resolved
+        # (Partita GG) -- a row still waiting for one has nothing to list
+        # yet. Kept in its own try/except: a problem here (e.g. the Filato
+        # X Tinturia.xlsx file is currently open in Excel) must not read as
+        # "nothing happened" when the Biglietti above already printed fine,
+        # and must not block the move-to-Orders step below either.
+        filato_records = [
+            record for record in records
+            if str(record.raw_batch or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
+        ]
+        if filato_records:
+            try:
+                _codes, _density, _vmm, _prices, summary = self._load_common_sources()
+                rows = _filato_rows(filato_records, [], summary)
+                filato_path = self.shared_excel_path.parent / "Filato X Tinturia.xlsx"
+                export_filato_full(filato_path, [
+                    RawYarnMatch(
+                        articolo=str(row.get("Articolo", "")), titolo=str(row.get("Titolo", "")),
+                        partita=str(row.get("Partita", "")), rocce=float(row.get("Rocche", 0) or 0),
+                        peso=float(row.get("Peso", 0) or 0), label=str(row.get("تحضير خام", "تحضير خام")),
+                    )
+                    for row in rows
+                ])
+                lines.append(f"\nRaw yarn to prepare ({len(rows)} row(s)):\n{filato_path}")
+            except Exception as exc:
+                self._logger.exception("Shared Excel Biglietti (Filato X Tinturia) failed")
+                had_error = True
+                lines.append(f"\nFilato X Tinturia FAILED:\n{exc}")
+
+        moved = 0
+        for partita_col in pg_x_partita_cols or []:
+            try:
+                moved += move_pg_x_to_orders(self.shared_excel_path, partita_col)
+            except Exception as exc:
+                self._logger.exception("Shared Excel Biglietti (move to Orders) failed for %s", partita_col)
+                had_error = True
+                lines.append(f"\nCould not move {partita_col} to Orders:\n{exc}")
+        if moved:
+            lines.append(f"\nMoved {moved} PG-X row(s) to Orders.")
+
+        if had_error:
+            self._set_status("Completed with errors -- see details.")
+            self.after(0, lambda: messagebox.showwarning("Biglietti", "\n".join(lines)))
+        else:
+            self.after(0, lambda: messagebox.showinfo("Biglietti", "\n".join(lines)))
+        self.after(0, lambda: self.convert_btn.config(state="normal"))
 
     def _upload_pgx_gg_file(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
         """Read a two-column Partita Col/Partita GG file and assign every PG-X row."""
@@ -1681,7 +1834,14 @@ class BigliettiTab(ttk.Frame):
             refresh_records(new_datasets)
             partita_gg_var.set("")
             rebuild()
-            messagebox.showinfo("Auto-Assign Complete", f"Successfully assigned Partita GG & moved {updated_count} row(s) to Orders!", parent=parent_window)
+            messagebox.showinfo(
+                "Auto-Assign Complete",
+                f"Assigned Partita GG for {updated_count} row(s) -- they've moved out of PG-X into Orders.\n\n"
+                "To print their Biglietti (and export Filato X Tinturia for them), switch to the Orders tab, "
+                "check them, and use \"Print Selected Biglietti\" -- they're no longer in PG-X, so "
+                "\"Print Assigned PG-X\" won't include them.",
+                parent=parent_window,
+            )
 
         def fail(loading, exc):
             if loading.winfo_exists():
@@ -1693,129 +1853,28 @@ class BigliettiTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _assigned_pgx_records(self, current_sheet_name: str, record_by_iid: dict[str, object]):
+    def _assigned_pgx_records(self, current_sheet_name: str, record_by_iid: dict[str, object], sheet_by_iid: dict[str, str] = None):
         if current_sheet_name != "PG-X":
             return []
         return [
-            record for record in record_by_iid.values()
-            if str(record.raw_batch or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
+            record for iid, record in record_by_iid.items()
+            if (sheet_by_iid.get(iid) == "PG-X" if sheet_by_iid else iid.startswith("PG-X-"))
+            and str(getattr(record, "raw_batch", "") or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
         ]
 
-    def _export_pgx_filato_shared(self, parent_window, current_sheet_name: str, record_by_iid: dict[str, object]):
-        """Rewrite the shared Filato X Tinturia.xlsx using assigned PG-X rows."""
-        records = self._assigned_pgx_records(current_sheet_name, record_by_iid)
-        if not records:
-            return messagebox.showinfo("Filato X Tinturia", "No PG-X row has a Partita GG yet.", parent=parent_window)
-        try:
-            _codes, _density, _vmm, _prices, summary = self._load_common_sources()
-            rows = _filato_rows(records, [], summary)
-            path = self.shared_excel_path.parent / "Filato X Tinturia.xlsx"
-            export_filato_full(path, [
-                RawYarnMatch(articolo=str(row.get("Articolo", "")), titolo=str(row.get("Titolo", "")), partita=str(row.get("Partita", "")), rocce=float(row.get("Rocche", 0) or 0), peso=float(row.get("Peso", 0) or 0), label=str(row.get("تحضير خام", "تحضير خام")))
-                for row in rows
-            ])
-            messagebox.showinfo("Filato X Tinturia", f"File rewritten with {len(rows)} assigned row(s):\n{path}", parent=parent_window)
-        except Exception as exc:
-            messagebox.showerror("Filato X Tinturia", str(exc), parent=parent_window)
-
-    def _print_assigned_pgx(self, window, current_sheet_name: str, record_by_iid: dict[str, object]):
-        records = self._assigned_pgx_records(current_sheet_name, record_by_iid)
-        if not records:
-            return messagebox.showinfo("Print Assigned PG-X", "No PG-X row has a Partita GG yet.", parent=window)
-        selected = {str(index): True for index, _record in enumerate(records)}
-        by_iid = {str(index): record for index, record in enumerate(records)}
-        self._print_selected_shared(window, selected, by_iid, move_assigned_pg_x=False)
-
-    def _export_pick_list_shared(self, parent_window, selected: dict[str, bool], record_by_iid: dict[str, object], current_sheet_name: str):
-        """Export a formatted Excel Pick List (إذن سحب خيط خام من المخزن) for warehouse staff."""
-        checked_records = [record_by_iid[iid] for iid, is_selected in selected.items() if is_selected]
-        if not checked_records:
-            checked_records = [record for iid, record in record_by_iid.items() if record_by_iid.get(iid)]
-
-        if not checked_records:
-            return messagebox.showwarning("No Data", "There are no records to export.", parent=parent_window)
-
-        path = filedialog.asksaveasfilename(
-            parent=parent_window,
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")],
-            initialfile="Pick_List_Raw_Yarn.xlsx",
-            title="Export Raw Yarn Pick List (إذن سحب خام)",
-        )
-        if not path:
+    def _print_assigned_pgx(self, window, current_sheet_name: str, record_by_iid: dict[str, object], sheet_by_iid: dict[str, str] = None):
+        if current_sheet_name != "PG-X":
             return
-
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Pick List"
-        ws.sheet_view.rightToLeft = False
-
-        ws.merge_cells("A1:J1")
-        title_cell = ws["A1"]
-        title_cell.value = "إذن سحب خيط خام من المخزن — Raw Yarn Pick List"
-        title_cell.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
-        title_cell.fill = PatternFill("solid", fgColor="16324F")
-        title_cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 35
-
-        headers = [
-            "Dispo / Riga", "Cliente", "Articolo (Raw)", "Partita GG",
-            "Rocche Needed", "Peso (KG)", "M/C", "Ordine", "Partita Col", "Consegna"
+        records = [
+            record for iid, record in record_by_iid.items()
+            if (sheet_by_iid.get(iid) == "PG-X" if sheet_by_iid else iid.startswith("PG-X-"))
+            and str(getattr(record, "raw_batch", "") or "").strip().upper().replace(" ", "") not in {"", "X", "PG-X", "PGX"}
         ]
-        ws.append(headers)
-        ws.row_dimensions[2].height = 25
-
-        header_fill = PatternFill("solid", fgColor="2C5282")
-        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        thin_border = Border(
-            left=Side(style="thin", color="CBD5E0"),
-            right=Side(style="thin", color="CBD5E0"),
-            top=Side(style="thin", color="CBD5E0"),
-            bottom=Side(style="thin", color="CBD5E0"),
-        )
-
-        for col_idx, text in enumerate(headers, start=1):
-            cell = ws.cell(row=2, column=col_idx)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = thin_border
-
-        stripe_fill = PatternFill("solid", fgColor="F7FAFC")
-        white_fill = PatternFill("solid", fgColor="FFFFFF")
-
-        for idx, rec in enumerate(checked_records, start=3):
-            raw_art = str(rec.article or "").strip().upper()
-            if raw_art.startswith("C"):
-                raw_art = raw_articolo_for(raw_art)
-
-            row_vals = [
-                rec.dispo, rec.customer_name, raw_art, rec.raw_batch,
-                rec.quantity_cones, rec.kg, rec.machine, rec.order_no,
-                rec.colored_batch, rec.delivery
-            ]
-            ws.append(row_vals)
-            ws.row_dimensions[idx].height = 22
-            fill = stripe_fill if idx % 2 == 0 else white_fill
-
-            for col_idx in range(1, 11):
-                cell = ws.cell(row=idx, column=col_idx)
-                cell.fill = fill
-                cell.border = thin_border
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        for col in ws.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col)
-            col_letter = get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
-
-        safe_save_workbook(wb, path)
-        wb.close()
-        messagebox.showinfo("Pick List Exported", f"Raw Yarn Pick List successfully created:\n{path}", parent=parent_window)
+        if not records:
+            return messagebox.showinfo("Print Assigned PG-X", "No PG-X row has a Partita GG assigned yet.", parent=window)
+        by_iid = {str(index): record for index, record in enumerate(records)}
+        sel = {str(index): True for index in range(len(records))}
+        self._print_selected_shared(window, sel, by_iid, move_assigned_pg_x=True)
 
     def _pick_articoli(self):
         p = self._pick_file("Select Articoli.xlsx")
