@@ -103,3 +103,20 @@ def list_history(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
         return [dict(row) for row in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC")]
     finally:
         conn.close()
+
+
+def list_shipped(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Every archived order whose invoice/shipment already went out (see
+    delete_shipped_shared_rows's reason="shipped/invoiced") -- i.e. exactly
+    what "Delete Shipped Colors" moved out of the live workbook, still kept
+    here for historical extraction."""
+    conn = _connect(db_path)
+    try:
+        return [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM orders WHERE status='archived' AND archived_reason='shipped/invoiced' "
+                "ORDER BY archived_at DESC"
+            )
+        ]
+    finally:
+        conn.close()

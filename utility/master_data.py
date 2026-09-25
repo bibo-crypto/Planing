@@ -5,7 +5,6 @@ This is deliberately JSON-backed until the central database phase is approved.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from utility.utils import APP_DATA_DIR

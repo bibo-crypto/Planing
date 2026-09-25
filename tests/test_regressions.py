@@ -207,7 +207,7 @@ class PlanningRegressionTests(unittest.TestCase):
         row = {"cliente": "ELVY", "data": "2026-09-07", "mc": 192, "new_comment": "Lab"}
         self.assertEqual(compute_delivery_date(row), "2026-09-21")
         row.update({"comment": "PG-X-123", "new_comment": "Filato"})
-        self.assertEqual(compute_delivery_date(row), "Bending for yarn")
+        self.assertEqual(compute_delivery_date(row), "Pending for yarn")
         row["raw_yarn_match"] = "G130 / 44"
         row["yarn_arrival_date"] = "2026-09-08"
         self.assertEqual(compute_delivery_date(row), "2026-09-15")
@@ -368,11 +368,11 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(_get(rows[0], "Consegna"), "2026-09-06")
 
     def test_report_dates_display_day_first(self):
-        frame = pd.DataFrame([{"delivery_date": "2026-09-06", "data": "2026-12-31"}, {"delivery_date": "Bending for yarn", "data": ""}])
+        frame = pd.DataFrame([{"delivery_date": "2026-09-06", "data": "2026-12-31"}, {"delivery_date": "Pending for yarn", "data": ""}])
         result = _format_display_dates(frame, ["data", "delivery_date"])
         self.assertEqual(result.loc[0, "delivery_date"], "06/09/2026")
         self.assertEqual(result.loc[0, "data"], "31/12/2026")
-        self.assertEqual(result.loc[1, "delivery_date"], "Bending for yarn")
+        self.assertEqual(result.loc[1, "delivery_date"], "Pending for yarn")
 
     def test_overview_shared_refresh_helper_is_available(self):
         from gui.tabs.overview_tab import OverviewTab
@@ -696,12 +696,12 @@ class PlanningRegressionTests(unittest.TestCase):
             worksheet,
             pd.DataFrame([
                 {"Delivery Date": "2026-09-08"},
-                {"Delivery Date": "Bending for yarn"},
+                {"Delivery Date": "Pending for yarn"},
             ]),
         )
         self.assertEqual(worksheet.cell(row=2, column=1).value, "08/09/2026")
         self.assertEqual(worksheet.cell(row=2, column=1).data_type, "s")
-        self.assertEqual(worksheet.cell(row=3, column=1).value, "Bending for yarn")
+        self.assertEqual(worksheet.cell(row=3, column=1).value, "Pending for yarn")
 
     def test_on_time_delivery_scores_and_ranks_clients(self):
         states = {
@@ -861,7 +861,7 @@ class PlanningRegressionTests(unittest.TestCase):
         ws = wb.active
         ws.append(["Articolo", "Delivery Date"])
         ws.append(["G130", date(2026, 9, 10)])
-        ws.append(["G140", "Bending for yarn"])
+        ws.append(["G140", "Pending for yarn"])
         _style_sheet(ws, days_until_highlight_columns={"Delivery Date": 4})
 
         rules = list(ws.conditional_formatting)
@@ -1065,8 +1065,12 @@ class PlanningRegressionTests(unittest.TestCase):
             self.assertIn("Get-Process -Name 'Planing'", script)  # verifies the new build actually starts running
             self.assertIn("sawRunning", script)  # tolerates AV closing/relaunching under a different PID
             self.assertIn("rolling back to the previous version", script)
-            # The rollback path must run for both real failure modes.
-            self.assertEqual(script.count("Restore-Backup"), 3)  # 1 definition + 2 call sites (crash-on-launch, copy-never-succeeded)
+            # The rollback path must run for every real failure mode: a
+            # crash-on-launch, a copy that never succeeded, and -- as an
+            # outer safety net -- literally anything else that throws
+            # (e.g. Restore-Backup itself failing under $ErrorActionPreference
+            # = 'Stop' must not skip relaunching something entirely).
+            self.assertEqual(script.count("Restore-Backup"), 4)  # 1 definition + 3 call sites
 
     def test_install_update_detaches_helper_from_any_job_object(self):
         # Regression guard: if Planing.exe runs inside a Windows Job Object
@@ -1111,6 +1115,107 @@ class PlanningRegressionTests(unittest.TestCase):
             flags = captured["creationflags"]
             self.assertTrue(flags & fake_flags.CREATE_BREAKAWAY_FROM_JOB)
             self.assertTrue(flags & fake_flags.CREATE_NEW_PROCESS_GROUP)
+
+    def test_needs_elevation_detects_unwritable_install_dir(self):
+        # Regression guard for the real-world failure this was built to
+        # catch: Planing installed under C:\Program Files needs
+        # Administrator rights to write to, which the (non-admin) running
+        # process does not have -- every Copy-Item in the update script,
+        # including the rollback's own copy-back, failed with Access
+        # Denied and the app never relaunched at all.
+        import os
+        import stat
+        from utility.updater import _needs_elevation
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writable_dir = Path(temp_dir) / "writable"
+            writable_dir.mkdir()
+            self.assertFalse(_needs_elevation(writable_dir))
+
+            if os.name != "nt" and os.geteuid() != 0:  # root and Windows ACLs both bypass this chmod-based probe
+                readonly_dir = Path(temp_dir) / "readonly"
+                readonly_dir.mkdir()
+                readonly_dir.chmod(stat.S_IREAD | stat.S_IEXEC)
+                try:
+                    self.assertTrue(_needs_elevation(readonly_dir))
+                finally:
+                    readonly_dir.chmod(stat.S_IRWXU)  # let TemporaryDirectory clean up
+
+    def test_install_update_elevates_when_install_dir_unwritable(self):
+        import sys
+        import zipfile
+        from unittest.mock import patch
+        import utility.updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            zip_path = temp_dir / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("Planing/Planing.exe", "fake exe bytes")
+            install_dir = temp_dir / "install"
+            install_dir.mkdir()
+
+            popen_called = []
+            shell_execute_calls = []
+
+            class FakeShell32:
+                def ShellExecuteW(self, *args):
+                    shell_execute_calls.append(args)
+                    return 42  # >32 means "launched successfully" per the Windows API
+
+            with patch.object(sys, "frozen", True, create=True), \
+                 patch("subprocess.Popen", side_effect=lambda *a, **k: popen_called.append(1) or object()), \
+                 patch.object(updater, "_needs_elevation", return_value=True), \
+                 patch.dict("sys.modules", {"ctypes": type(sys)("ctypes")}):
+                sys.modules["ctypes"].windll = type(sys)("windll")
+                sys.modules["ctypes"].windll.shell32 = FakeShell32()
+                updater.install_update(zip_path, install_dir, "2.0.0")
+
+            self.assertEqual(popen_called, [])  # must NOT use the non-elevated path
+            self.assertEqual(len(shell_execute_calls), 1)
+            self.assertEqual(shell_execute_calls[0][1], "runas")
+
+    def test_download_installer_rejects_truncated_download(self):
+        # A network hiccup mid-download must be caught here, with a clear
+        # message -- not silently produce a corrupt ZIP that only fails
+        # much later, deep inside the PowerShell install script, as
+        # "not a valid application for this OS platform".
+        from unittest.mock import patch, MagicMock
+        from utility.updater import download_installer, ReleaseInfo
+
+        release = ReleaseInfo(
+            version="2.0.0", tag_name="v2.0.0", title="v2.0.0", notes="", page_url="",
+            installer_url="https://example.com/Planing.zip", installer_name="Planing.zip",
+        )
+        fake_response = MagicMock()
+        fake_response.headers = {"Content-Length": "1000"}
+        fake_response.read.side_effect = [b"short", b""]  # far less than 1000 bytes, then EOF
+        fake_response.__enter__ = lambda self: fake_response
+        fake_response.__exit__ = lambda self, *a: False
+
+        with patch("utility.updater.urlopen", return_value=fake_response):
+            with self.assertRaises(RuntimeError) as ctx:
+                download_installer(release)
+        self.assertIn("incomplete", str(ctx.exception).lower())
+
+    def test_download_installer_rejects_corrupt_zip(self):
+        from unittest.mock import patch, MagicMock
+        from utility.updater import download_installer, ReleaseInfo
+
+        release = ReleaseInfo(
+            version="2.0.0", tag_name="v2.0.0", title="v2.0.0", notes="", page_url="",
+            installer_url="https://example.com/Planing.zip", installer_name="Planing.zip",
+        )
+        fake_response = MagicMock()
+        fake_response.headers = {}
+        fake_response.read.side_effect = [b"this is not a zip file at all", b""]
+        fake_response.__enter__ = lambda self: fake_response
+        fake_response.__exit__ = lambda self, *a: False
+
+        with patch("utility.updater.urlopen", return_value=fake_response):
+            with self.assertRaises(RuntimeError) as ctx:
+                download_installer(release)
+        self.assertIn("corrupt", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

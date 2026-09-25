@@ -12,7 +12,7 @@ class MasterDataTab(ttk.Frame):
     SCHEMAS = {
         "Customers": ("customers", ("code", "name")),
         "Machines": ("machines", ("code", "number", "rocche")),
-        "Delave -> Lino": ("delave_map", ("delave_articolo", "raw_articolo")),
+        "Delave -> Lino": ("delave_map", ("delave_articolo", "raw_articolo", "titolo")),
     }
 
     def __init__(self, parent, on_data_changed=None):

@@ -164,6 +164,24 @@ def download_installer(release: ReleaseInfo, progress: Callable[[int], None] | N
                 downloaded += len(chunk)
                 if progress and total:
                     progress(int(downloaded * 100 / total))
+        # A network hiccup mid-download can end the response early without
+        # urlopen/read ever raising -- silently continuing with a truncated
+        # or corrupt ZIP produced exactly this symptom in the wild: the
+        # install script would extract *something*, but Windows refused to
+        # run it ("not a valid application for this OS platform"), and that
+        # only ever surfaced deep in the PowerShell log, long after this
+        # function returned successfully. Catch it right here instead.
+        if total and downloaded != total:
+            raise RuntimeError(
+                f"Download incomplete: got {downloaded} of {total} bytes. Check your internet connection and try again."
+            )
+        try:
+            with zipfile.ZipFile(destination) as archive:
+                bad_file = archive.testzip()
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError("The downloaded update file is corrupt. Please try again.") from exc
+        if bad_file:
+            raise RuntimeError(f"The downloaded update file is corrupt (bad entry: {bad_file}). Please try again.")
     except Exception:
         destination.unlink(missing_ok=True)
         raise
@@ -185,6 +203,46 @@ def _powershell_quote(value: Path | str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _needs_elevation(install_dir: Path) -> bool:
+    """True if the current (non-admin) process cannot write into install_dir
+    -- e.g. it's under C:\\Program Files, which every normal user account
+    (including the one that owns/runs this installation) needs
+    Administrator rights to modify. Probed with a real write, not a guess
+    from the path alone, so a per-user install location (%LOCALAPPDATA%)
+    never triggers an unnecessary UAC prompt."""
+    probe = install_dir / f".planing_write_test_{os.getpid()}.tmp"
+    try:
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return False
+    except OSError:
+        return True
+
+
+def _run_update_script(script_path: Path, creation_flags: int, elevated: bool) -> None:
+    if not elevated:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script_path)],
+            creationflags=creation_flags,
+            close_fds=True,
+        )
+        return
+    # install_dir (typically C:\Program Files\Planing) needs Administrator
+    # rights to write to, same as any other app installed there -- this is
+    # not optional, so request elevation via the UAC prompt (the "runas"
+    # verb) rather than letting every Copy-Item in the script fail with
+    # Access Denied, including the rollback's own copy-back, which used to
+    # leave nothing running at all (see install_update's docstring).
+    import ctypes
+    args = f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_path}"'
+    result = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", args, None, 0)
+    if result <= 32:  # ShellExecuteW's own convention: <=32 means it failed to even launch
+        raise RuntimeError(
+            "This update needs Administrator approval to install (Planing is installed under "
+            "Program Files). Please approve the Windows prompt, or ask an admin to run the update."
+        )
+
+
 def install_update(zip_path: Path, install_dir: Path, new_version: str) -> None:
     """Stage a ZIP update and start a hidden process that replaces files later.
 
@@ -197,12 +255,19 @@ def install_update(zip_path: Path, install_dir: Path, new_version: str) -> None:
     leaving the install broken or, worse, leaving nothing running at all.
     User settings/data live in AppData and are never touched by either the
     update or the rollback.
+
+    install_dir commonly needs Administrator rights (Program Files) that
+    this process does not itself have, so the helper script is launched
+    elevated (UAC prompt) whenever a real write probe shows install_dir
+    isn't writable as-is -- otherwise every step below fails with Access
+    Denied, including the rollback's own copy-back, silently.
     """
     if not zip_path.is_file():
         raise FileNotFoundError(zip_path)
     if not getattr(sys, "frozen", False):
         raise RuntimeError("Automatic updates are available only in the installed Windows version.")
 
+    elevated = _needs_elevation(install_dir)
     stage_root = Path(tempfile.mkdtemp(prefix="Planing_Update_"))
     try:
         _safe_extract(zip_path, stage_root)
@@ -235,10 +300,16 @@ $target = {_powershell_quote(install_dir)}
 $backup = {_powershell_quote(backup_dir)}
 $exePath = {_powershell_quote(exe_path)}
 function Restore-Backup {{
-    Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath $backup -Force | ForEach-Object {{
-        Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force
-    }}
+    # Never let a rollback failure propagate out under $ErrorActionPreference
+    # = 'Stop' -- that would skip the Start-Process relaunch right after it
+    # and leave nothing running at all. Best-effort is still far better than
+    # a silent, total failure here.
+    try {{
+        Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $backup -Force | ForEach-Object {{
+            Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force -ErrorAction SilentlyContinue
+        }}
+    }} catch {{ $_ | Out-File -FilePath $log -Append }}
 }}
 try {{
     if (Test-Path -LiteralPath $backup) {{ Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }}
@@ -301,7 +372,15 @@ try {{
         Restore-Backup
         Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
     }}
-    }} catch {{ $_ | Out-File -FilePath $log -Append }}
+    }} catch {{
+        $_ | Out-File -FilePath $log -Append
+        # Whatever failed above, always try to leave *something* running --
+        # closing Planing to update and then leaving nothing open at all,
+        # not even the old version, is the one outcome worse than a failed
+        # update.
+        Restore-Backup
+        Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
+    }}
 Remove-Item -LiteralPath {_powershell_quote(zip_path)} -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath {_powershell_quote(stage_root)} -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -314,17 +393,15 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
         # kill this helper along with it before it ever gets to run,
         # leaving the update never applied and nothing relaunched at all.
         # CREATE_BREAKAWAY_FROM_JOB + CREATE_NEW_PROCESS_GROUP make sure
-        # this process survives the parent's exit regardless.
+        # this process survives the parent's exit regardless. Irrelevant
+        # (and unavailable) for the elevated/ShellExecuteW path -- a
+        # UAC-elevated process is already its own top-level session.
         creation_flags = (
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         )
-        subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script_path)],
-            creationflags=creation_flags,
-            close_fds=True,
-        )
+        _run_update_script(script_path, creation_flags, elevated)
     except Exception:
         shutil.rmtree(stage_root, ignore_errors=True)
         zip_path.unlink(missing_ok=True)
