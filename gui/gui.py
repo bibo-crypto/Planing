@@ -25,6 +25,7 @@ from __future__ import annotations
 from utility.excel_io import safe_save_workbook
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -36,6 +37,7 @@ from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.utils import find_pdfs, load_settings, logger, make_output_path, save_settings
 from utility.updater import APP_VERSION, ReleaseInfo, check_for_updates_async, download_installer, install_update
 from utility import notifications
+from utility.backup import create_backup, restore_backup
 from gui.modern_widgets import RoundedButton
 from utility.utils import keep_window_on_top
 
@@ -115,6 +117,11 @@ class ConverterApp(tk.Tk):
             # Some non-Windows window managers do not support the zoomed state.
             pass
         self._set_window_icon()
+        # Escape is intentionally global: operators frequently open several
+        # lookup/edit windows and should never have to hunt for each X button.
+        # The update dialog opts out because interrupting an in-flight update
+        # can leave a partially downloaded installer.
+        self.bind_all("<Escape>", self._close_child_windows, add="+")
 
         # ── Persisted state ───────────────────────────────────────────
         self._prefs = load_settings()
@@ -167,6 +174,21 @@ class ConverterApp(tk.Tk):
         # would make Tk reject the layout.
         self._startup_label.place(relx=0.5, rely=0.5, anchor="center")
         self.after(50, self._finish_startup)
+
+    def _close_child_windows(self, _event=None):
+        """Close the active ordinary Toplevel, preserving its close handler."""
+        update = getattr(self, "_update_window", None)
+        try:
+            child = _event.widget.winfo_toplevel() if _event is not None else None
+            if isinstance(child, tk.Toplevel) and child is not update:
+                close_handler = child.protocol("WM_DELETE_WINDOW")
+                if close_handler:
+                    child.tk.eval(close_handler)
+                else:
+                    child.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+        return "break"
 
     def _finish_startup(self) -> None:
         """Build the full UI after the initial window has been painted."""
@@ -262,14 +284,10 @@ class ConverterApp(tk.Tk):
             # holding a reference (a lingering thread, a live COM object
             # from the Outlook integration, etc.), Windows can leave this
             # process running in the background, still holding the exe/DLL
-            # file locks the update script needs released. That makes every
-            # copy attempt fail, so the "update" silently never applies and
-            # a manual relaunch just finds the same old version asking to
-            # update again. sys.exit(0) forces the interpreter -- and the
-            # process -- to actually end here. (Same fix already proven in
-            # DyeMaster Pro's updater for this exact symptom.)
+            # file locks the update script needs released. Force the process
+            # to end so the helper can replace the executable immediately.
             self.destroy()
-            sys.exit(0)
+            os._exit(0)
         except Exception as exc:  # noqa: BLE001
             if getattr(self, "_update_window", None) and self._update_window.winfo_exists():
                 self._update_window.destroy()
@@ -381,7 +399,9 @@ class ConverterApp(tk.Tk):
         notification_bar.grid(row=0, column=0, sticky="ew")
         notification_bar.columnconfigure(0, weight=1)
         self._notification_button = ttk.Button(notification_bar, command=self._open_notifications, danger=False)
-        self._notification_button.grid(row=0, column=1, sticky="e")
+        self._notification_button.grid(row=0, column=1, sticky="e", padx=3)
+        ttk.Button(notification_bar, text="Backup", command=self._create_backup).grid(row=0, column=2, padx=3)
+        ttk.Button(notification_bar, text="Restore", command=self._restore_backup).grid(row=0, column=3, padx=3)
         style.configure("Notification.TButton", background="#b91c1c", foreground="white")
         style.map("Notification.TButton", background=[("active", "#991b1b")])
         self._refresh_notification_badge()
@@ -472,6 +492,7 @@ class ConverterApp(tk.Tk):
         self._prezzi_tab = PrezziTab(
             notebook, on_shared_cache_changed=self._on_shared_cache_changed,
             on_notification=self._add_notification,
+            on_notifications=self._add_notifications,
         )
         notebook.add(self._prezzi_tab, text="Prezzi")
 
@@ -530,7 +551,6 @@ class ConverterApp(tk.Tk):
 
     def _on_shared_cache_changed(self) -> None:
         """Refresh every consumer after any shared source is uploaded."""
-        self._refresh_dfm_status()
         self._refresh_magazino_status()
         if hasattr(self, "_situazione_tab"):
             self._situazione_tab.sync_shared_async()
@@ -559,6 +579,12 @@ class ConverterApp(tk.Tk):
             self._refresh_notification_badge()
         self.after(0, add_now)
 
+    def _add_notifications(self, entries: list[dict]) -> None:
+        def add_now():
+            notifications.add_many(entries)
+            self._refresh_notification_badge()
+        self.after(0, add_now)
+
     def _refresh_notification_badge(self) -> None:
         if not hasattr(self, "_notification_button"):
             return
@@ -582,24 +608,32 @@ class ConverterApp(tk.Tk):
         except tk.TclError:
             pass
         win.lift()
-        win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
-        tree = ttk.Treeview(win, columns=("severity", "title", "page", "partita_colore", "message", "created"), show="headings")
-        for col, title, width in (("severity", "Severity", 80), ("title", "Title", 160), ("page", "Page", 110), ("partita_colore", "Partita Colore", 110), ("message", "Message", 270), ("created", "Created", 130)):
+        win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
+        filter_bar = ttk.Frame(win); filter_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Label(filter_bar, text="Category:").pack(side="left")
+        category_var = tk.StringVar(value="All")
+        category_combo = ttk.Combobox(filter_bar, textvariable=category_var, values=("All",) + notifications.CATEGORIES, state="readonly", width=14)
+        category_combo.pack(side="left", padx=6)
+        tree = ttk.Treeview(win, columns=("severity", "category", "title", "page", "partita_colore", "message", "created"), show="headings")
+        for col, title, width in (("severity", "Severity", 80), ("category", "Category", 100), ("title", "Title", 160), ("page", "Page", 110), ("partita_colore", "Partita Colore", 110), ("message", "Message", 270), ("created", "Created", 130)):
             tree.heading(col, text=title); tree.column(col, width=width, anchor="center" if col in {"severity", "page", "partita_colore", "created"} else "w")
-        tree.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
+        tree.grid(row=1, column=0, columnspan=5, sticky="nsew", padx=8, pady=8)
         tree.tag_configure("evenrow", background="#ffffff")
         tree.tag_configure("oddrow", background="#eef4fb")
         def refresh():
             tree.delete(*tree.get_children())
-            for index, item in enumerate(notifications.list_open()):
+            for index, item in enumerate(notifications.list_open(category_var.get())):
                 tree.insert(
                     "", "end", iid=item["key"],
-                    values=(item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")),
+                    values=(item.get("severity", ""), item.get("category", "Other"), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")),
                     tags=("oddrow" if index % 2 else "evenrow",),
                 )
             self._refresh_notification_badge()
         def resolve_selected():
             for iid in tree.selection(): notifications.resolve(iid)
+            refresh()
+        def snooze_selected():
+            for iid in tree.selection(): notifications.snooze(iid, 24)
             refresh()
         def export_excel():
             items = notifications.list_open()
@@ -615,21 +649,52 @@ class ConverterApp(tk.Tk):
             try:
                 from openpyxl import Workbook
                 workbook = Workbook(); sheet = workbook.active; sheet.title = "Notifications"
-                headers = ("Severity", "Title", "Page", "Partita Colore", "Message", "Created")
+                headers = ("Severity", "Category", "Title", "Page", "Partita Colore", "Message", "Created")
                 sheet.append(headers)
                 for item in items:
-                    sheet.append((item.get("severity", ""), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")))
+                    sheet.append((item.get("severity", ""), item.get("category", "Other"), item.get("title", ""), item.get("page", ""), item.get("partita_colore", ""), item.get("message", ""), item.get("created_at", "")))
                 sheet.freeze_panes = "A2"; sheet.auto_filter.ref = sheet.dimensions
                 for cell in sheet[1]: cell.font = cell.font.copy(bold=True)
                 safe_save_workbook(workbook, path); workbook.close()
                 messagebox.showinfo("Notifications", f"Export completed:\n{path}", parent=win)
             except Exception as exc:
                 messagebox.showerror("Export error", str(exc), parent=win)
-        ttk.Button(win, text="Mark Resolved", command=resolve_selected).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
-        ttk.Button(win, text="Extract to Excel", command=export_excel).grid(row=1, column=1, padx=8, pady=(0, 8))
-        ttk.Button(win, text="Refresh", command=refresh).grid(row=1, column=2, padx=8, pady=(0, 8))
-        ttk.Button(win, text="Close", command=win.destroy).grid(row=1, column=3, sticky="e", padx=8, pady=(0, 8))
+        category_combo.bind("<<ComboboxSelected>>", lambda _event: refresh())
+        ttk.Button(win, text="Mark Resolved", command=resolve_selected).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Button(win, text="Snooze 24h", command=snooze_selected).grid(row=2, column=1, padx=8, pady=(0, 8))
+        ttk.Button(win, text="Extract to Excel", command=export_excel).grid(row=2, column=2, padx=8, pady=(0, 8))
+        ttk.Button(win, text="Refresh", command=refresh).grid(row=2, column=3, padx=8, pady=(0, 8))
+        ttk.Button(win, text="Close", command=win.destroy).grid(row=2, column=4, sticky="e", padx=8, pady=(0, 8))
         refresh()
+
+    def _create_backup(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Create Planning Backup", defaultextension=".zip",
+            filetypes=[("Planning backup", "*.zip")], initialfile="planning_backup.zip",
+        )
+        if not path:
+            return
+        try:
+            create_backup(path)
+            messagebox.showinfo("Backup", f"Backup created successfully:\n{path}", parent=self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Backup failed", str(exc), parent=self)
+
+    def _restore_backup(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Restore Planning Backup", filetypes=[("Planning backup", "*.zip")],
+        )
+        if not path:
+            return
+        if not messagebox.askyesno("Confirm Restore", "Restore this backup? Current settings and cached data may be replaced.", parent=self):
+            return
+        try:
+            count = restore_backup(path)
+            notifications.add("system-backup-restored", "Backup restored", f"Restored {count} file(s). Restart the program to reload all data.", "System", "medium")
+            self._refresh_notification_badge()
+            messagebox.showinfo("Restore", f"Restored {count} file(s). Please restart the program.", parent=self)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Restore failed", str(exc), parent=self)
 
     def _refresh_magazino_status(self) -> None:
         cache = load_magazino_cache()
@@ -861,7 +926,7 @@ class ConverterApp(tk.Tk):
         matching entry are left blank in that column.
         """
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(3, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         info = ttk.Label(
             parent,
@@ -892,38 +957,21 @@ class ConverterApp(tk.Tk):
         self._elvy_entry_delta = ttk.Entry(entry_frame)
         self._elvy_entry_delta.grid(row=0, column=3, sticky="ew", padx=(0, 12), pady=4)
 
+        action_row = ttk.Frame(entry_frame)
+        action_row.grid(row=1, column=0, columnspan=4, sticky="e", pady=(6, 0))
         ttk.Button(
-            entry_frame, text="💾  Save", command=self._on_elvy_save, width=10
-        ).grid(row=0, column=4, sticky="e")
-
-        # ── DFM colour reference ─────────────────────────────────────────
-        dfm_frame = ttk.LabelFrame(parent, text="DFM Color Reference", padding=8)
-        dfm_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 4))
-        dfm_frame.columnconfigure(1, weight=1)
-
-        dfm_info = ttk.Label(
-            dfm_frame,
-            text="Load the DFM.xlsx export (filtered to Elvy / C130 articles) so "
-                 "Purchase Order conversions can look up each row's colour: its "
-                 "Article No + Colore is matched against this data to fill in two "
-                 "new columns, COLOREDFM and CLDESCR (Delta's colour code and "
-                 "name). Reload this whenever you get an updated DFM export.",
-            foreground="grey", anchor="w", wraplength=700, justify="left",
-        )
-        dfm_info.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
+            action_row, text="💾  Save", command=self._on_elvy_save, width=10
+        ).pack(side="left", padx=(0, 6))
         ttk.Button(
-            dfm_frame,
-            text="📂  Select Update File (DFM.xlsx)…",
-            command=self._on_dfm_load,
-        ).grid(row=1, column=0, sticky="w")
-
-        self._dfm_lbl_status = ttk.Label(dfm_frame, text="", foreground="grey", anchor="w")
-        self._dfm_lbl_status.grid(row=1, column=1, sticky="ew", padx=(12, 0))
+            action_row, text="✏  Edit Selected", command=self._on_elvy_edit
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            action_row, text="🗑  Delete Selected", command=self._on_elvy_delete
+        ).pack(side="left")
 
         # ── Saved mappings table ─────────────────────────────────────────
         table_frame = ttk.LabelFrame(parent, text="Saved Mappings", padding=8)
-        table_frame.grid(row=3, column=0, sticky="nsew", padx=4, pady=(4, 4))
+        table_frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4, 4))
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
@@ -952,74 +1000,12 @@ class ConverterApp(tk.Tk):
         tree_scroll.grid(row=0, column=1, sticky="ns")
         self._elvy_tree.configure(yscrollcommand=tree_scroll.set)
 
-        btn_row = ttk.Frame(table_frame)
-        btn_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-        ttk.Button(
-            btn_row, text="✏  Edit Selected", command=self._on_elvy_edit
-        ).grid(row=0, column=0, padx=(0, 6))
-
-        ttk.Button(
-            btn_row, text="🗑  Delete Selected", command=self._on_elvy_delete
-        ).grid(row=0, column=1)
-
         # Tracks the original Article No of the row being edited (if any),
         # so Save can detect a renamed key and remove the old entry instead
         # of leaving a stale duplicate behind.
         self._elvy_editing_key: str | None = None
 
         self._refresh_elvy_tree()
-        self._refresh_dfm_status()
-
-    def _refresh_dfm_status(self) -> None:
-        """Show what DFM reference (if any) is currently cached, and when."""
-        from parsers.dfm_lookup import load_dfm_cache
-        cache = load_dfm_cache()
-        entries = cache.get("entries", [])
-        if entries:
-            self._dfm_lbl_status.config(
-                text=f"Loaded: {cache.get('source_file', '?')} "
-                     f"({len(entries)} colour entries, {cache.get('loaded_at', '?')})",
-                foreground="grey",
-            )
-        else:
-            self._dfm_lbl_status.config(
-                text="No DFM reference loaded yet — COLOREDFM/CLDESCR columns will stay blank.",
-                foreground="grey",
-            )
-
-    def _on_dfm_load(self) -> None:
-        from parsers.dfm_lookup import build_dfm_lookup, save_dfm_cache
-        path = filedialog.askopenfilename(
-            title="Select the DFM.xlsx export",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            lookup = build_dfm_lookup(Path(path))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Could Not Load File", str(exc))
-            return
-
-        if not lookup:
-            messagebox.showwarning(
-                "No Elvy Rows Found",
-                "This file was read fine, but no ARTICOLODFM rows starting with "
-                "\"C130\" (Elvy) were found in it.",
-            )
-            return
-
-        # Keep the parsed reference and the original validated file location
-        # in one shared cache used by both Data Elvy and Situazione.
-        save_dfm_cache(lookup, Path(path).name, Path(path))
-        self._refresh_dfm_status()
-        if self._on_shared_cache_changed:
-            self._on_shared_cache_changed()
-        messagebox.showinfo(
-            "DFM Reference Loaded",
-            f"Loaded {len(lookup)} Elvy colour entries from {Path(path).name}.",
-        )
 
     # ------------------------------------------------------------------
     # Elvy mapping table handlers
@@ -1157,7 +1143,6 @@ class ConverterApp(tk.Tk):
         # Do not trigger heavy shared-file loading while switching tabs.
         # Keep the UI responsive; shared DFM/Produzione loads happen only when
         # the user explicitly refreshes or uploads on the target page.
-        self._refresh_dfm_status()
         if (
             situazione_selected
             or settimana_selected

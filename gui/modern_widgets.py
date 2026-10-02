@@ -10,7 +10,7 @@ from tkinter import ttk
 class RoundedButton(tk.Canvas):
     """A compact pill-shaped button with the same command API as ttk.Button."""
 
-    def __init__(self, master, text="", command=None, width=None, **kwargs):
+    def __init__(self, master, text="", command=None, width=None, min_width=130, **kwargs):
         self._text = str(text)
         self._command = command
         self._state = "normal"
@@ -25,7 +25,7 @@ class RoundedButton(tk.Canvas):
         requested = int(width) if width is not None else 0
         if requested and requested <= 40:
             requested = requested * 9 + 40
-        self._width = max(130, requested, text_width + 40)
+        self._width = max(int(min_width), requested, text_width + 40)
 
         super().__init__(
             master,

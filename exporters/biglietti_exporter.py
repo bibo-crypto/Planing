@@ -367,18 +367,51 @@ def compute_delivery_date(records: list["OrderRecord"]) -> None:
         r.delivery_date = _compute_delivery_date(r.raw_batch, r.prezzo, r.machine, today)
 
 
-def _prezzo_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> Any:
+def _prezzo_match_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> tuple[Any, bool, str, Any]:
     if not lookup:
-        return ""
-    for key in ((articolo, codice), (_clean(articolo), _clean(codice))):
+        return "", False, "", None
+    article = _clean(articolo).upper()
+    code = _clean(codice)
+    if not (code.isdigit() and len(code) > 1 and code.startswith("0")):
+        try:
+            code_number = float(code.replace(",", "."))
+            code = str(int(code_number)) if code_number.is_integer() else code
+        except (TypeError, ValueError):
+            pass
+    if code.isdigit() and len(code) < 5:
+        code = code.zfill(5)
+    for key in ((article, code), (_clean(articolo), _clean(codice))):
         if key in lookup:
-            return lookup[key][1] or ""
-    return ""
+            level, price = lookup[key]
+            try:
+                has_price = price is not None and float(price) != 0
+            except (TypeError, ValueError):
+                has_price = bool(_clean(price))
+            if has_price:
+                return price, False, "", level
+    category = lookup.get(("__ARTICLE_CATEGORY__", article), "")
+    if not category:
+        try:
+            category = load_articoli_marca_lookup().get(article, "")
+        except Exception:
+            category = ""
+    if category:
+        value = lookup.get(("__CATEGORY__", code, str(category).casefold()))
+        if value:
+            level, price = value
+            if price is not None and price != 0:
+                return price, True, str(category), level
+    return "", False, str(category), None
+
+
+def _prezzo_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> Any:
+    return _prezzo_match_for(articolo, codice, lookup)[0]
 
 
 # Public alias -- other tabs (Situazione) reuse this same matching logic
 # for their own Prezzo column instead of re-implementing it.
 prezzo_for = _prezzo_for
+prezzo_match_for = _prezzo_match_for
 
 
 # Machines (by their Rocche-based M/C total, e.g. Situazione's own 'mc'
@@ -387,7 +420,7 @@ prezzo_for = _prezzo_for
 # Situazione's own Prezzo column apply the exact same rule.
 # The same machines may appear as capacity (24/32/56) or as the operator's
 # machine number (12/9/10) in Situazione and the editing dialogs.
-PREZZO_SURCHARGE_MACHINES = {9, 10, 12, 24, 32, 56}
+PREZZO_SURCHARGE_MACHINES = {24, 32, 56}
 
 
 def apply_machine_surcharge(price: Any, machine: Any) -> Any:
@@ -1046,6 +1079,51 @@ def _is_pg_x(value: Any) -> bool:
     return not text or text in {"X", "PG-X", "PGX"}
 
 
+def _deduplicate_create_excel_rows(wb) -> int:
+    """Keep the first non-empty Partita Col across Orders and PG-X."""
+    seen: set[str] = set()
+    removed = 0
+    for sheet_name in ("Orders", "PG-X"):
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        headers = [_clean(cell.value) for cell in ws[1]]
+        partita_col = next(
+            (index + 1 for index, header in enumerate(headers) if _key(header) == _key("Partita Col")),
+            None,
+        )
+        if partita_col is None:
+            continue
+        duplicate_rows = []
+        for row_idx in range(2, ws.max_row + 1):
+            key = _partita_key(ws.cell(row=row_idx, column=partita_col).value)
+            if not key:
+                continue
+            if key in seen:
+                duplicate_rows.append(row_idx)
+            else:
+                seen.add(key)
+        for row_idx in reversed(duplicate_rows):
+            ws.delete_rows(row_idx, 1)
+        removed += len(duplicate_rows)
+    return removed
+
+
+def deduplicate_create_excel(path: Path) -> int:
+    """Remove duplicate Partita Col rows from the shared Orders workbook."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path)
+    try:
+        removed = _deduplicate_create_excel_rows(wb)
+        if removed:
+            safe_save_workbook(wb, path)
+            _sync_workbook_history(path, wb)
+        return removed
+    finally:
+        wb.close()
+
+
 def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -> dict[str, Any]:
     """Create or append the shared workbook used by the dyeing review flow.
 
@@ -1101,6 +1179,8 @@ def append_create_excel(path: Path, records: list[OrderRecord], customer: str) -
         for row_idx in range(ws.max_row, 1, -1):
             if _is_pg_x(ws.cell(row=row_idx, column=raw_col).value):
                 ws.delete_rows(row_idx, 1)
+
+    _deduplicate_create_excel_rows(wb)
 
     def col(name: str) -> int | None:
         wanted = _key(name)

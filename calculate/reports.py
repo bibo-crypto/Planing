@@ -1,7 +1,4 @@
-"""Cross-cutting reports built on top of the persisted Situazione state
-(utility/situazione_db.py) -- on-time delivery scoring and the Partita
-timeline/audit trail. Pure dataframe logic, no Tkinter.
-"""
+"""Cross-cutting reports built on top of the persisted Situazione state."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -64,65 +61,3 @@ def compute_on_time_delivery(states: dict) -> pd.DataFrame:
     return summary.sort_values("on_time_pct", ascending=True).reset_index(drop=True)[columns]
 
 
-def format_partita_timeline(history_rows: list[dict]) -> pd.DataFrame:
-    """Turn raw partita_history rows into a display-ready timeline: one row
-    per event, with a plain-language description of what changed since the
-    previous snapshot.
-    """
-    from calculate.situazione import compute_delay_days, _parse_delivery_date
-
-    columns = ["changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "consegna", "ritardo"]
-    if not history_rows:
-        return pd.DataFrame(columns=columns)
-
-    tracked = [
-        ("bagno", "Assigned to Bagno {new}"),
-        ("tinto", "Dyed on {new}"),
-        ("data_qualita", "Passed Q.C. on {new}"),
-        ("data_uscita", "Shipped on {new}"),
-    ]
-    out_rows = []
-    prev: dict = {}
-    today = pd.Timestamp(datetime.now().date())
-
-    for i, row in enumerate(history_rows):
-        events = []
-        if i == 0:
-            events.append("First seen")
-        else:
-            for field, template in tracked:
-                new_val = str(row.get(field) or "").strip()
-                old_val = str(prev.get(field) or "").strip()
-                if new_val and new_val != old_val:
-                    events.append(template.format(new=new_val))
-            if row.get("new_comment") != prev.get("new_comment"):
-                events.append(f"Status -> {row.get('new_comment') or '(cleared)'}")
-        if not events:
-            events.append("Updated")
-
-        days_qc = str(row.get("days_in_qc") or "").strip()
-        if not days_qc:
-            tinto_dt = _parse_delivery_date(row.get("tinto"))
-            if tinto_dt is not None:
-                days_qc = str((today - tinto_dt).days)
-            else:
-                days_qc = ""
-
-        ritardo_val = str(row.get("ritardo_consegna") or row.get("ritardo") or "").strip()
-        if not ritardo_val:
-            ritardo_val = compute_delay_days(row)
-
-        out_rows.append({
-            "changed_at": row.get("changed_at"),
-            "event": "; ".join(events),
-            "comment": row.get("new_comment"),
-            "bagno": row.get("bagno"),
-            "tinto": row.get("tinto"),
-            "data_qualita": row.get("data_qualita"),
-            "data_uscita": row.get("data_uscita"),
-            "days_in_qc": days_qc,
-            "consegna": row.get("consegna"),
-            "ritardo": ritardo_val,
-        })
-        prev = row
-    return pd.DataFrame(out_rows, columns=columns)

@@ -18,7 +18,7 @@ from gui.tabs.overview_tab import _write_typed_excel_table
 import openpyxl
 import utility.path_manager as path_manager
 import utility.situazione_db as db
-from calculate.reports import compute_on_time_delivery, format_partita_timeline
+from calculate.reports import compute_on_time_delivery
 from calculate.prezzi import detect_price_anomalies
 
 
@@ -527,6 +527,68 @@ class PlanningRegressionTests(unittest.TestCase):
             self.assertEqual(pg_x_rows[0].bagno, "S999")
             self.assertEqual(pg_x_rows[0].quantity_cones, 40)
 
+    def test_show_orders_deduplicates_partita_col_across_orders_and_pg_x(self):
+        from exporters.biglietti_exporter import CREATE_EXCEL_HEADERS, deduplicate_create_excel
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            wb = openpyxl.Workbook()
+            orders = wb.active
+            orders.title = "Orders"
+            orders.append(CREATE_EXCEL_HEADERS)
+            orders.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157890, "", "", "", 158694])
+            orders.append(["", "ELVY", "", "", "", "", "", "", "", "", "", "157890.0", "", "", "", 158694])
+            pg_x = wb.create_sheet("PG-X")
+            pg_x.append(CREATE_EXCEL_HEADERS)
+            pg_x.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157890, "", "", "", ""])
+            pg_x.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157891, "", "", "", ""])
+            pg_x.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157891, "", "", "", ""])
+            wb.save(path)
+            wb.close()
+
+            self.assertEqual(deduplicate_create_excel(path), 3)
+
+            wb = openpyxl.load_workbook(path, data_only=True)
+            self.assertEqual(wb["Orders"].max_row - 1, 1)
+            self.assertEqual(wb["PG-X"].max_row - 1, 1)
+            self.assertEqual(wb["Orders"].cell(2, 12).value, 157890)
+            self.assertEqual(wb["PG-X"].cell(2, 12).value, 157891)
+            wb.close()
+
+    def test_append_create_excel_cleans_existing_duplicates_and_skips_existing_partita_col(self):
+        from exporters.biglietti_exporter import (
+            CREATE_EXCEL_HEADERS, OrderRecord, append_create_excel,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            wb = openpyxl.Workbook()
+            orders = wb.active
+            orders.title = "Orders"
+            orders.append(CREATE_EXCEL_HEADERS)
+            orders.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157890, "", "", "", 158694])
+            orders.append(["", "ELVY", "", "", "", "", "", "", "", "", "", "157890.0", "", "", "", 158694])
+            pg_x = wb.create_sheet("PG-X")
+            pg_x.append(CREATE_EXCEL_HEADERS)
+            pg_x.append(["", "ELVY", "", "", "", "", "", "", "", "", "", 157891, "", "", "", ""])
+            wb.save(path)
+            wb.close()
+
+            duplicate = OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S", description="", additional_raw="",
+                color_code="5305", color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch="157891", raw_batch="PG-X", quantity_cones=32, raw_weight=30,
+                dispo="D-00505450-001", bagno="S940",
+            )
+            result = append_create_excel(path, [duplicate], "ELVY")
+
+            self.assertEqual(result["added"], 0)
+            self.assertEqual(result["skipped"], 1)
+            wb = openpyxl.load_workbook(path, data_only=True)
+            self.assertEqual(wb["Orders"].max_row - 1, 1)
+            self.assertEqual(wb["PG-X"].max_row - 1, 1)
+            wb.close()
+
     def test_update_order_row_clearing_partita_gg_moves_row_back_to_pg_x(self):
         from exporters.biglietti_exporter import OrderRecord, append_create_excel, update_order_row, load_create_excel_records
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -720,34 +782,6 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(elvy["on_time_pct"], 50.0)
         # Worst on-time % sorts first.
         self.assertEqual(summary.iloc[0]["cliente"], "MED")
-
-    def test_partita_history_records_stage_changes_only(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(db, "DB_PATH", str(Path(temp_dir) / "test.db")):
-                db.init_db()
-                base = {"partita": "P900", "cliente": "ELVY", "articolo": "G130", "colore": "10",
-                        "comment": "C.Q", "bagno": "5", "tinto": "", "data_qualita": "",
-                        "data_uscita": "", "consegna": "2026-09-10", "old_comment": "", "new_comment": "C.Q"}
-                db.upsert_states([base])
-                # Re-uploading identical data must NOT add a second history row.
-                db.upsert_states([dict(base)])
-                stage_2 = dict(base, tinto="2026-09-01", new_comment="Tinto")
-                db.upsert_states([stage_2])
-                stage_3 = dict(stage_2, data_uscita="2026-09-05", new_comment="Uscita")
-                db.upsert_states([stage_3])
-
-                history = db.get_partita_history("P900")
-                self.assertEqual(len(history), 3)  # added once, then 2 real stage changes
-
-                timeline = format_partita_timeline(history)
-                self.assertEqual(len(timeline), 3)
-                self.assertIn("days_in_qc", timeline.columns)
-                self.assertIn("consegna", timeline.columns)
-                self.assertIn("ritardo", timeline.columns)
-                self.assertTrue((timeline["consegna"] == "2026-09-10").all())
-                self.assertIn("First seen", timeline.iloc[0]["event"])
-                self.assertIn("Dyed on 2026-09-01", timeline.iloc[1]["event"])
-                self.assertIn("Shipped on 2026-09-05", timeline.iloc[2]["event"])
 
     def test_price_anomaly_flags_large_jump_not_small_one(self):
         df = pd.DataFrame([

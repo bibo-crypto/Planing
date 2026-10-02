@@ -44,7 +44,8 @@ class SettimanaTab(ttk.Frame):
         self._build_toolbar()
         self._build_treeview()
         self._refresh_source_labels_from_cache()
-        self.after_idle(self.sync_shared_async)
+        # Load shared data when the user opens this page, rather than
+        # competing with the main Situation restore during startup.
 
     def on_shown(self) -> None:
         """Load shared weekly sources when this page is opened."""

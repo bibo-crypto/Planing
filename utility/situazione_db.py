@@ -12,6 +12,8 @@ Tables:
   green/red status per source tab and know what "no changes" means.
 """
 import sqlite3
+import json
+from io import StringIO
 from datetime import datetime
 
 from utility.utils import APP_DATA_DIR
@@ -56,27 +58,6 @@ CREATE TABLE IF NOT EXISTS codes (
     titolo          TEXT
 );
 
-CREATE TABLE IF NOT EXISTS partita_history (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    partita         TEXT,
-    cliente         TEXT,
-    articolo        TEXT,
-    colore          TEXT,
-    data            TEXT,
-    consegna        TEXT,
-    comment         TEXT,
-    bagno           TEXT,
-    tinto           TEXT,
-    data_qualita    TEXT,
-    data_uscita     TEXT,
-    days_in_qc      TEXT,
-    ritardo_consegna TEXT,
-    old_comment     TEXT,
-    new_comment     TEXT,
-    changed_at      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_partita_history_partita ON partita_history(partita);
-
 CREATE TABLE IF NOT EXISTS upload_log (
     source_name     TEXT PRIMARY KEY,
     file_name       TEXT,
@@ -87,12 +68,39 @@ CREATE TABLE IF NOT EXISTS upload_log (
     message         TEXT,
     data_json       TEXT
 );
+CREATE TABLE IF NOT EXISTS frame_cache (
+    source_name TEXT PRIMARY KEY,
+    data_json TEXT NOT NULL,
+    saved_at TEXT NOT NULL
+);
+-- Versioned row-level snapshots.  frame_cache remains as a backward-
+-- compatible fallback for old installations, while new writes use these
+-- tables so metadata and rows can be invalidated/queryed independently.
+CREATE TABLE IF NOT EXISTS source_snapshot (
+    source_name TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    source_path TEXT,
+    source_mtime_ns INTEGER,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    saved_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS source_snapshot_row (
+    source_name TEXT NOT NULL,
+    row_number INTEGER NOT NULL,
+    row_json TEXT NOT NULL,
+    PRIMARY KEY (source_name, row_number),
+    FOREIGN KEY (source_name) REFERENCES source_snapshot(source_name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_source_snapshot_row_source ON source_snapshot_row(source_name);
 """
 
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -107,16 +115,6 @@ def init_db():
         pass  # column already exists
     try:
         conn.execute("ALTER TABLE partita_state ADD COLUMN ritardo_consegna TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    try:
-        conn.execute("ALTER TABLE partita_history ADD COLUMN days_in_qc TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    try:
-        conn.execute("ALTER TABLE partita_history ADD COLUMN ritardo_consegna TEXT")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
@@ -171,6 +169,55 @@ def get_all_uploads():
     return {r["source_name"]: dict(r) for r in rows}
 
 
+def save_frame_cache(source_name, frame):
+    """Persist a small/medium source frame so dashboards open from SQLite."""
+    if frame is None:
+        return
+    data = frame.to_json(orient="records", date_format="iso", date_unit="s")
+    conn = get_conn()
+    source_name = str(source_name)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DELETE FROM source_snapshot_row WHERE source_name=?", (source_name,))
+    conn.execute(
+        "INSERT INTO source_snapshot(source_name,schema_version,row_count,saved_at) VALUES(?,?,?,?) "
+        "ON CONFLICT(source_name) DO UPDATE SET schema_version=excluded.schema_version, row_count=excluded.row_count, saved_at=excluded.saved_at",
+        (source_name, 1, int(len(frame)), datetime.now().isoformat(timespec="seconds")),
+    )
+    rows = [(source_name, i, json.dumps(row, ensure_ascii=False, default=str))
+            for i, row in enumerate(frame.to_dict(orient="records"))]
+    conn.executemany("INSERT INTO source_snapshot_row(source_name,row_number,row_json) VALUES(?,?,?)", rows)
+    conn.execute(
+        "INSERT INTO frame_cache(source_name,data_json,saved_at) VALUES(?,?,?) "
+        "ON CONFLICT(source_name) DO UPDATE SET data_json=excluded.data_json,saved_at=excluded.saved_at",
+        (source_name, data, datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_frame_cache(source_name):
+    """Return a cached pandas DataFrame, or None when no snapshot exists."""
+    import pandas as pd
+    conn = get_conn()
+    source_name = str(source_name)
+    snapshot = conn.execute("SELECT schema_version FROM source_snapshot WHERE source_name=?", (source_name,)).fetchone()
+    if snapshot:
+        rows = conn.execute("SELECT row_json FROM source_snapshot_row WHERE source_name=? ORDER BY row_number", (source_name,)).fetchall()
+        conn.close()
+        try:
+            return pd.DataFrame([json.loads(row["row_json"]) for row in rows])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    row = conn.execute("SELECT data_json FROM frame_cache WHERE source_name=?", (source_name,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        return pd.read_json(StringIO(row["data_json"]), orient="records")
+    except (TypeError, ValueError):
+        return None
+
+
 def save_codes(df):
     """df must have columns: articolo_filato, titolo"""
     conn = get_conn()
@@ -211,9 +258,6 @@ def upsert_states(rows):
 
     added, updated, unchanged = 0, 0, 0
     now = datetime.now().isoformat(timespec="seconds")
-    history_rows = []
-    tracked_fields = ("comment", "bagno", "tinto", "data_qualita", "data_uscita", "new_comment")
-
     for row in rows:
         partita = row["partita"]
         if not str(partita or "").strip():
@@ -228,21 +272,6 @@ def upsert_states(rows):
             unchanged += 1
         else:
             updated += 1
-
-        # A timeline/audit-trail entry for this Partita: record a snapshot
-        # whenever any stage-relevant field actually changes (a new date
-        # filled in, the machine/bagno reassigned, the status text moving),
-        # not just when new_comment changes -- e.g. Data Uscita can be
-        # filled in on the same day the comment text stays "C.Q" for one
-        # more sync pass, and that's still a real, timeline-worthy event.
-        if prev is None or any(prev.get(field) != row.get(field, "") for field in tracked_fields):
-            history_rows.append((
-                partita, row.get("cliente", ""), row.get("articolo", ""), row.get("colore", ""),
-                row.get("data", ""), row.get("consegna", ""), row.get("comment", ""),
-                row.get("bagno", ""), row.get("tinto", ""), row.get("data_qualita", ""),
-                row.get("data_uscita", ""), row.get("days_in_qc", ""), row.get("ritardo_consegna", ""),
-                old_comment, new_comment, now,
-            ))
 
         conn.execute(
             """INSERT INTO partita_state
@@ -273,46 +302,9 @@ def upsert_states(rows):
              old_comment, new_comment, row.get("prezzo", ""), now, row.get("row_hash", "")),
         )
 
-    if history_rows:
-        conn.executemany(
-            """INSERT INTO partita_history
-               (partita, cliente, articolo, colore, data, consegna, comment,
-                bagno, tinto, data_qualita, data_uscita, days_in_qc, ritardo_consegna,
-                old_comment, new_comment, changed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            history_rows,
-        )
-
     conn.commit()
     conn.close()
     return added, updated, unchanged
-
-
-def get_partita_history(partita: str) -> list[dict]:
-    """Full timeline for one Partita, oldest first -- each row is a snapshot
-    taken the moment a stage-relevant field changed (see upsert_states)."""
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM partita_history WHERE partita=? ORDER BY changed_at ASC, id ASC",
-        (str(partita).strip(),),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def search_partite(query: str, limit: int = 25) -> list[str]:
-    """Partita numbers matching a (partial) search string, most recent first."""
-    query = str(query).strip()
-    if not query:
-        return []
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT partita FROM partita_history WHERE partita LIKE ? "
-        "ORDER BY partita LIMIT ?",
-        (f"%{query}%", limit),
-    ).fetchall()
-    conn.close()
-    return [r["partita"] for r in rows]
 
 
 def remove_states_not_in(partite):

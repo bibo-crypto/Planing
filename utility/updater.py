@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 import zipfile
 
 
-DEFAULT_APP_VERSION = "1.0.6"
+DEFAULT_APP_VERSION = "1.1.1"
 GITHUB_REPOSITORY = "bibo-crypto/Planing"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
@@ -311,6 +311,17 @@ function Restore-Backup {{
         }}
     }} catch {{ $_ | Out-File -FilePath $log -Append }}
 }}
+function Start-Planing {{
+    try {{
+        $started = Start-Process -FilePath $exePath -WorkingDirectory $target -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 2
+        if (Get-Process -Id $started.Id -ErrorAction SilentlyContinue) {{ return $true }}
+    }} catch {{ $_ | Out-File -FilePath $log -Append }}
+    try {{
+        Start-Process -FilePath 'cmd.exe' -WorkingDirectory $target -WindowStyle Hidden -ArgumentList @('/c', 'start', '""', $exePath) -ErrorAction Stop
+        return $true
+    }} catch {{ $_ | Out-File -FilePath $log -Append; return $false }}
+}}
 try {{
     if (Test-Path -LiteralPath $backup) {{ Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }}
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
@@ -342,7 +353,7 @@ try {{
         Move-Item -LiteralPath $versionTemp -Destination $versionPath -Force
         $writtenVersion = (Get-Content -LiteralPath $versionPath -Raw).Trim().TrimStart('v','V')
         if ($writtenVersion -ne $versionValue.Trim().TrimStart('v','V')) {{ throw "version.txt verification failed: '$writtenVersion'" }}
-        Start-Process -FilePath $exePath -WorkingDirectory $target
+        if (-not (Start-Planing)) {{ throw "Planing.exe could not be started after update" }}
         # Antivirus commonly intercepts a freshly-written, unsigned exe on
         # its first launch -- it can run its own scan/sandbox pass, kill
         # that first process, and start a *different* one afterwards, on
@@ -365,12 +376,12 @@ try {{
         if (-not $sawRunning) {{
             "New version never started running within 3 minutes -- rolling back to the previous version" | Out-File -FilePath $log -Append
             Restore-Backup
-            Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
+            Start-Planing | Out-Null
         }}
     }} else {{
         "Update copy never succeeded after 20 attempts -- rolling back to the previous version" | Out-File -FilePath $log -Append
         Restore-Backup
-        Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
+        Start-Planing | Out-Null
     }}
     }} catch {{
         $_ | Out-File -FilePath $log -Append
@@ -379,7 +390,7 @@ try {{
         # not even the old version, is the one outcome worse than a failed
         # update.
         Restore-Backup
-        Start-Process -FilePath $exePath -WorkingDirectory $target -ErrorAction SilentlyContinue
+        Start-Planing | Out-Null
     }}
 Remove-Item -LiteralPath {_powershell_quote(zip_path)} -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath {_powershell_quote(stage_root)} -Recurse -Force -ErrorAction SilentlyContinue

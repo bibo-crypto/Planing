@@ -22,7 +22,7 @@ for _exporter_function in (
     "export_word", "export_workbook", "load_articoli_marca_lookup",
     "load_articoli_titolo_map", "load_densita_query", "load_el_kamal_order", "load_order",
     "load_prezzo_lookup", "load_vmm22_ratio_from_magazino", "_filato_rows",
-    "append_create_excel", "load_create_excel_records", "sync_workbook_history", "save_pg_x_partita",
+    "append_create_excel", "deduplicate_create_excel", "load_create_excel_records", "sync_workbook_history", "save_pg_x_partita",
     "update_pg_x_row", "update_order_row", "move_pg_x_to_orders", "delete_pg_x_row",
     "delete_shipped_shared_rows",
 ):
@@ -748,6 +748,7 @@ class BigliettiTab(ttk.Frame):
 
     def _load_shared_orders_worker(self, path: Path, loading: tk.Toplevel):
         try:
+            deduplicate_create_excel(path)
             sync_workbook_history(path)
             datasets = {
                 "Orders": load_create_excel_records(path, sheet_name="Orders"),
@@ -1534,8 +1535,14 @@ class BigliettiTab(ttk.Frame):
         if not records:
             return messagebox.showwarning("No Orders Selected", "Select at least one color to print.", parent=window)
         # Keep one stable output file: every print replaces the previous
-        # document with only the records selected in the current view.
-        destination = self.shared_excel_path.parent / "Biglietti_Selected.docx"
+        # document with only the records passed in this time. Shared by
+        # both "Print Selected Biglietti" (checked rows) and "Print
+        # Assigned PG-X" (assigned rows) -- named neither "..._Selected"
+        # (looked like the wrong button had run when Print Assigned PG-X
+        # produced it) nor "Biglietti.docx" (that name is the *template*
+        # file selected above, usually kept in this same folder -- reusing
+        # it here would silently overwrite the user's own template).
+        destination = self.shared_excel_path.parent / "Biglietti_Stampati.docx"
         pg_x_partita_cols = []
         if move_assigned_pg_x:
             pg_x_partita_cols = list(dict.fromkeys(

@@ -113,16 +113,17 @@ class SourceRow(ttk.Frame):
         button_name = SOURCE_BUTTON_NAMES.get(key, label)
         self.button = ttk.Button(
             self,
-            text=f"Upload {button_name}",
+            text=button_name,
             command=self._browse,
-            width=13,
+            width=6,
+            min_width=88,
             font=("Segoe UI", 8, "bold"),
             height=30,
         )
         self.button.grid(row=0, column=0, columnspan=2, padx=4, pady=(3, 2), sticky="ew")
 
-        self.status_lbl = ttk.Label(self, textvariable=self.status_var, anchor="w",
-                                    foreground="#667085", width=14)
+        self.status_lbl = ttk.Label(self, textvariable=self.status_var, anchor="center",
+                        foreground="#667085", width=8, font=("Segoe UI", 8))
         self.status_lbl.grid(row=1, column=1, padx=(2, 4), sticky="w")
 
         self.columnconfigure(1, weight=1)
@@ -164,6 +165,7 @@ class SituazioneTab(ttk.Frame):
         self._other_shared_syncing = False
         self._shared_source_paths = {}
         self._startup_restore_in_progress = False
+        self._sources_restore_started = False
         self._startup_snapshot_current = False
         self._table_loaded_callbacks = []
         self._data_revision = 0
@@ -172,6 +174,10 @@ class SituazioneTab(ttk.Frame):
         self._shared_dfm_path = ""
         self._shared_prod_path = ""
         self._copertura_revision = 0
+        cached_copertura = db.load_frame_cache("copertura")
+        if isinstance(cached_copertura, pd.DataFrame) and not cached_copertura.empty:
+            self.loaded_frames["copertura"] = cached_copertura
+            self._copertura_revision += 1
         self._child_windows = {}
         self._price_densita_syncing = False
 
@@ -186,11 +192,16 @@ class SituazioneTab(ttk.Frame):
 
     def on_shown(self) -> None:
         """Restore shared Excel sources when the Situation page is opened."""
+        if self._sources_restore_started:
+            return
+        self._sources_restore_started = True
         self.after_idle(self._auto_restore_saved_files)
-        self.after_idle(self.sync_shared_async)
-        self.after_idle(self.sync_remaining_shared_sources)
-        self.after_idle(self._recompute_prezzo_densita_async)
-        self.after_idle(self.refresh_raw_yarn_match_async)
+        # Stagger the optional background syncs: starting all Excel readers at
+        # the same instant made the UI and disk compete during startup.
+        self.after(500, self.sync_shared_async)
+        self.after(1200, self.sync_remaining_shared_sources)
+        self.after(2200, self._recompute_prezzo_densita_async)
+        self.after(3200, self.refresh_raw_yarn_match_async)
 
     # ------------------------------------------------------------------ UI
     def _configure_styles(self):
@@ -221,31 +232,37 @@ class SituazioneTab(ttk.Frame):
 
     def _build_upload_panel(self):
         upload_area = ttk.Frame(self)
-        upload_area.pack(side="top", fill="x", anchor="w", padx=8, pady=(2, 0))
+        upload_area.pack(side="top", fill="x", padx=8, pady=(2, 0))
+        upload_area.columnconfigure(0, weight=3, uniform="upload_panels")
+        upload_area.columnconfigure(1, weight=1, uniform="upload_panels")
 
         panel = ttk.LabelFrame(upload_area, text="1) Required files", style="Upload.TLabelframe")
-        panel.pack(side="left", anchor="nw")
+        panel.grid(row=0, column=0, sticky="nsew")
         panel.configure(padding=(5, 1))
 
         self.source_rows = {}
-        for key in SOURCE_ORDER:
+        for index, key in enumerate(SOURCE_ORDER):
             label, _ = data_loaders.LOADERS[key]
             row = SourceRow(panel, key, label, self._handle_upload)
-            row.grid(row=0, column=SOURCE_ORDER.index(key), padx=3, pady=1, sticky="nw")
+            row.grid(row=0, column=index, padx=2, pady=1, sticky="ew")
             self.source_rows[key] = row
+        for column in range(len(SOURCE_ORDER)):
+            panel.columnconfigure(column, weight=1, uniform="required_sources")
 
         codes_panel = ttk.LabelFrame(upload_area, text="Optional file", style="Upload.TLabelframe")
-        codes_panel.pack(side="left", anchor="nw", padx=(8, 0), fill="y")
+        codes_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         codes_panel.configure(padding=(5, 1))
+        codes_panel.columnconfigure(0, weight=1, uniform="optional_sources")
+        codes_panel.columnconfigure(1, weight=1, uniform="optional_sources")
 
         codes_row = SourceRow(codes_panel, "codes", "Yarn codes (Articoli) - optional",
                                self._handle_codes_upload)
-        codes_row.grid(row=0, column=0, padx=3, pady=1, sticky="nw")
+        codes_row.grid(row=0, column=0, padx=3, pady=1, sticky="ew")
         self.codes_row = codes_row
 
         listini_row = SourceRow(codes_panel, "listini", "Listini (Prezzi) - optional",
                                  self._handle_listini_upload)
-        listini_row.grid(row=0, column=1, padx=3, pady=1, sticky="nw")
+        listini_row.grid(row=0, column=1, padx=2, pady=1, sticky="ew")
         self.listini_row = listini_row
 
     def _build_toolbar(self):
@@ -272,9 +289,6 @@ class SituazioneTab(ttk.Frame):
 
         self.on_time_btn = ttk.Button(bar, text="On-Time Delivery", command=self._open_on_time_delivery)
         self.on_time_btn.pack(side="left", padx=4)
-
-        self.timeline_btn = ttk.Button(bar, text="Partita Timeline", command=self._open_partita_timeline)
-        self.timeline_btn.pack(side="left", padx=4)
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
@@ -520,105 +534,6 @@ class SituazioneTab(ttk.Frame):
         buttons.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(buttons, text="📤 Export to Excel", command=export_summary).pack(side="right", padx=3)
 
-    def _open_partita_timeline(self, initial_partita: str = ""):
-        """Search a Partita and see every stage change recorded for it
-        (Bagno assigned, Tinto, Q.C., Uscita, status text), oldest first."""
-        if self._focus_child_window("timeline"):
-            window = self._child_windows["timeline"]
-            if initial_partita:
-                window._search_var.set(initial_partita)
-                window._do_search()
-            return
-
-        window = tk.Toplevel(self)
-        keep_window_on_top(window)
-        self._child_windows["timeline"] = window
-        window.title("Partita Timeline")
-        window.geometry("960x500")
-        window.minsize(750, 360)
-
-        search_row = ttk.Frame(window)
-        search_row.pack(fill="x", padx=10, pady=(10, 6))
-        ttk.Label(search_row, text="Search Partita:").pack(side="left", padx=(0, 6))
-        search_var = tk.StringVar(value=initial_partita)
-        window._search_var = search_var
-        entry = ttk.Entry(search_row, textvariable=search_var, width=24)
-        entry.pack(side="left")
-        ttk.Button(search_row, text="Clear", width=6, command=lambda: search_var.set("")).pack(side="left", padx=(4, 0))
-        status = ttk.Label(search_row, text="")
-        status.pack(side="left", padx=(10, 0))
-
-        frame = ttk.Frame(window)
-        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        columns = ("changed_at", "event", "comment", "bagno", "tinto", "data_qualita", "data_uscita", "days_in_qc", "consegna", "ritardo")
-        labels = {
-            "changed_at": "When", "event": "Event", "comment": "Status", "bagno": "Bagno",
-            "tinto": "Tinto", "data_qualita": "Data Qualità", "data_uscita": "Data Uscita",
-            "days_in_qc": "Days in C.Q", "consegna": "Consegna", "ritardo": "Ritardo",
-        }
-        tree = ttk.Treeview(frame, columns=columns, show="headings")
-        widths = [125, 230, 95, 60, 85, 90, 90, 80, 85, 75]
-        for column, width in zip(columns, widths):
-            tree.heading(column, text=labels[column])
-            tree.column(column, width=width, anchor="w" if column == "event" else "center")
-        yscroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=yscroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        current_timeline = {"df": pd.DataFrame()}
-
-        def do_search():
-            partita = search_var.get().strip()
-            tree.delete(*tree.get_children())
-            if not partita:
-                status.config(text="")
-                current_timeline["df"] = pd.DataFrame()
-                return
-            history = db.get_partita_history(partita)
-            timeline = reports.format_partita_timeline(history)
-            current_timeline["df"] = timeline
-            if timeline.empty:
-                status.config(text="No history recorded for this Partita.")
-                return
-            status.config(text=f"{len(timeline)} event(s)")
-            for _, row in timeline.iterrows():
-                tree.insert("", "end", values=tuple(row[c] for c in columns))
-
-        window._do_search = do_search
-        search_var.trace_add("write", lambda *_: do_search())
-        entry.bind("<Return>", lambda _event: do_search())
-        ttk.Button(search_row, text="Search", command=do_search).pack(side="left", padx=(10, 0))
-
-        def export_timeline():
-            timeline = current_timeline["df"]
-            if timeline.empty:
-                messagebox.showinfo("Partita Timeline", "Search for a Partita first.", parent=window)
-                return
-            path = filedialog.asksaveasfilename(
-                parent=window, title="Export Timeline", defaultextension=".xlsx",
-                filetypes=[("Excel files", "*.xlsx")],
-                initialfile=f"timeline_{search_var.get().strip()}.xlsx",
-            )
-            if not path:
-                return
-            try:
-                timeline.rename(columns=labels).to_excel(path, index=False, sheet_name="Timeline")
-                messagebox.showinfo("Partita Timeline", f"Export completed:\n{path}", parent=window)
-            except Exception as exc:  # noqa: BLE001
-                messagebox.showerror("Partita Timeline", str(exc), parent=window)
-
-        buttons = ttk.Frame(window)
-        buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="📤 Export to Excel", command=export_timeline).pack(side="right", padx=3)
-
-        if initial_partita:
-            do_search()
-        else:
-            entry.focus_set()
-
     def _focus_child_window(self, key):
         """Focus an already-open child window instead of opening a duplicate."""
         window = self._child_windows.get(key)
@@ -669,18 +584,6 @@ class SituazioneTab(ttk.Frame):
         self.tree.tag_configure("price_error", background="#fee2e2", foreground="#991b1b")
         self.tree.tag_configure("stripe", background="#f3f6fa")
         self.tree.tag_configure("normal", background="#ffffff")
-
-        # Double-click a row -> open its Partita's timeline directly, so you
-        # don't have to retype the number you're already looking at.
-        self.tree.bind("<Double-1>", self._on_tree_double_click)
-
-    def _on_tree_double_click(self, _event):
-        item_id = self.tree.focus()
-        if not item_id:
-            return
-        partita = self.tree.set(item_id, "partita")
-        if partita:
-            self._open_partita_timeline(initial_partita=partita)
 
     def _autosize_columns(self, df):
         """Fit columns to visible content while keeping the table usable."""
@@ -780,6 +683,10 @@ class SituazioneTab(ttk.Frame):
             loaded = {}
             errors = {}
             for key in SOURCE_ORDER:
+                # DFM is an explicit-upload-only reference; never parse the
+                # saved historical workbook during startup.
+                if key == "dfm":
+                    continue
                 path = paths.get(key, "")
                 if not path:
                     errors[key] = "not saved"
@@ -885,27 +792,12 @@ class SituazioneTab(ttk.Frame):
         return True
 
     def sync_shared_dfm(self):
-        """Load the DFM selected in either page from the shared persistent cache."""
-        cache = load_dfm_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        if not source_path.is_file():
-            return
-        if getattr(self, "_shared_dfm_path", "") == str(source_path):
-            return
+        """DFM is intentionally never restored from disk at startup.
 
-        try:
-            df, errors = data_loaders.load_dfm(str(source_path))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not restore shared DFM file: %s", exc)
-            return
-        if errors or df is None or df.empty:
-            return
-
-        self.loaded_frames["dfm"] = df
-        self._shared_dfm_path = str(source_path)
-        msg = f"✅ {len(df)} rows - {source_path.name}"
-        self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
-        db.save_upload("dfm", source_path.name, len(df), "ok", msg, file_path=str(source_path))
+        DFM is a large historical reference and must only enter the process
+        after the operator explicitly selects it in the upload control.
+        """
+        return
 
     def sync_shared_async(self):
         """Restore shared Excel files without blocking the Tk event loop."""
@@ -930,11 +822,7 @@ class SituazioneTab(ttk.Frame):
         def worker():
             dfm_result = None
             prod_result = None
-            if dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path:
-                try:
-                    dfm_result = data_loaders.load_dfm(dfm_path)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not restore shared DFM file: %s", exc)
+            # DFM deliberately omitted: it is an explicit-upload-only source.
             if prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path:
                 try:
                     prod_result = data_loaders.load_data_prod(prod_path)
@@ -943,12 +831,6 @@ class SituazioneTab(ttk.Frame):
 
             def apply_result():
                 self._shared_syncing = False
-                if dfm_result and not dfm_result[1] and dfm_result[0] is not None and not dfm_result[0].empty:
-                    df = dfm_result[0]
-                    self.loaded_frames["dfm"] = df
-                    self._shared_dfm_path = dfm_path
-                    self.source_rows["dfm"].set_status(True, f"✅ {len(df)} rows")
-                    db.save_upload("dfm", Path(dfm_path).name, len(df), "ok", f"✅ {len(df)} rows - {Path(dfm_path).name}", file_path=dfm_path)
                 if prod_result and not prod_result[1] and prod_result[0] is not None and not prod_result[0].empty:
                     df = prod_result[0]
                     self.loaded_frames["data_prod"] = df
@@ -1088,6 +970,10 @@ class SituazioneTab(ttk.Frame):
         self.loaded_frames[key] = df
         if key == "copertura":
             self._copertura_revision += 1
+            try:
+                db.save_frame_cache("copertura", df)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not cache Copertura in SQLite: %s", exc)
         msg = f"✅ {len(df)} rows - {os.path.basename(display_path)}"
         self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
         db.save_upload(key, os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
@@ -1442,7 +1328,9 @@ class SituazioneTab(ttk.Frame):
             logger.warning("Situazione: Densita' Query lookup failed: %s", exc)
 
         def _prezzo_row(row):
-            base = biglietti_exporter.prezzo_for(row.get("articolo", ""), row.get("codice", ""), price_lookup)
+            base, used_category, category, level = biglietti_exporter.prezzo_match_for(
+                row.get("articolo", ""), row.get("codice", ""), price_lookup
+            )
             expected = biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
             current = row.get("prezzo", "")
             try:
@@ -1465,8 +1353,24 @@ class SituazioneTab(ttk.Frame):
             if article and code:
                 identity = f"{article}:{code}:{partita_col}"
                 missing_key = f"situazione-price-missing:{identity}"
+                category_key = f"situazione-price-category-fallback:{identity}"
+                if used_category and expected_num is not None:
+                    level_text = f", livello {float(level):g}" if level is not None else ""
+                    pending.append((
+                        "add", category_key, "Prezzo Listini da Category",
+                        f"Articolo {article}, color code {code}: no direct price; used Category {category} price {expected_num:.2f}{level_text}.",
+                        "Situazione Generale", "medium", partita_col,
+                    ))
+                else:
+                    pending.append(("resolve", category_key))
                 if expected_num is None:
-                    pending.append(("resolve", missing_key))
+                    if current_num in (None, 0.0):
+                        pending.append(("resolve", missing_key))
+                    else:
+                        pending.append((
+                            "add", missing_key, "Prezzo Listini mancante",
+                            f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f} exists but Listini has no matching price.", "Situazione Generale", "medium", partita_col,
+                        ))
                 elif current_num is not None and abs(current_num - 0.01) < 1e-9:
                     pending.append((
                         "add", f"situazione-price-suspicious:{identity}", "Prezzo Ord. sospetto (0.01)",

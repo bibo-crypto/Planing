@@ -36,6 +36,7 @@ from __future__ import annotations
 from utility.excel_io import safe_save_workbook
 
 import tkinter as tk
+import threading
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
@@ -223,6 +224,40 @@ def export_treeview_to_excel(tree: ttk.Treeview, default_filename: str, parent: 
     messagebox.showinfo("Export Completed", f"Exported to:\n{path}", parent=parent)
 
 
+def export_dataframe_fast(df: pd.DataFrame, default_filename: str, parent: tk.Widget | None = None,
+                          sheet_title: str = "Export") -> None:
+    """Fast background export for larger reports; the UI thread only opens the dialog."""
+    if df.empty:
+        messagebox.showinfo("No Data", "There is no data to export.", parent=parent)
+        return
+    path = filedialog.asksaveasfilename(
+        title="Export to Excel", defaultextension=".xlsx",
+        filetypes=[("Excel files", "*.xlsx")], initialfile=default_filename,
+    )
+    if not path:
+        return
+    snapshot = df.copy()
+
+    def worker():
+        error = None
+        try:
+            # pandas/openpyxl writes the report in one pass and avoids the
+            # per-cell type inference/format loop used by the detailed export.
+            snapshot.to_excel(path, index=False, sheet_name=sheet_title[:31])
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+
+        def done():
+            if error:
+                messagebox.showerror("Export Failed", error, parent=parent)
+            else:
+                messagebox.showinfo("Export Completed", f"Exported to:\n{path}", parent=parent)
+        if parent is not None and parent.winfo_exists():
+            parent.after(0, done)
+
+    threading.Thread(target=worker, name="planing-excel-export", daemon=True).start()
+
+
 def _write_typed_excel_table(ws, df: pd.DataFrame) -> None:
     """Write an Overview export with typed cells, styling and Excel filters."""
     ws.append(list(df.columns))
@@ -394,12 +429,19 @@ class OverviewTab(ttk.Frame):
         self._lbl_updated = ttk.Label(toolbar, text="", foreground="#64748b", font=("Segoe UI", 9))
         self._lbl_updated.pack(side="right")
 
-        self._notification_frame = None
-
         outer = ttk.Frame(self)
         outer.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
 
-        canvas = tk.Canvas(outer, highlightthickness=0, bg="#f8fafc")
+        # tk.Canvas needs an explicit bg -- otherwise it can default to pure
+        # white, which stands out as a harsh blank rectangle against the
+        # ttk theme's own real frame background the moment the scrollable
+        # content is shorter than the canvas's visible area (exactly what
+        # happens here: cards are much shorter than the old static tables
+        # were). Reading the theme's actual background at runtime (instead
+        # of a hardcoded guess like "#f8fafc") means this never drifts out
+        # of sync with it again, on any theme/OS.
+        theme_bg = ttk.Style(self).lookup("TFrame", "background") or self.cget("background")
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=theme_bg)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
@@ -414,6 +456,12 @@ class OverviewTab(ttk.Frame):
 
         def _on_canvas_configure(event):
             canvas.itemconfig(body_window, width=event.width)
+            # Stretch the body to at least the canvas's own visible height
+            # (never shrink it below its natural content height) so short
+            # content still fills the visible area in the theme's real
+            # background color above, rather than leaving a flat,
+            # differently-colored rectangle below it.
+            canvas.itemconfig(body_window, height=max(event.height, self._body.winfo_reqheight()))
 
         self._body.bind("<Configure>", _on_body_configure)
         canvas.bind("<Configure>", _on_canvas_configure)
@@ -629,30 +677,7 @@ class OverviewTab(ttk.Frame):
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
-    def _render_notifications(self) -> None:
-        if not getattr(self, "_notification_frame", None):
-            return
-        for child in self._notification_frame.winfo_children():
-            child.destroy()
-        items = notifications.list_open()
-        if not items:
-            ttk.Label(self._notification_frame, text="No open notifications", foreground="#2e7d32").pack(anchor="w")
-            return
-        for item in items[:8]:
-            row = ttk.Frame(self._notification_frame)
-            row.pack(fill="x", pady=1)
-            color = "#c62828" if item.get("severity") == "high" else "#9a3412"
-            ttk.Label(row, text=f"{item.get('title', 'Notification')}: ", foreground=color, font=("Segoe UI", 9, "bold")).pack(side="left")
-            ttk.Label(row, text=item.get("message", ""), foreground="#344054").pack(side="left", fill="x", expand=True)
-            key = item.get("key", "")
-            ttk.Button(row, text="Resolve", width=9, command=lambda key=key: self._resolve_notification(key)).pack(side="right")
-
-    def _resolve_notification(self, key: str) -> None:
-        notifications.resolve(key)
-        self.refresh(force=True)
-
     def _render(self, df: pd.DataFrame, magazino: pd.DataFrame) -> None:
-        self._render_notifications()
         for frame in (self._cards_frame, self._tables_frame):
             for widget in frame.winfo_children():
                 widget.destroy()
@@ -765,12 +790,29 @@ class OverviewTab(ttk.Frame):
                         on_click=lambda: self._open_data_ticket(f"Elvy: consegna entro {DELIVERY_ALERT_DAYS} giorni", elvy_due_df, elvy_cols, "elvy_entro_giorni.xlsx"))
 
         price_anomalies = business_logic.find_price_anomalies(df)
+        price_change_df = self._price_change_df()
+        category_conflicts = (
+            price_change_df[price_change_df["issue"].eq("Category price/level conflict")]
+            if "issue" in price_change_df.columns
+            else pd.DataFrame()
+        )
+        for _, conflict in category_conflicts.iterrows():
+            price_anomalies.append({
+                "cliente": "Prezzi Category",
+                "articolo": conflict["CLARTICOLO"],
+                "codice": conflict["CLCOLORE"],
+                "colore": conflict["CLDESCR"],
+                "prezzo": conflict["new_price"],
+                "prezzo_lisini": conflict["old_price"],
+                "category": conflict["CATEGORY"],
+                "issue": conflict["issue"],
+            })
         price_problem_colors = len({
             str(item.get("colore", "")).strip()
             for item in price_anomalies
             if str(item.get("colore", "")).strip()
         })
-        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "prezzo", "prezzo_lisini", "ordine", "riga", "bagno", "mc", "issue"]
+        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "category", "prezzo", "prezzo_lisini", "ordine", "riga", "bagno", "mc", "issue"]
         self._add_card(
             8, "💲 Errori Prezzo — colori", str(price_problem_colors),
             alert=price_problem_colors > 0,
@@ -779,8 +821,7 @@ class OverviewTab(ttk.Frame):
                 price_anomalies_cols, "errori_prezzo.xlsx",
             ),
         )
-        price_change_df = self._price_change_df()
-        price_change_cols = ["CLARTICOLO", "CLCOLORE", "CLDESCR", "old_price", "new_price", "pct_change", "changed_on"]
+        price_change_cols = ["CLARTICOLO", "CLCOLORE", "CLDESCR", "CATEGORY", "old_price", "new_price", "pct_change", "changed_on", "issue"]
         self._add_card(
             9, "⚠ Price Changes", f"{len(price_change_df):,}",
             alert=len(price_change_df) > 0, danger=len(price_change_df) > 0,
@@ -796,6 +837,7 @@ class OverviewTab(ttk.Frame):
         counts = {machine: 0 for machine in range(3, 13)}
         if not schedule.empty:
             counts.update(schedule["machine"].value_counts().to_dict())
+        machines = sorted(counts)
 
         frame = tk.LabelFrame(
             self._cards_frame, text="Copertura macchine", bg="#f8fafc", fg="#16324f",
@@ -810,7 +852,7 @@ class OverviewTab(ttk.Frame):
 
         covered_until = business_logic.machine_coverage_until
 
-        for index, machine in enumerate(range(3, 13)):
+        for index, machine in enumerate(machines):
             count = int(counts[machine])
             empty = count == 0
             card = tk.Frame(
@@ -896,7 +938,7 @@ class OverviewTab(ttk.Frame):
         buttons.grid(row=2, column=0, columnspan=2, sticky="ew")
         ttk.Button(
             buttons, text="Export Excel",
-            command=lambda: export_dataframe_typed(
+            command=lambda: export_dataframe_fast(
                 machine_df.rename(columns=labels), f"machine_{machine}_dyeing_schedule.xlsx", window,
                 sheet_title=f"M{machine}",
             ),
@@ -908,7 +950,10 @@ class OverviewTab(ttk.Frame):
         prezzi_tab = self.prezzi_tab
         base_df = getattr(prezzi_tab, "_base_df", None)
         if not isinstance(base_df, pd.DataFrame) or base_df.empty:
-            return pd.DataFrame(columns=["CLARTICOLO", "CLCOLORE", "CLDESCR", "old_price", "new_price", "pct_change", "changed_on"])
+            return pd.DataFrame(columns=[
+                "CLARTICOLO", "CLCOLORE", "CLDESCR", "CATEGORY", "old_price",
+                "new_price", "pct_change", "changed_on", "issue",
+            ])
         from calculate.prezzi import detect_price_anomalies
         return detect_price_anomalies(base_df, min_pct_change=10.0)
 
@@ -999,4 +1044,3 @@ class OverviewTab(ttk.Frame):
             ),
         ).pack(side="left")
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
-

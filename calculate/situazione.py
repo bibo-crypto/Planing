@@ -597,23 +597,33 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
 # definition so the two views can never silently drift out of sync.
 # ----------------------------------------------------------------------
 _MACHINE_CODE_RANGE = (3300, 3399)
-_BARE_MACHINE_RE = re.compile(r"(?<!\d)0*(1[0-2]|[3-9])(?:\.0+)?(?!\d)")
+_BARE_MACHINE_RE = re.compile(r"(?<!\d)0*(\d+)(?:\.0+)?(?!\d)")
 
 
 def machine_number_from_label(value) -> int | None:
     """
-    Parse a Copertura "Machine" label into a plain machine number (3-12).
+    Parse a Copertura "Machine" label into a plain machine number.
     Accepts either the 3300-series code Delta uses internally (e.g.
     "3305" -> 5) or a bare number as it might appear in a hand-edited
     sheet (e.g. "5", "05", "12.0", "M5" -> 5 / 12). Returns None when
     nothing recognizable is found.
     """
     text = clean_text(value)
-    digits = re.sub(r"\D", "", text)
-    if digits and _MACHINE_CODE_RANGE[0] <= int(digits) <= _MACHINE_CODE_RANGE[1]:
-        return int(digits) - _MACHINE_CODE_RANGE[0]
+    numeric_text = text.replace(",", ".")
+    try:
+        numeric_value = float(numeric_text)
+        numeric_int = int(numeric_value) if numeric_value.is_integer() else None
+    except (TypeError, ValueError):
+        numeric_int = None
+    if numeric_int is not None and _MACHINE_CODE_RANGE[0] <= numeric_int <= _MACHINE_CODE_RANGE[1]:
+        return numeric_int - _MACHINE_CODE_RANGE[0]
     match = _BARE_MACHINE_RE.search(text)
-    return int(match.group(1)) if match else None
+    if not match:
+        return None
+    number = int(match.group(1))
+    if _MACHINE_CODE_RANGE[0] <= number <= _MACHINE_CODE_RANGE[1]:
+        return number - _MACHINE_CODE_RANGE[0]
+    return number if number > 0 else None
 
 
 def machine_coverage_until(color_count, today=None) -> str:
@@ -669,7 +679,7 @@ def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
         on="bagno_key", how="inner",
     )
     merged["machine_number"] = merged["machine"].map(machine_number_from_label)
-    merged = merged[merged["machine_number"].between(3, 12, inclusive="both")]
+    merged = merged[merged["machine_number"].notna()]
     if merged.empty:
         return {}
     return merged.groupby("machine_number").size().to_dict()
@@ -692,7 +702,7 @@ def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFra
     right["_bagno_key"] = right["bagno"].map(bagno_key)
     right["_copertura_order"] = right.index
     right["_machine_number"] = right["machine"].map(machine_number_from_label)
-    right = right[right["_machine_number"].between(3, 12, inclusive="both")]
+    right = right[right["_machine_number"].notna()]
     right = right.drop_duplicates("_bagno_key", keep="first")
     merged = left.merge(right[["_bagno_key", "_machine_number", "_copertura_order"]], on="_bagno_key", how="inner")
     if merged.empty:

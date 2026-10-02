@@ -16,20 +16,41 @@ import pandas as pd
 
 from calculate import prezzi as logic
 from utility.prezzi_cache import load_prezzi_cache, save_prezzi_cache
+from utility.excel_io import safe_save_workbook
 from utility.path_manager import save_source
 from utility.utils import keep_window_on_top, logger
 
 COLUMNS = logic.DISPLAY_COLUMNS
 HEADERS = logic.HEADERS
+MAX_RENDER_ROWS = 1500
+
+
+def _filter_color_code(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    code = query.strip()
+    if not code:
+        return df
+
+    colors = df["CLCOLORE"].fillna("").astype(str)
+    if code.isdigit():
+        normalized_query = code.lstrip("0") or "0"
+        normalized_colors = colors.map(
+            lambda value: (value.lstrip("0") or "0") if value.isdigit() else value
+        )
+        exact_matches = normalized_colors.eq(normalized_query)
+        if exact_matches.any():
+            return df[exact_matches]
+
+    return df[colors.str.casefold().str.contains(code.casefold(), regex=False)]
 
 
 class PrezziTab(ttk.Frame):
     """Embeddable 'Prezzi' tab."""
 
-    def __init__(self, master, on_shared_cache_changed=None, on_notification=None):
+    def __init__(self, master, on_shared_cache_changed=None, on_notification=None, on_notifications=None):
         super().__init__(master)
         self._on_shared_cache_changed = on_shared_cache_changed
         self._on_notification = on_notification
+        self._on_notifications = on_notifications
         self._base_df = pd.DataFrame()
         self.prezzi_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
@@ -38,10 +59,12 @@ class PrezziTab(ttk.Frame):
         self._render_after_id = None
         self._render_generation = 0
         self._loaded_source_path = ""
+        self._loaded_file_name = ""
         self._sort_column = ""
         self._sort_reverse = False
         self._articolo_var = tk.StringVar()
         self._codice_var = tk.StringVar()
+        self._category_var = tk.StringVar()
         self._anomalies_window = None
 
         self._configure_styles()
@@ -83,8 +106,11 @@ class PrezziTab(ttk.Frame):
         ttk.Entry(row_search, textvariable=self._articolo_var, width=20).pack(side="left", padx=(4, 16))
         ttk.Label(row_search, text="Codice:").pack(side="left")
         ttk.Entry(row_search, textvariable=self._codice_var, width=14).pack(side="left", padx=(4, 16))
+        ttk.Label(row_search, text="Category:").pack(side="left")
+        ttk.Entry(row_search, textvariable=self._category_var, width=18).pack(side="left", padx=(4, 16))
         self._articolo_var.trace_add("write", lambda *_: self._on_search_changed())
         self._codice_var.trace_add("write", lambda *_: self._on_search_changed())
+        self._category_var.trace_add("write", lambda *_: self._on_search_changed())
 
         ttk.Button(row_search, text="Clear", command=self._clear_filters).pack(side="left", padx=4)
 
@@ -151,6 +177,13 @@ class PrezziTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 errors = [f"An error occurred while reading the file: {exc}"]
                 df = None
+            issues = []
+            validation_error = None
+            if df is not None:
+                try:
+                    issues = logic.validate_price_data(df)
+                except Exception as exc:  # noqa: BLE001
+                    validation_error = exc
 
             def apply_result():
                 self._uploading = False
@@ -162,15 +195,26 @@ class PrezziTab(ttk.Frame):
                     else:
                         logger.warning("Prezzi: could not restore cached file: %s", "; ".join(errors))
                     return
+                # Articoli may be uploaded after Listini; enrich again here
+                # so the Category column and category rules are immediately
+                # refreshed without requiring a second Listini upload.
                 self._base_df = df
                 # Public, unfiltered-by-search accessor for other tabs
                 # (Ordine Elvy's Livello/Prezzo lookup) -- self.summary_df
                 # changes with the search boxes, this doesn't.
-                self.prezzi_df = df
+                self.prezzi_df = self._base_df
                 self._loaded_source_path = normalized_path
-                self.status_var.set(f"{Path(path).name} — {len(df)} price rows")
-                if self._on_notification:
-                    for issue in logic.validate_price_data(df):
+                self._loaded_file_name = Path(path).name
+                self._update_status(len(self._base_df))
+                if validation_error is not None:
+                    logger.warning("Prezzi: price validation failed: %s", validation_error)
+                if self._on_notifications:
+                    self._on_notifications([
+                        {**issue, "page": "Prezzi"}
+                        for issue in issues
+                    ])
+                elif self._on_notification:
+                    for issue in issues:
                         self._on_notification(issue["key"], issue["title"], issue["message"], "Prezzi", issue["severity"])
                 if save_cache:
                     save_prezzi_cache(path)
@@ -197,6 +241,7 @@ class PrezziTab(ttk.Frame):
     def _clear_filters(self) -> None:
         self._articolo_var.set("")
         self._codice_var.set("")
+        self._category_var.set("")
         self._sort_column = ""
         self._sort_reverse = False
         self._apply_search_and_sort()
@@ -206,6 +251,7 @@ class PrezziTab(ttk.Frame):
         df = self._base_df
         if df.empty:
             self.summary_df = pd.DataFrame(columns=COLUMNS)
+            self._update_status(0)
             self._render()
             return
 
@@ -214,14 +260,23 @@ class PrezziTab(ttk.Frame):
             df = df[df["CLARTICOLO"].str.lower().str.contains(articolo_q, regex=False)]
         codice_q = self._codice_var.get().strip().lower()
         if codice_q:
-            df = df[df["CLCOLORE"].str.lower().str.contains(codice_q, regex=False)]
+            df = _filter_color_code(df, codice_q)
+        category_q = self._category_var.get().strip().lower()
+        if category_q:
+            df = df[df["CATEGORY"].str.lower().str.contains(category_q, regex=False)]
 
         if self._sort_column:
             ascending = not self._sort_reverse
             df = df.sort_values(self._sort_column, ascending=ascending, kind="mergesort")
 
         self.summary_df = df.reset_index(drop=True)
+        self._update_status(len(df))
         self._render()
+
+    def _update_status(self, matched_rows: int) -> None:
+        visible_rows = min(matched_rows, MAX_RENDER_ROWS)
+        suffix = f" — showing {visible_rows:,} of {matched_rows:,}" if visible_rows < matched_rows else f" — {matched_rows:,} price rows"
+        self.status_var.set(f"{self._loaded_file_name}{suffix}")
 
     def _sort_by(self, column: str) -> None:
         if self._sort_column == column:
@@ -243,7 +298,7 @@ class PrezziTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         if self.summary_df.empty:
             return
-        rows = list(self.summary_df[COLUMNS].itertuples(index=False, name=None))
+        rows = list(self.summary_df[COLUMNS].head(MAX_RENDER_ROWS).itertuples(index=False, name=None))
 
         def insert_chunk(start=0):
             if generation != self._render_generation:
@@ -251,10 +306,13 @@ class PrezziTab(ttk.Frame):
             end = min(start + 150, len(rows))
             for idx in range(start, end):
                 row = rows[idx]
-                livello = "" if pd.isna(row[4]) else f"{row[4]:g}"
-                prezzo = "" if pd.isna(row[5]) else f"{row[5]:.2f}"
+                # COLUMNS = Articolo, Descrizione, Codice, Colore,
+                # Category, Livello, Prezzo.  Category is text and must
+                # never be formatted with the numeric :g formatter.
+                livello = "" if pd.isna(row[5]) else f"{float(row[5]):g}"
+                prezzo = "" if pd.isna(row[6]) else f"{float(row[6]):.2f}"
                 self.tree.insert("", "end", values=(
-                    row[0], row[1], row[2], row[3], livello, prezzo,
+                    row[0], row[1], row[2], row[3], row[4], livello, prezzo,
                 ), tags=("evenrow" if idx % 2 == 0 else "oddrow",))
             if end < len(rows):
                 self._render_after_id = self.after(1, insert_chunk, end)
@@ -323,14 +381,12 @@ class PrezziTab(ttk.Frame):
             cell.alignment = center
             cell.border = border
 
-        for _, r in export_df.iterrows():
-            livello = None if pd.isna(r["LIVELLOLPZ"]) else r["LIVELLOLPZ"]
-            prezzo = None if pd.isna(r["PREZZOLPZ"]) else r["PREZZOLPZ"]
-            ws.append([r["CLARTICOLO"], r["DESCRIZARTICOLOLI"], r["CLCOLORE"], r["CLDESCR"], livello, prezzo])
-            for cell in ws[ws.max_row]:
-                cell.font = Font(name="Arial")
-                cell.alignment = center
-                cell.border = border
+        for row in export_df.itertuples(index=False, name=None):
+            values = list(row)
+            for index in (5, 6):
+                if pd.isna(values[index]):
+                    values[index] = None
+            ws.append(values)
 
         last_row = ws.max_row
         last_col_letter = get_column_letter(len(COLUMNS))
@@ -338,7 +394,7 @@ class PrezziTab(ttk.Frame):
             ws.auto_filter.ref = f"A1:{last_col_letter}{last_row}"
         ws.freeze_panes = "A2"
         widths = {"CLARTICOLO": 16, "DESCRIZARTICOLOLI": 24, "CLCOLORE": 14,
-                  "CLDESCR": 20, "LIVELLOLPZ": 12, "PREZZOLPZ": 12}
+                  "CLDESCR": 20, "CATEGORY": 20, "LIVELLOLPZ": 12, "PREZZOLPZ": 12}
         for i, c in enumerate(COLUMNS, start=1):
             ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 16)
 
@@ -348,9 +404,7 @@ class PrezziTab(ttk.Frame):
     # Price-change anomalies
     # ------------------------------------------------------------------
     def _open_price_anomalies(self) -> None:
-        """Flag Articolo+Colore pairs whose price jumped/dropped by 10%+
-        between two dated Listini entries -- catches pricing mistakes and
-        genuine repricings alike, sorted by the biggest change first."""
+        """Calculate the report off the Tk thread, then render it."""
         if self._base_df is None or self._base_df.empty:
             messagebox.showinfo("Price Changes", "Upload the Listini file first.", parent=self)
             return
@@ -361,10 +415,40 @@ class PrezziTab(ttk.Frame):
                     self._anomalies_window.focus_force()
                     return
             except tk.TclError:
+                self._anomalies_window = None
+        snapshot = self._base_df.copy(deep=True)
+        self._btn_price_changes.config(state="disabled", text="Calculating…")
+
+        def worker():
+            try:
+                result = logic.detect_price_anomalies(snapshot, min_pct_change=10.0)
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                result, error = pd.DataFrame(), exc
+
+            def finish():
+                self._btn_price_changes.config(state="normal", text="⚠ Price Changes")
+                if error is not None:
+                    messagebox.showerror("Price Changes", str(error), parent=self)
+                    return
+                self._show_price_anomalies(result)
+            self.after(0, finish)
+
+        threading.Thread(target=worker, name="prezzi-price-changes", daemon=True).start()
+
+    def _show_price_anomalies(self, anomalies: pd.DataFrame) -> None:
+        """Flag Articolo+Colore pairs whose price jumped/dropped by 10%+
+        between two dated Listini entries -- catches pricing mistakes and
+        genuine repricings alike, sorted by the biggest change first."""
+        if self._anomalies_window is not None:
+            try:
+                if self._anomalies_window.winfo_exists():
+                    self._anomalies_window.lift()
+                    self._anomalies_window.focus_force()
+                    return
+            except tk.TclError:
                 pass
             self._anomalies_window = None
-
-        anomalies = logic.detect_price_anomalies(self._base_df, min_pct_change=10.0)
 
         window = tk.Toplevel(self)
         keep_window_on_top(window)
@@ -379,14 +463,14 @@ class PrezziTab(ttk.Frame):
 
         frame = ttk.Frame(window)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        columns = ("CLARTICOLO", "CLCOLORE", "CLDESCR", "old_price", "new_price", "pct_change", "changed_on")
+        columns = ("CLARTICOLO", "CLCOLORE", "CLDESCR", "CATEGORY", "old_price", "new_price", "pct_change", "changed_on", "issue")
         labels = {
             "CLARTICOLO": "Articolo", "CLCOLORE": "Colore", "CLDESCR": "Descr. Colore",
-            "old_price": "Old Price", "new_price": "New Price", "pct_change": "Change %",
-            "changed_on": "Changed On",
+            "CATEGORY": "Category", "old_price": "Old Price", "new_price": "New Price", "pct_change": "Change %",
+            "changed_on": "Changed On", "issue": "Issue",
         }
         tree = ttk.Treeview(frame, columns=columns, show="headings")
-        widths = [110, 90, 150, 90, 90, 90, 100]
+        widths = [110, 90, 150, 130, 90, 90, 90, 100, 240]
         for column, width in zip(columns, widths):
             tree.heading(column, text=labels[column])
             tree.column(column, width=width, anchor="center")
@@ -403,11 +487,15 @@ class PrezziTab(ttk.Frame):
             ttk.Label(frame, text="No price changes of 10% or more found.").grid(row=0, column=0)
         else:
             for _, row in anomalies.iterrows():
-                tag = "up" if row["pct_change"] > 0 else "down"
+                try:
+                    tag = "up" if float(row["pct_change"]) > 0 else "down"
+                except (TypeError, ValueError):
+                    tag = "up"
                 tree.insert("", "end", values=(
-                    row["CLARTICOLO"], row["CLCOLORE"], row["CLDESCR"],
-                    f"{row['old_price']:.2f}", f"{row['new_price']:.2f}",
-                    f"{row['pct_change']:+.1f}%", row["changed_on"],
+                    row["CLARTICOLO"], row["CLCOLORE"], row["CLDESCR"], row.get("CATEGORY", ""),
+                    f"{float(row['old_price']):.2f}" if str(row["old_price"]) else "",
+                    f"{float(row['new_price']):.2f}" if str(row["new_price"]) else "",
+                    f"{float(row['pct_change']):+.1f}%" if str(row["pct_change"]) else "", row["changed_on"], row.get("issue", ""),
                 ), tags=(tag,))
 
         def export_anomalies():
@@ -420,12 +508,27 @@ class PrezziTab(ttk.Frame):
             )
             if not path:
                 return
-            try:
-                anomalies.rename(columns=labels).to_excel(path, index=False, sheet_name="Price Changes")
-                messagebox.showinfo("Price Changes", f"Export completed:\n{path}", parent=window)
-            except Exception as exc:  # noqa: BLE001
-                messagebox.showerror("Price Changes", str(exc), parent=window)
+            export_df = anomalies.rename(columns=labels).copy()
+            export_button.config(state="disabled", text="Exporting…")
+
+            def worker():
+                try:
+                    export_df.to_excel(path, index=False, sheet_name="Price Changes")
+                    error = None
+                except Exception as exc:  # noqa: BLE001
+                    error = exc
+
+                def finish():
+                    export_button.config(state="normal", text="📤 Export to Excel")
+                    if error is not None:
+                        messagebox.showerror("Price Changes", str(error), parent=window)
+                    else:
+                        messagebox.showinfo("Price Changes", f"Export completed:\n{path}", parent=window)
+                window.after(0, finish)
+
+            threading.Thread(target=worker, name="prezzi-price-changes-export", daemon=True).start()
 
         buttons = ttk.Frame(window)
         buttons.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(buttons, text="📤 Export to Excel", command=export_anomalies).pack(side="right", padx=3)
+        export_button = ttk.Button(buttons, text="📤 Export to Excel", command=export_anomalies)
+        export_button.pack(side="right", padx=3)

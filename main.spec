@@ -29,6 +29,7 @@ for _pkg in ("pypdfium2", "pypdfium2_raw", "pandas", "numpy"):
 # Explorer, not the running window.
 datas += [('icon.ico', '.')]
 datas += [('version.txt', '.')]
+datas += [('data/prezzi_category_map.json', 'data')]
 
 a = Analysis(
     ['main.py'],

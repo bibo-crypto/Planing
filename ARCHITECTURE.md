@@ -80,6 +80,17 @@ source-path caches, the Situazione upload log, and the new local JSON stores
 remain in place. A future database phase can add migrations, permissions,
 history, and shared records after the operating rules and backup strategy are
 approved.
+## Local SQLite persistence
+
+A central business database is still outside this phase. The existing local
+SQLite files retain operational records and derived snapshots; the shared
+`planning_orders.sqlite3` also stores a fingerprinted cache of normalized
+Listini rows so unchanged Excel files do not need to be reparsed on each
+launch. Cache entries are invalidated when the Listini source file changes.
+Listini Category values come from the bundled `data/prezzi_category_map.json`
+reference, with unknown articles inferred only from same-customer rows that
+match color, level, and price. Source-path settings remain in their existing
+JSON files.
 
 Packaging/build tooling stays at the repo root since it isn't application
 code: `main.spec`, `build.bat`, `installer.iss`, `requirements.txt`,
