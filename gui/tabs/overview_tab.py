@@ -15,6 +15,8 @@ in memory — nothing new to upload. Current sources:
   • Magazino Filato (magazino_tab.magazino_summary) — columns articolo,
     partita, mag_rocche, mag_peso. articolo prefix identifies the client
     family (G130 = Elvy, G170 = Kamal) since Magazino has no Cliente column.
+  • Prezzi (prezzi_tab._validation_issues) — Listini validation notices,
+    shown separately from price anomalies calculated from Situazione Generale.
 
 There's no historical/time-series table in situazione_db.py (partita_state
 only tracks current state, not day-by-day snapshots), so the charts here
@@ -49,6 +51,23 @@ from utility.utils import load_settings, parse_number
 from utility import notifications
 import calculate.situazione as business_logic
 
+
+def _focus_entry_when_ready(window: tk.Toplevel, entry: ttk.Entry) -> None:
+    """Raise a popup and force keyboard focus into its search field."""
+    def focus_entry() -> None:
+        try:
+            if window.winfo_exists() and entry.winfo_exists() and entry.winfo_ismapped():
+                window.deiconify()
+                window.lift()
+                window.focus_force()
+                entry.focus_force()
+                entry.icursor(tk.END)
+        except tk.TclError:
+            pass
+
+    window.after_idle(focus_entry)
+
+
 ARTICOLO_CLIENT_LABELS = {"G130": "Elvy", "G170": "Kamal"}
 READY_MARK = "pronto da spedire"
 SHORTAGE_MARK = "PG-X"
@@ -60,6 +79,7 @@ HEADERS_IT = {
     "riga": "Riga", "data": "Data", "consegna": "Consegna",
     "delivery_date": "Delivery Date",
     "partita": "Partita", "rocche": "Rocche", "mc": "M/C",
+    "partita_colore": "Partita Colore",
     "comment": "Commento", "raw_yarn_match": "Filato Disponibile",
     "cq": "C.Q", "tinto": "Tinto", "bagno": "Bagno",
     "old_comment": "Vecchio commento", "new_comment": "Nuovo commento",
@@ -69,7 +89,13 @@ HEADERS_IT = {
     "days_to_delivery": "Giorni alla consegna",
     "ritardo_consegna": "Ritardo (gg)",
     "prezzo": "Prezzo Ord.", "prezzo_lisini": "Prezzo Listini", "issue": "Problema",
+    "title": "Titolo", "message": "Descrizione", "severity": "Gravità",
 }
+def _price_color_anomalies(situazione_df: pd.DataFrame) -> pd.DataFrame:
+    """Return price anomalies sourced from Situazione Generale."""
+    return pd.DataFrame(business_logic.find_price_anomalies(situazione_df))
+
+
 CHECK_COLUMNS = [
     "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
     "data", "consegna", "partita", "rocche", "mc", "comment", "raw_yarn_match",
@@ -526,12 +552,14 @@ class OverviewTab(ttk.Frame):
     def _current_data_signature(self):
         """Return cheap revision counters maintained by the source tabs."""
         prezzi_df = getattr(self.prezzi_tab, "_base_df", None)
+        prezzi_issues = getattr(self.prezzi_tab, "_validation_issues", ())
         return (
             getattr(self.situazione_tab, "_data_revision", 0),
             getattr(self.situazione_tab, "_copertura_revision", 0),
             getattr(self.magazino_tab, "_data_revision", 0),
             getattr(self.prezzi_tab, "_loaded_source_path", ""),
             len(prezzi_df) if isinstance(prezzi_df, pd.DataFrame) else 0,
+            tuple((issue.get("key"), issue.get("message")) for issue in prezzi_issues),
             len(notifications.list_open()),
         )
 
@@ -789,35 +817,19 @@ class OverviewTab(ttk.Frame):
         self._add_card(7, f"📅 Elvy: entro {DELIVERY_ALERT_DAYS} giorni", f"{elvy_due_colors:,}", alert=elvy_due_colors > 0,
                         on_click=lambda: self._open_data_ticket(f"Elvy: consegna entro {DELIVERY_ALERT_DAYS} giorni", elvy_due_df, elvy_cols, "elvy_entro_giorni.xlsx"))
 
-        price_anomalies = business_logic.find_price_anomalies(df)
         price_change_df = self._price_change_df()
-        category_conflicts = (
-            price_change_df[price_change_df["issue"].eq("Category price/level conflict")]
-            if "issue" in price_change_df.columns
-            else pd.DataFrame()
-        )
-        for _, conflict in category_conflicts.iterrows():
-            price_anomalies.append({
-                "cliente": "Prezzi Category",
-                "articolo": conflict["CLARTICOLO"],
-                "codice": conflict["CLCOLORE"],
-                "colore": conflict["CLDESCR"],
-                "prezzo": conflict["new_price"],
-                "prezzo_lisini": conflict["old_price"],
-                "category": conflict["CATEGORY"],
-                "issue": conflict["issue"],
-            })
+        price_anomalies_df = _price_color_anomalies(df)
         price_problem_colors = len({
             str(item.get("colore", "")).strip()
-            for item in price_anomalies
+            for item in price_anomalies_df.to_dict("records")
             if str(item.get("colore", "")).strip()
         })
-        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "category", "prezzo", "prezzo_lisini", "ordine", "riga", "bagno", "mc", "issue"]
+        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "partita_colore", "prezzo", "prezzo_lisini", "ordine", "riga", "bagno", "mc", "issue"]
         self._add_card(
             8, "💲 Errori Prezzo — colori", str(price_problem_colors),
             alert=price_problem_colors > 0,
             on_click=lambda: self._open_data_ticket(
-                "Errori Prezzo (Prezzo mancante o sospetto)", pd.DataFrame(price_anomalies),
+                "Errori Prezzo (Situazione Generale)", price_anomalies_df,
                 price_anomalies_cols, "errori_prezzo.xlsx",
             ),
         )
@@ -865,8 +877,9 @@ class OverviewTab(ttk.Frame):
             frame.columnconfigure(index, weight=1, minsize=106)
             click = lambda _event, selected_machine=machine: self._open_machine_schedule(selected_machine, schedule)
             card.bind("<Button-1>", click)
-            tk.Label(card, text=f"M{machine}", bg=card["bg"], fg="#991b1b" if empty else "#16324f",
-                     font=("Segoe UI", 10, "bold"), anchor="center").pack(fill="x")
+            tk.Label(card, text=business_logic.machine_label(machine),
+                     bg=card["bg"], fg="#991b1b" if empty else "#16324f",
+                     font=("Segoe UI", 9, "bold"), anchor="center").pack(fill="x")
             for child in card.winfo_children():
                 child.bind("<Button-1>", click)
             tk.Label(card, text=f"{count} colori", bg=card["bg"], fg="#991b1b" if empty else "#344054",
@@ -881,12 +894,13 @@ class OverviewTab(ttk.Frame):
     def _open_machine_schedule(self, machine: int, schedule: pd.DataFrame) -> None:
         """Show the Copertura-ordered dyeing sequence for one machine."""
         window = tk.Toplevel(self)
-        window.title(f"Copertura macchine — M{machine}")
+        machine_name = business_logic.machine_label(machine)
+        window.title(f"Copertura macchine — {machine_name}")
         window.geometry("1180x620")
         window.minsize(850, 420)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
-        ttk.Label(window, text=f"Dyeing schedule for Machine {machine} — 2 colors/day; Friday off", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        ttk.Label(window, text=f"Dyeing schedule for {machine_name} — 2 colors/day; Friday off", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)
         toolbar = ttk.Frame(window)
         toolbar.grid(row=0, column=0, sticky="e", padx=10, pady=8)
         search = tk.StringVar()
@@ -895,9 +909,10 @@ class OverviewTab(ttk.Frame):
         entry.pack(side="left", padx=5)
         ttk.Button(toolbar, text="Clear", command=lambda: search.set("")).pack(side="left", padx=(5, 0))
         # Same field order as Situazione Generale's own COLUMN_SPEC.
-        columns = ["cliente", "articolo", "titolo", "colore", "ordine", "riga",
+        columns = ["cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
                    "partita", "rocche", "machine", "dye_date", "bagno"]
         labels = {"dye_date": "Data tintura", "machine": "M/C", "bagno": "Bagno", "colore": "Colore",
+                   "codice": "Codice",
                    "titolo": "Titolo", "articolo": "Articolo", "partita": "Partita", "rocche": "Rocche",
                    "cliente": "Cliente", "ordine": "Ordine", "riga": "Riga"}
         tree = ttk.Treeview(window, columns=columns, show="headings")
@@ -924,6 +939,8 @@ class OverviewTab(ttk.Frame):
         # order can never drift out of sync with the row values again --
         # that mismatch was exactly what swapped M/C and Data tintura before.
         machine_df = schedule[schedule["machine"] == machine][columns].copy() if not schedule.empty else schedule.reindex(columns=columns)
+        if not machine_df.empty:
+            machine_df["machine"] = machine_name
 
         def render(*_args):
             tree.delete(*tree.get_children())
@@ -944,6 +961,7 @@ class OverviewTab(ttk.Frame):
             ),
         ).pack(side="left")
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        _focus_entry_when_ready(window, entry)
 
     def _price_change_df(self) -> pd.DataFrame:
         """Listini price transitions over the alert threshold (see detect_price_anomalies)."""
@@ -999,7 +1017,8 @@ class OverviewTab(ttk.Frame):
         toolbar.grid(row=0, column=0, sticky="e", padx=10, pady=8)
         search = tk.StringVar()
         ttk.Label(toolbar, text="Search:").pack(side="left")
-        ttk.Entry(toolbar, textvariable=search, width=28).pack(side="left", padx=5)
+        search_entry = ttk.Entry(toolbar, textvariable=search, width=28)
+        search_entry.pack(side="left", padx=5)
         ttk.Button(toolbar, text="Clear", command=lambda: search.set("")).pack(side="left", padx=(5, 0))
 
         display_df = _format_display_dates(df, ["data", "consegna", "delivery_date", "tinto", "data_qualita", "data_uscita"])
@@ -1018,7 +1037,7 @@ class OverviewTab(ttk.Frame):
 
         for col in available_cols:
             tree.heading(col, text=HEADERS_IT.get(col, col.capitalize()), command=lambda c=col: sort_col(c))
-            tree.column(col, width=115 if col not in {"titolo", "colore", "comment", "new_comment", "raw_yarn_match", "issue"} else 170, anchor="center")
+            tree.column(col, width=115 if col not in {"titolo", "colore", "comment", "message", "new_comment", "raw_yarn_match", "issue"} else 170, anchor="center")
         tree.grid(row=1, column=0, sticky="nsew", padx=10)
         scroll = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
         scroll.grid(row=1, column=1, sticky="ns")
@@ -1044,3 +1063,4 @@ class OverviewTab(ttk.Frame):
             ),
         ).pack(side="left")
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        _focus_entry_when_ready(window, search_entry)

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Iterable
 
 from utility.utils import APP_DATA_DIR

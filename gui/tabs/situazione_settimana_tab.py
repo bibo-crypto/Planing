@@ -18,6 +18,7 @@ from calculate import situazione_settimana as logic
 from gui.tabs.situazione_tab import SourceRow
 from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
 from parsers.prod_lookup import load_prod_cache, save_prod_cache
+from utility.excel_io import safe_save_workbook
 from utility.path_manager import source_path, save_source
 from utility.utils import logger
 

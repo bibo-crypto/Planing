@@ -23,7 +23,12 @@ from exporters.excel_exporter import (
     write_header,
 )
 from parsers.kamal_parser import KamalOrderRow
-from pipelines.ordine_kamal import assign_ordine_kamal_machines, build_ordine_kamal_rows, match_by_lotto
+from pipelines.ordine_kamal import (
+    OrdineKamalRow,
+    assign_ordine_kamal_machines,
+    build_ordine_kamal_rows,
+    match_by_lotto,
+)
 from pipelines.ordini_elvy import RawYarnMatch, match_raw_yarn
 from utility.utils import logger
 

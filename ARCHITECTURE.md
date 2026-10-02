@@ -12,8 +12,11 @@ main.py                 entry point
 
 gui/                     Tkinter UI: windows, tabs, widgets
   gui.py                 main window, notebook, cross-tab wiring
+  workflows/             Purchase Orders, Bolla, and Elvy Invoice workflows
   modern_widgets.py       shared custom widgets (RoundedButton, ...)
-  tabs/                   one file per notebook tab
+  tabs/                   one file per notebook tab, plus focused mixins for
+                          shared-order dialogs/actions and Situazione sources/
+                          refresh workflows
 
 calculate/               pure business logic, no Tkinter
   situazione.py           Copertura / machine-queue / compute_situation

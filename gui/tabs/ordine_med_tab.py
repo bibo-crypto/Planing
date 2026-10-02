@@ -5,7 +5,6 @@ ordine_med.py for the full reverse-engineering notes.
 """
 
 from __future__ import annotations
-from utility.excel_io import safe_save_workbook
 
 import threading
 from pathlib import Path
@@ -159,6 +158,8 @@ class OrdineMedTab(ttk.Frame):
         self.densita_path = Path(path)
         self._lbl_densita.config(text=str(self.densita_path), foreground="black")
         save_densita_cache(path)
+        if self._on_shared_cache_changed:
+            self._on_shared_cache_changed()
 
     def _restore_saved_paths(self):
         output_str = self._prefs.get("ordine_med_output_dir") or self._prefs.get("ordine_med_output_path")

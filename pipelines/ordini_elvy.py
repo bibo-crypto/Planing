@@ -31,11 +31,15 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from calculate.abbina_calculator import MACHINE_CODES
 from parsers.pdf_parser import OrderRow
 from utility.master_data import finished_articolo_for, raw_articolo_for
 from utility.utils import clean_text
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 CLIENTE_CODE = 3009
 LAVORANTE_CODE = 900901
@@ -392,7 +396,7 @@ class RawYarnMatch:
 
 def match_raw_yarn(
     ordini_rows: list["OrdiniElvyRow"],
-    magazino_summary: "pd.DataFrame",
+    magazino_summary: pd.DataFrame,
     codes_map: dict | None = None,
     quantity_attr: str = "quantity_cones",
 ) -> list[RawYarnMatch]:

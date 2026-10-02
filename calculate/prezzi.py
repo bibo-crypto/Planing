@@ -446,6 +446,21 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
     if df is None or df.empty:
         return [{"key": "prezzi-empty", "title": "Prezzi file is empty", "message": "The active Listini file contains no usable color prices.", "severity": "high"}]
     issues = []
+
+    def _color_fields(value) -> dict[str, str]:
+        codice = _format_codice(value)
+        descriptions = []
+        if "CLDESCR" in df.columns:
+            color_codes = df["CLCOLORE"].map(_format_codice)
+            descriptions = (
+                df.loc[color_codes.eq(codice), "CLDESCR"]
+                .map(clean_text)
+                .loc[lambda values: values.ne("")]
+                .drop_duplicates()
+                .tolist()
+            )
+        return {"codice": codice, "colore": "; ".join(descriptions)}
+
     numeric_price = pd.to_numeric(df["PREZZOLPZ"], errors="coerce")
     invalid_price = numeric_price.notna() & (numeric_price > 0) & (numeric_price <= 0.01)
     if invalid_price.any():
@@ -458,9 +473,9 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
     conflicts = counts[(counts["price_count"] > 1) | (counts["level_count"] > 1)]
     for (articolo, colore), row in conflicts.iterrows():
         if row["price_count"] > 1:
-            issues.append({"key": f"prezzi-conflict-price:{articolo}:{colore}", "title": "Conflicting color prices", "message": f"Articolo {articolo}, colore {colore} has {int(row['price_count'])} different prices.", "severity": "high"})
+            issues.append({"key": f"prezzi-conflict-price:{articolo}:{colore}", "title": "Conflicting color prices", "message": f"Articolo {articolo}, colore {colore} has {int(row['price_count'])} different prices.", "severity": "high", **_color_fields(colore)})
         if row["level_count"] > 1:
-            issues.append({"key": f"prezzi-conflict-level:{articolo}:{colore}", "title": "Conflicting color levels", "message": f"Articolo {articolo}, colore {colore} has {int(row['level_count'])} different LVL values.", "severity": "medium"})
+            issues.append({"key": f"prezzi-conflict-level:{articolo}:{colore}", "title": "Conflicting color levels", "message": f"Articolo {articolo}, colore {colore} has {int(row['level_count'])} different LVL values.", "severity": "medium", **_color_fields(colore)})
     if "CATEGORY" in df.columns:
         categorized = df.copy()
         categorized["CATEGORY"] = categorized["CATEGORY"].fillna("").astype(str).str.strip()
@@ -496,6 +511,7 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
                     f"Most frequent: {float(common_price):.2f}{level_text}."
                 ),
                 "severity": "medium",
+                **_color_fields(color),
             })
         article_customer = _category_customer_map(_load_reference_category_map())
         customer_categories = set(article_customer.values())
@@ -528,6 +544,7 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
                     f"{clean_text(article).upper()[:4]} belongs to {expected}."
                 ),
                 "severity": "high",
+                **_color_fields(color),
             })
     if "_CATEGORY_REVIEW" in df.columns and "CLARTICOLO" in df.columns:
         review_articles = (

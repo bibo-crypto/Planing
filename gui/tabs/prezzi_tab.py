@@ -52,6 +52,7 @@ class PrezziTab(ttk.Frame):
         self._on_notification = on_notification
         self._on_notifications = on_notifications
         self._base_df = pd.DataFrame()
+        self._validation_issues: list[dict[str, str]] = []
         self.prezzi_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
         self._uploading = False
@@ -199,6 +200,7 @@ class PrezziTab(ttk.Frame):
                 # so the Category column and category rules are immediately
                 # refreshed without requiring a second Listini upload.
                 self._base_df = df
+                self._validation_issues = list(issues)
                 # Public, unfiltered-by-search accessor for other tabs
                 # (Ordine Elvy's Livello/Prezzo lookup) -- self.summary_df
                 # changes with the search boxes, this doesn't.

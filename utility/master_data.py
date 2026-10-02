@@ -13,6 +13,7 @@ PATH = APP_DATA_DIR / "settings" / "master_data.json"
 DEFAULTS = {
     "customers": [],
     "machines": [
+        {"code": "3300", "number": "4", "rocche": "672"},
         {"code": "3301", "number": "11", "rocche": "6"},
         {"code": "3310", "number": "12", "rocche": "24"},
         {"code": "3306", "number": "9", "rocche": "32"},

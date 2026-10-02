@@ -7,10 +7,7 @@ validated separately, and per-Partita Old/New Comment history is kept in
 a local SQLite database (see situazione_db.py) instead of copy-pasted
 sheets.
 """
-import os
-import threading
 import tkinter as tk
-from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
 from datetime import datetime
@@ -23,12 +20,10 @@ import calculate.situazione as business_logic
 import calculate.reports as reports
 from calculate.abbina_suggestions import build_suggestions
 from gui.tabs.yarn_shortage_tab import YarnShortageTab
-from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
-from parsers.prod_lookup import load_prod_cache, save_prod_cache
 from utility.utils import keep_window_on_top, logger
-from utility.densita_cache import load_densita_cache
-from utility.path_manager import save_source, source_path
-from utility import notifications
+from utility.excel_io import safe_save_workbook
+from .situazione_sources import SOURCE_BUTTON_NAMES, SOURCE_ORDER, SituationSourcesMixin
+from .situazione_refresh import SituationRefreshMixin
 
 STATUS_COLORS = {
     "Filato": "#e0e0e0",
@@ -47,19 +42,6 @@ def color_for_status(status):
         return "#d9c6f0"
     return STATUS_COLORS.get(status, "#ffffff")
 
-
-SOURCE_ORDER = ["copertura", "data_prod", "dfm", "wincoint", "uscita", "qualita"]
-
-SOURCE_BUTTON_NAMES = {
-    "copertura": "Copertura",
-    "data_prod": "Produzione",
-    "dfm": "DFM",
-    "wincoint": "Wincoint",
-    "uscita": "Uscita",
-    "qualita": "Qualita",
-    "codes": "Articoli",
-    "listini": "Listini",
-}
 
 # (internal_key, header shown in the app / exported file, cell type)
 # Order and headers match the real "New Situazione" sheet exactly.
@@ -139,7 +121,7 @@ class SourceRow(ttk.Frame):
         self.status_var.set(message)
 
 
-class SituazioneTab(ttk.Frame):
+class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
     """Embeddable 'Situazione' tab — hosted inside gui.py's main Notebook."""
 
     def __init__(self, master, on_shared_cache_changed: Callable[[], None] | None = None, on_notification=None):
@@ -393,13 +375,17 @@ class SituazioneTab(ttk.Frame):
             if selected_kind == "Tutti" or selected_value == "Tutti":
                 return merged
             if selected_kind == "Macchina":
-                return merged.loc[merged["machine_number"].astype(str).eq(selected_value)]
+                selected_machine = business_logic.machine_number_from_label(selected_value)
+                return merged.loc[merged["machine_number"].eq(selected_machine)]
             return merged.loc[merged["cliente"].astype(str).eq(selected_value)]
 
         def refresh_filter_values(*_args):
             selected_kind = filter_kind.get()
             if selected_kind == "Macchina":
-                values = ["Tutti"] + [str(n) for n in sorted(merged["machine_number"].dropna().unique())]
+                values = ["Tutti"] + [
+                    business_logic.machine_label(int(number))
+                    for number in sorted(merged["machine_number"].dropna().unique())
+                ]
             elif selected_kind == "Cliente":
                 values = ["Tutti"] + sorted(merged["cliente"].dropna().astype(str).unique())
             else:
@@ -414,17 +400,19 @@ class SituazioneTab(ttk.Frame):
             tree.delete(*tree.get_children())
             machines = range(3, 13)
             if filter_kind.get() == "Macchina" and filter_value.get() != "Tutti":
-                machines = [int(filter_value.get())]
+                selected_machine = business_logic.machine_number_from_label(filter_value.get())
+                machines = [selected_machine] if selected_machine is not None else []
             for machine in machines:
                 rows = summary[summary["machine_number"] == machine]
                 total = int(rows["total_colors"].sum()) if not rows.empty else 0
                 until = coverage_until(total)
+                machine_label = business_logic.machine_label(machine)
                 if rows.empty:
-                    tree.insert("", "end", values=(machine, "-", 0, 0, 0, "-"))
+                    tree.insert("", "end", values=(machine_label, "-", 0, 0, 0, "-"))
                 else:
                     for _, row in rows.sort_values("cliente").iterrows():
-                        tree.insert("", "end", values=(machine, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]))
-                    tree.insert("", "end", values=(machine, "TOTALE", total, int(rows["pgx"].sum()), total - int(rows["pgx"].sum()), until), tags=("total",))
+                        tree.insert("", "end", values=(machine_label, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]))
+                    tree.insert("", "end", values=(machine_label, "TOTALE", total, int(rows["pgx"].sum()), total - int(rows["pgx"].sum()), until), tags=("total",))
             status.config(text=f"{len(view):,} colori")
 
         def export_summary():
@@ -436,17 +424,19 @@ class SituazioneTab(ttk.Frame):
             rows = []
             machines = range(3, 13)
             if filter_kind.get() == "Macchina" and filter_value.get() != "Tutti":
-                machines = [int(filter_value.get())]
+                selected_machine = business_logic.machine_number_from_label(filter_value.get())
+                machines = [selected_machine] if selected_machine is not None else []
             for machine in machines:
                 part = summary[summary["machine_number"] == machine]
                 total = int(part["total_colors"].sum()) if not part.empty else 0
+                machine_label = business_logic.machine_label(machine)
                 if part.empty:
-                        rows.append([machine, "-", 0, 0, 0, "-"])
+                        rows.append([machine_label, "-", 0, 0, 0, "-"])
                 else:
                     for _, row in part.sort_values("cliente").iterrows():
-                        rows.append([machine, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]])
+                        rows.append([machine_label, row["cliente"], int(row["total_colors"]), int(row["pgx"]), int(row["available"]), row["covered_until"]])
                     pgx_total = int(part["pgx"].sum())
-                    rows.append([machine, "TOTALE", total, pgx_total, total - pgx_total, coverage_until(total)])
+                    rows.append([machine_label, "TOTALE", total, pgx_total, total - pgx_total, coverage_until(total)])
             try:
                 pd.DataFrame(rows, columns=[labels[c] for c in columns]).to_excel(path, index=False, sheet_name="Copertura")
                 messagebox.showinfo("Copertura", f"Export completato:\n{path}", parent=window)
@@ -601,881 +591,33 @@ class SituazioneTab(ttk.Frame):
             self.tree.column(col, width=width, minwidth=min(width, 65), stretch=False)
 
     # ------------------------------------------------------------- shared DFM / uploads
-    def _on_upload_data(self):
-        """Reload every previously uploaded source from its saved file path."""
-        uploads = db.get_all_uploads()
-        reloaded = []
-        missing = []
 
-        for key in SOURCE_ORDER:
-            info = uploads.get(key, {})
-            path = info.get("file_path", "")
-            if not path:
-                missing.append(SOURCE_BUTTON_NAMES[key] + " (not uploaded yet)")
-            elif not os.path.isfile(path):
-                missing.append(f"{SOURCE_BUTTON_NAMES[key]} ({path})")
-            else:
-                self._handle_upload(key, path)
-                reloaded.append(SOURCE_BUTTON_NAMES[key])
 
-        codes_info = uploads.get("codes", {})
-        codes_path = codes_info.get("file_path", "")
-        if not codes_path:
-            missing.append("Articoli (not uploaded yet)")
-        elif not os.path.isfile(codes_path):
-            missing.append(f"Articoli ({codes_path})")
-        else:
-            self._handle_codes_upload("codes", codes_path)
-            reloaded.append("Articoli")
 
-        listini_info = uploads.get("listini", {})
-        listini_path = listini_info.get("file_path", "")
-        if not listini_path:
-            missing.append("Listini (not uploaded yet)")
-        elif not os.path.isfile(listini_path):
-            missing.append(f"Listini ({listini_path})")
-        else:
-            self._handle_listini_upload("listini", listini_path)
-            reloaded.append("Listini")
 
-        summary = []
-        if reloaded:
-            summary.append("Reloaded: " + ", ".join(reloaded))
-        if missing:
-            summary.append("Not available:\n- " + "\n- ".join(missing))
-        messagebox.showinfo("Upload Data", "\n\n".join(summary) or "No saved file paths found.")
 
-    def _auto_restore_saved_files(self):
-        """Restore saved upload paths and refresh once at application start.
 
-        Loading is done off the Tk thread because the source workbooks can be
-        large.  The automatic refresh deliberately preserves comment history:
-        opening the program must rebuild the table, not advance New Comm. to
-        Old Comm.
-        """
-        if getattr(self, "_auto_restore_started", False):
-            return
-        self._auto_restore_started = True
-        uploads = db.get_all_uploads()
 
-        # The SQLite snapshot is already the fast local cache for the
-        # Situazione grid. If none of the saved source workbooks changed since
-        # their last upload, do not parse all six Excel files on every startup.
-        # The user can still use Upload Data when a fresh rebuild is needed.
-        if self._saved_snapshot_is_current(uploads):
-            self._startup_snapshot_current = True
-            # The SQLite snapshot is enough for the main grid, but the
-            # Copertura dashboard also needs the physical machine column.
-            self._restore_saved_copertura(uploads)
-            logger.info("Situazione: startup snapshot is current; skipped Excel restore")
-            return
 
-        paths = {
-            key: str(uploads.get(key, {}).get("file_path", ""))
-            for key in SOURCE_ORDER + ["codes"]
-        }
-        if not any(paths.values()):
-            return
 
-        self._startup_restore_in_progress = True
 
-        def worker():
-            loaded = {}
-            errors = {}
-            for key in SOURCE_ORDER:
-                # DFM is an explicit-upload-only reference; never parse the
-                # saved historical workbook during startup.
-                if key == "dfm":
-                    continue
-                path = paths.get(key, "")
-                if not path:
-                    errors[key] = "not saved"
-                    continue
-                if not os.path.isfile(path):
-                    errors[key] = f"file not found: {path}"
-                    continue
-                try:
-                    df, load_errors = data_loaders.LOADERS[key][1](path)
-                    if load_errors or df is None or df.empty:
-                        errors[key] = "; ".join(load_errors) if load_errors else "file is empty"
-                    else:
-                        loaded[key] = df
-                except Exception as exc:  # noqa: BLE001
-                    errors[key] = str(exc)
 
-            codes_df = None
-            codes_error = None
-            codes_path = paths.get("codes", "")
-            if codes_path:
-                if os.path.isfile(codes_path):
-                    try:
-                        codes_df, load_errors = data_loaders.load_codes(codes_path)
-                        if load_errors or codes_df is None or codes_df.empty:
-                            codes_error = "; ".join(load_errors) if load_errors else "file is empty"
-                    except Exception as exc:  # noqa: BLE001
-                        codes_error = str(exc)
-                else:
-                    codes_error = f"file not found: {codes_path}"
 
-            def apply_result():
-                self._startup_restore_in_progress = False
-                for key, df in loaded.items():
-                    self.loaded_frames[key] = df
-                    self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-                    db.save_upload(key, os.path.basename(paths[key]), len(df), "ok",
-                                   f"✅ {len(df)} rows - {os.path.basename(paths[key])}",
-                                   file_path=paths[key])
-                for key, error in errors.items():
-                    if key in self.source_rows:
-                        self.source_rows[key].set_status(False, f"❌ {error}")
-                if codes_df is not None and not codes_error:
-                    db.save_codes(codes_df)
-                    self.codes_row.set_status(True, f"✅ Saved ({len(codes_df)} codes)")
-                    db.save_upload("codes", os.path.basename(codes_path), len(codes_df), "ok",
-                                   f"✅ Saved ({len(codes_df)} codes) - {os.path.basename(codes_path)}",
-                                   file_path=codes_path)
-                elif codes_error:
-                    self.codes_row.set_status(False, f"❌ {codes_error}")
 
-                if not errors:
-                    self._on_refresh(preserve_comment_history=True)
-                else:
-                    logger.warning("Situazione: automatic restore skipped refresh; missing/invalid files: %s",
-                                   ", ".join(errors))
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _restore_saved_copertura(self, uploads):
-        """Restore Copertura even when the main Situazione snapshot is current."""
-        info = uploads.get("copertura", {}) if isinstance(uploads, dict) else {}
-        path = str(info.get("file_path", ""))
-        if not path or not os.path.isfile(path) or "copertura" in self.loaded_frames:
-            return
-
-        def worker():
-            try:
-                df, errors = data_loaders.load_schedulato(path)
-            except Exception as exc:  # noqa: BLE001
-                df, errors = None, [str(exc)]
-
-            def apply_result():
-                if errors or df is None or df.empty:
-                    logger.warning("Situazione: saved Copertura restore failed: %s", errors)
-                    return
-                self.loaded_frames["copertura"] = df
-                self._copertura_revision += 1
-                self.source_rows["copertura"].set_status(True, f"✅ {len(df)} rows")
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @staticmethod
-    def _saved_snapshot_is_current(uploads):
-        """Return True when the SQLite table can be used without Excel I/O."""
-        if not db.get_all_states():
-            return False
-        for key in SOURCE_ORDER:
-            info = uploads.get(key, {})
-            path = info.get("file_path", "")
-            uploaded_at = info.get("uploaded_at", "")
-            if info.get("status") != "ok" or not path or not os.path.isfile(path) or not uploaded_at:
-                return False
-            try:
-                uploaded_timestamp = datetime.fromisoformat(str(uploaded_at)).timestamp()
-                if os.path.getmtime(path) > uploaded_timestamp + 1:
-                    return False
-            except (OSError, TypeError, ValueError):
-                return False
-        return True
-
-    def sync_shared_dfm(self):
-        """DFM is intentionally never restored from disk at startup.
-
-        DFM is a large historical reference and must only enter the process
-        after the operator explicitly selects it in the upload control.
-        """
-        return
-
-    def sync_shared_async(self):
-        """Restore shared Excel files without blocking the Tk event loop."""
-        # Startup restore owns the source loading pass. Running this second
-        # pass at the same time would read DFM/Produzione twice.
-        if self._startup_restore_in_progress:
-            return
-        if self._startup_snapshot_current:
-            self._startup_snapshot_current = False
-            return
-        if self._shared_syncing:
-            return
-        dfm_path = str(load_dfm_cache().get("source_path", ""))
-        prod_path = str(load_prod_cache().get("source_path", ""))
-        needs_dfm = bool(dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path)
-        needs_prod = bool(prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path)
-        if not (needs_dfm or needs_prod):
-            return
-
-        self._shared_syncing = True
-
-        def worker():
-            dfm_result = None
-            prod_result = None
-            # DFM deliberately omitted: it is an explicit-upload-only source.
-            if prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path:
-                try:
-                    prod_result = data_loaders.load_data_prod(prod_path)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not restore shared Produzione file: %s", exc)
-
-            def apply_result():
-                self._shared_syncing = False
-                if prod_result and not prod_result[1] and prod_result[0] is not None and not prod_result[0].empty:
-                    df = prod_result[0]
-                    self.loaded_frames["data_prod"] = df
-                    self._shared_prod_path = prod_path
-                    self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
-                    db.save_upload("data_prod", Path(prod_path).name, len(df), "ok", f"✅ {len(df)} rows - {Path(prod_path).name}", file_path=prod_path)
-                self.after_idle(self.sync_shared_async)
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def sync_remaining_shared_sources(self):
-        """Load all non-specialized sources saved by another page.
-
-        DFM and Produzione have dedicated parsers/caches and are handled by
-        ``sync_shared_async``. The remaining Situation inputs use the same
-        centralized path registry, so a file uploaded in Overview or another
-        page is parsed here automatically.
-        """
-        if self._other_shared_syncing:
-            return
-        source_keys = ("copertura", "wincoint", "uscita", "qualita", "articoli", "listini")
-        paths = {}
-        for key in source_keys:
-            path = source_path(key, existing_only=True)
-            if path and self._shared_source_paths.get(key) != str(path):
-                paths[key] = path
-        if not paths:
-            return
-        self._other_shared_syncing = True
-
-        def worker():
-            results = {}
-            for key, path in paths.items():
-                try:
-                    if key == "articoli":
-                        result = data_loaders.load_codes(str(path))
-                    elif key == "listini":
-                        import calculate.prezzi as prezzi_logic
-                        result = prezzi_logic.load_prezzi(str(path))
-                    else:
-                        result = data_loaders.LOADERS[key][1](str(path))
-                    results[key] = (path, result)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Could not restore shared %s file: %s", key, exc)
-
-            def apply_result():
-                self._other_shared_syncing = False
-                for key, (path, result) in results.items():
-                    df, errors = result
-                    if errors or df is None or df.empty:
-                        continue
-                    self._shared_source_paths[key] = str(path)
-                    if key == "articoli":
-                        db.save_codes(df)
-                        self.codes_row.set_status(True, f"✅ Saved ({len(df)} codes)")
-                    elif key == "listini":
-                        self.listini_row.set_status(True, f"✅ Saved ({len(df)} rows)")
-                        self.refresh_prezzo_densita()
-                    else:
-                        self.loaded_frames[key] = df
-                        if key == "copertura":
-                            self._copertura_revision += 1
-                        self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-                        db.save_upload(key, path.name, len(df), "ok", f"✅ {len(df)} rows - {path.name}", file_path=str(path))
-                self.after_idle(self.sync_remaining_shared_sources)
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _save_shared_dfm(self, path):
-        """Update the shared DFM cache when Situazione is the upload source."""
-        try:
-            entries = build_dfm_lookup(Path(path))
-            if entries:
-                save_dfm_cache(entries, Path(path).name, Path(path))
-                self._shared_dfm_path = str(Path(path))
-                if self._on_shared_cache_changed:
-                    self._on_shared_cache_changed()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not update shared DFM reference: %s", exc)
-
-    def sync_shared_prod(self):
-        """Load the Produzione file selected in either page from the shared cache."""
-        cache = load_prod_cache()
-        source_path = Path(str(cache.get("source_path", "")))
-        if not source_path.is_file():
-            return
-        if getattr(self, "_shared_prod_path", "") == str(source_path):
-            return
-
-        try:
-            df, errors = data_loaders.load_data_prod(str(source_path))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not restore shared Produzione file: %s", exc)
-            return
-        if errors or df is None or df.empty:
-            return
-
-        self.loaded_frames["data_prod"] = df
-        self._shared_prod_path = str(source_path)
-        msg = f"✅ {len(df)} rows - {source_path.name}"
-        self.source_rows["data_prod"].set_status(True, f"✅ {len(df)} rows")
-        db.save_upload("data_prod", source_path.name, len(df), "ok", msg, file_path=str(source_path))
-
-    def _save_shared_prod(self, path):
-        """Update the shared Produzione cache when Situazione is the upload source."""
-        try:
-            save_prod_cache(Path(path))
-            self._shared_prod_path = str(Path(path))
-            if self._on_shared_cache_changed:
-                self._on_shared_cache_changed()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not update shared Produzione reference: %s", exc)
-
-    def _handle_upload(self, key, path, cache_path=None):
-        """cache_path, if given, is what gets persisted/shown instead of
-        path -- used by the Overview 'import everything' button, which
-        loads from a temp extract of the real (master) file."""
-        display_path = cache_path or path
-        label, loader_fn = data_loaders.LOADERS[key]
-        try:
-            df, errors = loader_fn(path)
-        except Exception as exc:  # noqa: BLE001
-            errors = [f"An error occurred while reading the file: {exc}"]
-            df = None
-
-        if errors or df is None or df.empty:
-            msg = "; ".join(errors) if errors else "The file is empty after filtering"
-            self.source_rows[key].set_status(False, f"❌ {msg}")
-            db.save_upload(key, os.path.basename(display_path), 0, "error", msg, file_path=str(display_path))
-            self.loaded_frames.pop(key, None)
-            return
-
-        self.loaded_frames[key] = df
-        if key == "copertura":
-            self._copertura_revision += 1
-            try:
-                db.save_frame_cache("copertura", df)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not cache Copertura in SQLite: %s", exc)
-        msg = f"✅ {len(df)} rows - {os.path.basename(display_path)}"
-        self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-        db.save_upload(key, os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
-        if key == "dfm":
-            self._save_shared_dfm(display_path)
-        if key == "data_prod":
-            self._save_shared_prod(display_path)
-        # Every successful individual upload becomes available to all pages.
-        save_source(key, display_path)
-        logger.info("Situazione: %s uploaded — %d rows (%s)", key, len(df), os.path.basename(display_path))
-
-    def _handle_codes_upload(self, _key, path, cache_path=None):
-        display_path = cache_path or path
-        try:
-            df, errors = data_loaders.load_codes(path)
-        except Exception as exc:  # noqa: BLE001
-            errors = [f"An error occurred while reading the file: {exc}"]
-            df = None
-
-        if errors or df is None or df.empty:
-            msg = "; ".join(errors) if errors else "The file is empty"
-            self.codes_row.set_status(False, f"❌ {msg}")
-            return
-
-        db.save_codes(df)
-        save_source("articoli", display_path)
-        msg = f"✅ Saved ({len(df)} codes) - {os.path.basename(display_path)}"
-        self.codes_row.set_status(True, msg)
-        db.save_upload("codes", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
-        logger.info("Situazione: yarn codes reference updated — %d codes (%s)", len(df), os.path.basename(display_path))
-
-        # Also feed Biglietti's Marca-based Titolo cache, so uploading
-        # Articoli from either tab benefits both -- best-effort, never
-        # blocks the TITOLO-based save above if this file's Marca column
-        # isn't found.
-        try:
-            import utility.articoli_cache as articoli_cache
-            import exporters.biglietti_exporter as biglietti_exporter
-            marca_map, _errors = biglietti_exporter.load_articoli_marca_map(Path(path))
-            if marca_map:
-                articoli_cache.save_articoli_cache(display_path)
-        except Exception:
-            pass
-
-    def _handle_listini_upload(self, _key, path, cache_path=None):
-        display_path = cache_path or path
-        try:
-            import utility.prezzi_cache as prezzi_cache
-            import calculate.prezzi as prezzi_logic
-            df, errors = prezzi_logic.load_prezzi(path)
-        except Exception as exc:  # noqa: BLE001
-            errors = [f"An error occurred while reading the file: {exc}"]
-            df = None
-
-        if errors or df is None or df.empty:
-            msg = "; ".join(errors) if errors else "The file is empty"
-            self.listini_row.set_status(False, f"❌ {msg}")
-            return
-
-        prezzi_cache.save_prezzi_cache(display_path)
-        save_source("listini", display_path)
-        msg = f"✅ Saved ({len(df)} rows) - {os.path.basename(display_path)}"
-        self.listini_row.set_status(True, msg)
-        db.save_upload("listini", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
-        logger.info("Situazione: Listini (Prezzi) updated — %d rows (%s)", len(df), os.path.basename(display_path))
-        self.refresh_prezzo_densita()
-
-    def _refresh_source_labels_from_db(self):
-        uploads = db.get_all_uploads()
-        for key, row_widget in self.source_rows.items():
-            info = uploads.get(key)
-            if info:
-                ok = info["status"] == "ok"
-                if ok and not info.get("file_path"):
-                    row_widget.set_status(
-                        False,
-                        f"⚠ {info['message']} (select once to save path)",
-                    )
-                else:
-                    count = info.get("row_count", "")
-                    status_text = f"✅ {count} rows" if ok else f"❌ {info['message']}"
-                    row_widget.set_status(ok, status_text)
-        codes_info = uploads.get("codes")
-        if codes_info:
-            if codes_info["status"] == "ok" and not codes_info.get("file_path"):
-                self.codes_row.set_status(False, "⚠ Saved status only (select once to save path)")
-            else:
-                self.codes_row.set_status(codes_info["status"] == "ok",
-                                           f"✅ Saved ({codes_info.get('row_count', '')} codes)")
-        listini_info = uploads.get("listini")
-        if listini_info:
-            if listini_info["status"] == "ok" and not listini_info.get("file_path"):
-                self.listini_row.set_status(False, "⚠ Saved status only (select once to save path)")
-            else:
-                self.listini_row.set_status(listini_info["status"] == "ok",
-                                             f"✅ Saved ({listini_info.get('row_count', '')} rows)")
 
     # -------------------------------------------------------------- refresh
-    def _on_refresh(self, preserve_comment_history=False):
-        if "wincoint" not in self.loaded_frames:
-            messagebox.showwarning("Missing data", "Upload the WINCOINT orders file before refreshing.")
-            return
 
-        missing = [SOURCE_BUTTON_NAMES[k] for k in SOURCE_ORDER if k not in self.loaded_frames]
-        if missing:
-            messagebox.showwarning(
-                "Missing files",
-                "These files have not been uploaded in this session:\n- " + "\n- ".join(missing) +
-                "\n\nUpload them once, or use Upload Data after their paths have been saved. "
-                "Refresh was cancelled so existing derived data is not cleared."
-            )
-            return
 
-        # previous New Comment per Partita -- this becomes this round's Old Comment,
-        # and the cascade in situazione_logic actively uses it, not just for history
-        existing = db.get_all_states()
-        old_comments = {p: s["new_comment"] for p, s in existing.items()}
 
-        result_df = business_logic.compute_situation(
-            orders_df=self.loaded_frames.get("wincoint"),
-            dfm_df=self.loaded_frames.get("dfm"),
-            data_prod_df=self.loaded_frames.get("data_prod"),
-            copertura_df=self.loaded_frames.get("copertura"),
-            uscita_df=self.loaded_frames.get("uscita"),
-            qualita_df=self.loaded_frames.get("qualita"),
-            codes_map=db.load_codes(),
-            old_comments=old_comments,
-        )
 
-        # --- safety check: has ANYTHING changed vs what's already stored? ---
-        any_change = False
-        for _, r in result_df.iterrows():
-            prev = existing.get(r["partita"])
-            if prev is None or prev["new_comment"] != r["new_comment"]:
-                any_change = True
-                break
 
-        current_partite = {
-            str(value).strip()
-            for value in result_df.get("partita", pd.Series(dtype=str)).tolist()
-            if str(value).strip()
-        }
-        saved_partite = {str(value).strip() for value in existing}
-        partite_changed = current_partite != saved_partite
 
-        same_data = not any_change and not partite_changed and bool(existing)
-        if preserve_comment_history or same_data:
-            # The user may intentionally upload the same files again to
-            # rebuild the Treeview.  Do not show a warning, and do not treat
-            # the refresh as a new comment-history step: keep each row's
-            # already stored Old Comm. exactly as it is.
-            result_df["old_comment"] = result_df["partita"].map(
-                lambda partita: existing.get(partita, {}).get("old_comment", "")
-            )
-        else:
-            proceed = messagebox.askyesno(
-                "Confirm refresh",
-                f"{len(result_df)} batches will be updated. The current New Comment will move to Old Comment "
-                "for batches whose status changed. Continue?"
-            )
-            if not proceed:
-                return
 
-        removed = db.remove_states_not_in(current_partite)
-        added, updated, unchanged = db.upsert_states(result_df.to_dict(orient="records"))
-        self.summary_lbl.config(text=f"Added: {added}  |  Updated: {updated}  |  Unchanged: {unchanged}")
-        logger.info(
-            "Situazione: refreshed — added=%d updated=%d unchanged=%d removed=%d",
-            added, updated, unchanged, removed,
-        )
-        self._load_table_from_db()
 
-    def _notify_raw_yarn_available(self) -> None:
-        """Fire a notification for every row whose Filato Disponibile
-        (raw_yarn_match) column has a real match -- yarn that a PG-X-
-        flagged color was waiting for is now available in Magazino Filato.
-        Keyed by partita so re-runs update/replace the same notice rather
-        than piling up duplicates while the match is still there."""
-        if not self._on_notification or self.current_df.empty or "raw_yarn_match" not in self.current_df.columns:
-            return
-        matched = self.current_df[self.current_df["raw_yarn_match"].astype(str).str.strip() != ""]
-        for _, row in matched.iterrows():
-            partita = str(row.get("partita", "")).strip()
-            if not partita:
-                continue
-            self._on_notification(
-                f"situazione-raw-yarn-available:{partita}",
-                "Filato disponibile per un colore in attesa",
-                f"Partita {partita} (Bagno {row.get('bagno', '')}, Articolo {row.get('articolo', '')}): "
-                f"filato disponibile in Magazino — {row.get('raw_yarn_match', '')}.",
-                "Situazione Generale", "medium",
-            )
 
-    def _notify_abbina_pending(self, suggestions: pd.DataFrame | None = None) -> None:
-        """Fire one aggregate notification when the "Da abbinare" matching
-        window (see _open_abbina) currently has suggestions waiting --
-        computed here too so it surfaces without the user having to open
-        that window first. Pass a precomputed suggestions frame when the
-        caller already has one (e.g. from a background thread); otherwise
-        it's computed on the calling thread, so prefer passing one in from
-        anywhere already running off the UI thread."""
-        if not self._on_notification or self.current_df.empty:
-            return
-        if suggestions is None:
-            try:
-                suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Situazione: Da abbinare check failed: %s", exc)
-                return
-        if suggestions is None or suggestions.empty:
-            notifications.resolve("situazione-abbina-pending")
-            return
-        groups = suggestions.apply(lambda row: f"{row.get('codice', '')}|{row.get('colore', '')}", axis=1).nunique()
-        self._on_notification(
-            "situazione-abbina-pending",
-            "Colori da abbinare",
-            f"{groups} gruppo/i colore ({len(suggestions)} riga/e) in attesa di abbinamento — vedi \"Da abbinare\".",
-            "Situazione Generale", "medium",
-        )
 
-    def _recompute_raw_yarn_match(self) -> None:
-        """Fill "Filato Disponibile" for PG-X rows from Magazino Filato's
-        current stock -- best-effort, never blocks: if Magazino hasn't been
-        loaded yet this just leaves the column blank."""
-        if self.current_df.empty:
-            return
-        if "comment" not in self.current_df.columns:
-            self.current_df["raw_yarn_match"] = ""
-            return
-        magazino_tab = self.magazino_tab
-        magazino_summary = getattr(magazino_tab, "magazino_summary", None) if magazino_tab else None
-        lotti_summary = getattr(magazino_tab, "lotti_summary", None) if magazino_tab else None
-        try:
-            self.current_df["raw_yarn_match"] = business_logic.compute_raw_yarn_matches(
-                self.current_df, magazino_summary, lotti_summary
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Situazione: raw yarn auto-match failed: %s", exc)
-            self.current_df["raw_yarn_match"] = ""
-        self._notify_raw_yarn_available()
 
-    def refresh_raw_yarn_match(self) -> None:
-        """Public hook: re-run the Filato Disponibile match against whatever
-        Magazino Filato/LOTTI data is loaded right now, and re-render."""
-        if self.current_df.empty:
-            return
-        self._recompute_raw_yarn_match()
-        self.current_df = business_logic.compute_delivery_dates(self.current_df)
-        self._data_revision += 1
-        self._render_tree(self.current_df)
 
-    def refresh_prezzo_densita(self) -> None:
-        """Public hook: re-run the Prezzo/Densita lookup (e.g. after the
-        Densita' Query workbook is uploaded from the Biglietti tab) and
-        re-render, without a full WINCOINT refresh."""
-        if self.current_df.empty:
-            return
-        self._recompute_prezzo_densita()
-        self._data_revision += 1
-        self._render_tree(self.current_df)
-
-    def refresh_raw_yarn_match_async(self) -> None:
-        """Refresh raw-yarn suggestions after the cached UI is visible."""
-        if self.current_df.empty or getattr(self, "_raw_match_syncing", False):
-            return
-
-        snapshot = self.current_df.copy()
-        magazino_tab = self.magazino_tab
-        magazino_summary = getattr(magazino_tab, "magazino_summary", None)
-        lotti_summary = getattr(magazino_tab, "lotti_summary", None)
-        magazino_snapshot = magazino_summary.copy() if isinstance(magazino_summary, pd.DataFrame) else magazino_summary
-        lotti_snapshot = lotti_summary.copy() if isinstance(lotti_summary, pd.DataFrame) else lotti_summary
-        self._raw_match_syncing = True
-
-        def worker():
-            try:
-                matches = business_logic.compute_raw_yarn_matches(
-                    snapshot, magazino_snapshot, lotti_snapshot
-                )
-                error = None
-            except Exception as exc:  # noqa: BLE001
-                matches = [""] * len(snapshot)
-                error = exc
-            try:
-                # Computed here (background thread), not in apply_result, so
-                # this can't add latency to the UI thread -- Da abbinare's
-                # matching pass is not necessarily cheap.
-                abbina_suggestions = build_suggestions(snapshot, max_extra_percent=0.20)
-            except Exception:  # noqa: BLE001
-                abbina_suggestions = None
-
-            def apply_result():
-                self._raw_match_syncing = False
-                if error:
-                    logger.error("Situazione: async raw yarn match failed: %s", error)
-                    return
-                if not self.winfo_exists() or len(self.current_df) != len(snapshot):
-                    return
-                self.current_df["raw_yarn_match"] = matches
-                self.current_df = business_logic.compute_delivery_dates(self.current_df)
-                self._data_revision += 1
-                self._render_tree(self.current_df)
-                self._notify_raw_yarn_available()
-                self._notify_abbina_pending(abbina_suggestions)
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _recompute_prezzo_densita_for_frame(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, list[tuple]]:
-        """Fill Prezzo Listini (by Articolo+Codice, from the same Listini
-        used by the Biglietti tab's Prezzi source, plus the $2 machine
-        surcharge on 24/32/56) and Densita`(360-390) (by Partita, from the
-        Densita' Query workbook uploaded on either the Biglietti or
-        Situazione tab) -- best-effort, never blocks: blank if the relevant
-        source has not been uploaded yet.
-
-        IMPORTANT: this never touches the "prezzo" column (Prezzo Ord.) --
-        that is the price actually entered in Wincoint (read in
-        situazione_loaders.load_wincoint_orders and carried straight
-        through by compute_situation/the DB). "prezzo_lisini" is only the
-        expected value computed here, kept in its own column so the two can
-        be compared and shown side by side, and so a mismatch survives being
-        looked at rather than silently overwriting the real Wincoint price.
-
-        Returns (result_df, pending_notifications): this runs on a
-        background thread when called from _recompute_prezzo_densita_async,
-        and self._on_notification ultimately reaches a Tk widget's
-        .after() -- calling that from a non-main thread is not something
-        Tkinter guarantees, so notifications are only collected here and
-        must be fired by the caller on the main thread (see
-        _fire_prezzo_notifications)."""
-        import exporters.biglietti_exporter as biglietti_exporter
-        result = frame.copy()
-        pending: list[tuple] = []
-        if result.empty:
-            result["prezzo_lisini"] = ""
-            result["densita"] = ""
-            return result, pending
-        try:
-            price_lookup, _source = biglietti_exporter.load_prezzo_lookup()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Situazione: Prezzo lookup failed: %s", exc)
-            price_lookup = {}
-        densita_map: dict[int, dict] = {}
-        try:
-            cache = load_densita_cache()
-            path = cache.get("source_path")
-            if path and Path(path).is_file():
-                densita_map, _errors = biglietti_exporter.load_densita_query(Path(path))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Situazione: Densita' Query lookup failed: %s", exc)
-
-        def _prezzo_row(row):
-            base, used_category, category, level = biglietti_exporter.prezzo_match_for(
-                row.get("articolo", ""), row.get("codice", ""), price_lookup
-            )
-            expected = biglietti_exporter.apply_machine_surcharge(base, row.get("mc", ""))
-            current = row.get("prezzo", "")
-            try:
-                curr_clean = str(current or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
-                current_num = float(curr_clean) if curr_clean else None
-            except (TypeError, ValueError):
-                current_num = None
-            try:
-                exp_clean = str(expected or "").replace("$", "").replace("USD", "").replace("usd", "").strip().replace(",", ".")
-                expected_num = float(exp_clean) if exp_clean else None
-            except (TypeError, ValueError):
-                expected_num = None
-            article = str(row.get("articolo", "")).strip()
-            code = str(row.get("codice", "")).strip()
-            colore = str(row.get("colore", "")).strip()
-            partita = str(row.get("partita", "")).strip()
-            partita_col = partita if partita else (colore if colore else code)
-            if partita and colore and partita != colore:
-                partita_col = f"{partita} ({colore})"
-            if article and code:
-                identity = f"{article}:{code}:{partita_col}"
-                missing_key = f"situazione-price-missing:{identity}"
-                category_key = f"situazione-price-category-fallback:{identity}"
-                if used_category and expected_num is not None:
-                    level_text = f", livello {float(level):g}" if level is not None else ""
-                    pending.append((
-                        "add", category_key, "Prezzo Listini da Category",
-                        f"Articolo {article}, color code {code}: no direct price; used Category {category} price {expected_num:.2f}{level_text}.",
-                        "Situazione Generale", "medium", partita_col,
-                    ))
-                else:
-                    pending.append(("resolve", category_key))
-                if expected_num is None:
-                    if current_num in (None, 0.0):
-                        pending.append(("resolve", missing_key))
-                    else:
-                        pending.append((
-                            "add", missing_key, "Prezzo Listini mancante",
-                            f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f} exists but Listini has no matching price.", "Situazione Generale", "medium", partita_col,
-                        ))
-                elif current_num is not None and abs(current_num - 0.01) < 1e-9:
-                    pending.append((
-                        "add", f"situazione-price-suspicious:{identity}", "Prezzo Ord. sospetto (0.01)",
-                        f"Articolo {article}, color code {code}: Prezzo Ord. è 0.01.", "Situazione Generale", "high", partita_col,
-                    ))
-                elif current_num is not None and expected_num is not None and abs(current_num - expected_num) > 0.01:
-                    pending.append((
-                        "add", f"situazione-price-mismatch:{identity}:{current_num}:{expected_num}", "Color price differs from Prezzi",
-                        f"Articolo {article}, color code {code}: Prezzo Ord. {current_num:.2f}, expected {expected_num:.2f} from Listini (machine rule included).", "Situazione Generale", "high", partita_col,
-                    ))
-            return expected
-
-        def _densita_row(row):
-            if not densita_map:
-                return ""
-            try:
-                key = int(float(str(row.get("partita", "")).replace(",", ".")))
-            except (TypeError, ValueError):
-                return ""
-            return densita_map.get(key, {}).get("densita", "")
-
-        result["prezzo_lisini"] = result.apply(_prezzo_row, axis=1)
-        result["densita"] = result.apply(_densita_row, axis=1)
-        return result, pending
-
-    def _fire_prezzo_notifications(self, pending: list[tuple]) -> None:
-        """Runs on the main thread only (see _recompute_prezzo_densita_for_frame's
-        docstring) -- the actual self._on_notification/notifications.resolve calls."""
-        for entry in pending:
-            if entry[0] == "add" and self._on_notification:
-                self._on_notification(*entry[1:])
-            elif entry[0] == "resolve":
-                notifications.resolve(entry[1])
-
-    def _recompute_prezzo_densita(self) -> None:
-        self.current_df, pending = self._recompute_prezzo_densita_for_frame(self.current_df)
-        self._fire_prezzo_notifications(pending)
-
-    def _recompute_prezzo_densita_async(self) -> None:
-        if self._price_densita_syncing or self.current_df.empty:
-            return
-        self._price_densita_syncing = True
-        snapshot = self.current_df.copy()
-
-        def worker():
-            try:
-                result, pending = self._recompute_prezzo_densita_for_frame(snapshot)
-                error = None
-            except Exception as exc:  # noqa: BLE001
-                result, pending, error = None, [], exc
-
-            def apply_result():
-                self._price_densita_syncing = False
-                if error:
-                    logger.warning("Situazione: async Prezzo/Densita lookup failed: %s", error)
-                    return
-                if not self.winfo_exists() or len(self.current_df) != len(result):
-                    return
-                self.current_df["prezzo_lisini"] = result["prezzo_lisini"].to_numpy()
-                self.current_df["densita"] = result["densita"].to_numpy()
-                self._data_revision += 1
-                self._render_tree(self.current_df)
-                self._fire_prezzo_notifications(pending)  # main thread: safe to touch Tk here
-
-            self.after(0, apply_result)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _load_table_from_db(self):
-        states = db.get_all_states()
-        self.current_df = pd.DataFrame(states.values())
-        self._data_revision += 1
-        if not self.current_df.empty and "bagno" in self.current_df.columns:
-            self.current_df = self.current_df.sort_values(
-                by="bagno", ascending=True, key=lambda s: s.astype(str)
-            )
-            self.sort_state["bagno"] = False  # next click on Bagno heading reverses to Z-A
-        self._recompute_raw_yarn_match()
-        self.current_df = business_logic.compute_delivery_dates(self.current_df)
-        # "prezzo" (Prezzo Ord.) is the real Wincoint price and already
-        # comes from the DB row itself -- it must NOT be blanked here.
-        # "prezzo_lisini" (the Listini-derived expected price) is the only
-        # one that needs a placeholder until the async lookup below fills
-        # it in and, critically, runs the mismatch check against "prezzo".
-        if "prezzo" not in self.current_df.columns:
-            self.current_df["prezzo"] = ""
-        self.current_df["prezzo_lisini"] = ""
-        self.current_df["densita"] = ""
-        self._render_tree(self.current_df)
-        # Recompute Prezzo Listini (and fire the price-mismatch notification)
-        # after every load from the DB -- not just once at tab startup. This
-        # is what used to be missing: a plain Refresh left Prezzo Listini
-        # blank and the comparison never ran until the Listini file was
-        # re-uploaded or the app restarted.
-        self._recompute_prezzo_densita_async()
-        for callback in tuple(self._table_loaded_callbacks):
-            try:
-                callback()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Situazione: could not update dependent view: %s", exc)
-
-    def add_table_loaded_callback(self, callback):
-        """Register a callback invoked after the Situazione Treeview reloads."""
-        if callback not in self._table_loaded_callbacks:
-            self._table_loaded_callbacks.append(callback)
 
     # -------------------------------------------------------------- display
     def _render_tree(self, df, autosize=True):

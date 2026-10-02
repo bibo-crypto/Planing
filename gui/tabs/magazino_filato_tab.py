@@ -16,6 +16,7 @@ import pandas as pd
 
 from calculate import lotti as lotti_logic
 from calculate import magazino as logic
+from utility.excel_io import safe_save_workbook
 from utility.lotti_cache import load_lotti_cache, save_lotti_cache
 from utility.magazino_cache import load_magazino_cache, save_magazino_cache
 from utility.utils import logger

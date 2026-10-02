@@ -17,7 +17,6 @@ from gui.tabs.overview_tab import _format_display_dates
 from gui.tabs.overview_tab import _write_typed_excel_table
 import openpyxl
 import utility.path_manager as path_manager
-import utility.situazione_db as db
 from calculate.reports import compute_on_time_delivery
 from calculate.prezzi import detect_price_anomalies
 
@@ -26,6 +25,76 @@ class PlanningRegressionTests(unittest.TestCase):
     def test_empty_machine_group_has_no_capacity(self):
         self.assertEqual(_smallest_fitting_machine(0), 0)
         self.assertEqual(_smallest_fitting_machine(-1), 0)
+
+    def test_copertura_codes_map_to_correct_machine_numbers_and_capacities(self):
+        from calculate.constants import MACHINE_CAPACITY_BY_NUMBER
+        from calculate.situazione import machine_label, machine_number_from_label
+
+        expected = {
+            3: (3309, 672),
+            4: (3300, 672),
+            5: (3308, 192),
+            6: (3304, 384),
+            7: (3307, 72),
+            8: (3303, 128),
+            9: (3306, 32),
+            10: (3302, 56),
+            11: (3301, 6),
+            12: (3310, 24),
+        }
+
+        for number, (code, capacity) in expected.items():
+            self.assertEqual(machine_number_from_label(str(code)), number)
+            self.assertEqual(MACHINE_CAPACITY_BY_NUMBER[number], capacity)
+            self.assertEqual(machine_label(number), f"M{number} ({capacity} rocche)")
+
+    def test_machine_schedule_keeps_codice_for_per_machine_treeview(self):
+        from calculate.situazione import build_machine_schedule
+
+        situation = pd.DataFrame([{
+            "bagno": "B-1", "cliente": "Cliente", "articolo": "A1",
+            "titolo": "30/1", "codice": "00123", "colore": "Blu",
+            "partita": "P-100", "rocche": 24, "ordine": "O-1", "riga": 1,
+        }])
+        copertura = pd.DataFrame([{"bagno": "B-1", "machine": "3309"}])
+
+        schedule = build_machine_schedule(
+            situation, copertura, today=date(2026, 10, 5)
+        )
+
+        self.assertEqual(schedule.loc[0, "codice"], "00123")
+        self.assertEqual(schedule.loc[0, "colore"], "Blu")
+
+    def test_situazione_densita_uses_raw_batch_from_pg_comment(self):
+        from gui.tabs.situazione_tab import SituazioneTab
+
+        tab = object.__new__(SituazioneTab)
+        tab._on_notification = None
+        frame = pd.DataFrame([{
+            "partita": "COLORED-BATCH",
+            "comment": "PG-158694-PM-X",
+            "articolo": "",
+            "codice": "",
+            "prezzo": "",
+            "mc": "",
+        }])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "densita.xlsx"
+            source.touch()
+            with patch(
+                "gui.tabs.situazione_refresh.load_densita_cache",
+                return_value={"source_path": str(source)},
+            ), patch(
+                "exporters.biglietti_exporter.load_prezzo_lookup",
+                return_value=({}, ""),
+            ), patch(
+                "exporters.biglietti_exporter.load_densita_query",
+                return_value=({158694: {"densita": 378}}, []),
+            ):
+                result, _pending = tab._recompute_prezzo_densita_for_frame(frame)
+
+        self.assertEqual(result.loc[0, "densita"], 378)
 
     def test_machine_lookup_rejects_empty_counts(self):
         self.assertEqual(_machine_for_count(None), "")
@@ -377,6 +446,25 @@ class PlanningRegressionTests(unittest.TestCase):
     def test_overview_shared_refresh_helper_is_available(self):
         from gui.tabs.overview_tab import OverviewTab
         self.assertTrue(hasattr(OverviewTab, "_refresh_shared_tabs"))
+
+    def test_overview_price_color_ticket_uses_situazione_anomalies(self):
+        from gui.tabs.overview_tab import _price_color_anomalies
+
+        situazione = pd.DataFrame([{
+            "articolo": "A1",
+            "colore": "Blu",
+            "codice": "001",
+            "partita": "P-100",
+            "prezzo": 12.0,
+            "prezzo_lisini": 10.0,
+        }])
+
+        color_errors = _price_color_anomalies(situazione)
+
+        self.assertEqual(len(color_errors), 1)
+        self.assertEqual(color_errors.loc[0, "articolo"], "A1")
+        self.assertEqual(color_errors.loc[0, "partita_colore"], "P-100 (Blu)")
+        self.assertNotIn("key", color_errors.columns)
 
     def test_canonical_ui_tab_imports(self):
         from gui.tabs.biglietti_tab import BigliettiTab
@@ -928,10 +1016,22 @@ class PlanningRegressionTests(unittest.TestCase):
 
     def test_email_template_blank_detection(self):
         from utility.email_compose import EmailTemplate
+
         self.assertTrue(EmailTemplate().is_blank())
         self.assertTrue(EmailTemplate.from_dict(None).is_blank())
         self.assertTrue(EmailTemplate.from_dict({}).is_blank())
         self.assertFalse(EmailTemplate(subject="hi").is_blank())
+
+    def test_elvy_invoice_conversion_loads_its_mapping_helpers(self):
+        from types import SimpleNamespace
+        from gui.gui import ConverterApp
+
+        app = SimpleNamespace(
+            after=lambda *_args: None,
+            _on_einv_conversion_done=lambda *_args: None,
+        )
+        with patch("parsers.elvy_mapping.load_elvy_mapping", return_value={}):
+            ConverterApp._run_einv_conversion(app, [], Path("."), False)
 
     def test_open_outlook_email_raises_clear_error_without_outlook(self):
         # On this (non-Windows / no-Outlook) test environment, win32com

@@ -8,8 +8,8 @@ env/
 ENV/
 
 # Build and packaged application output
-build/
-dist/
+/build*/
+/dist*/
 installer_output/
 *.spec.bak
 *.exe
@@ -18,15 +18,18 @@ installer_output/
 # Runtime logs and local application settings
 logs/
 settings/
+/cache/
 *.log
 *.pkl
 *.prof
 
-# Situazione local database and SQLite sidecars
-situazione/*.db
-situazione/*.db-*
-situazione/*.sqlite
-situazione/*.sqlite-*
+# Local databases and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 
 # User-selected/imported data files
 *.xlsx
@@ -41,6 +44,18 @@ situazione/*.sqlite-*
 Thumbs.db
 desktop.ini
 
+# Test and tooling artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+*.egg-info/
+*.bak
+*.tmp
+*.swp
+*.swo
 
 .cursor/hooks.json
 .cursor/hooks/after-agent-response.js

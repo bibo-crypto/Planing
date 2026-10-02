@@ -21,6 +21,7 @@ import re
 from itertools import combinations
 
 from utility.utils import clean_text, parse_number
+from calculate.constants import MACHINE_CAPACITY_BY_NUMBER, MACHINE_NUMBER_BY_CODE
 
 READY_CODES = {"AA", "AC", "AU", "AT"}
 ELVY_CLIENT_CODES = {"3009", "ELVY"}
@@ -600,6 +601,16 @@ _MACHINE_CODE_RANGE = (3300, 3399)
 _BARE_MACHINE_RE = re.compile(r"(?<!\d)0*(\d+)(?:\.0+)?(?!\d)")
 
 
+def machine_label(machine_number: int) -> str:
+    """Return the display name and cone capacity for a physical machine."""
+    capacity = MACHINE_CAPACITY_BY_NUMBER.get(int(machine_number))
+    return (
+        f"M{machine_number} ({capacity} rocche)"
+        if capacity is not None
+        else f"M{machine_number}"
+    )
+
+
 def machine_number_from_label(value) -> int | None:
     """
     Parse a Copertura "Machine" label into a plain machine number.
@@ -616,13 +627,13 @@ def machine_number_from_label(value) -> int | None:
     except (TypeError, ValueError):
         numeric_int = None
     if numeric_int is not None and _MACHINE_CODE_RANGE[0] <= numeric_int <= _MACHINE_CODE_RANGE[1]:
-        return numeric_int - _MACHINE_CODE_RANGE[0]
+        return MACHINE_NUMBER_BY_CODE.get(numeric_int)
     match = _BARE_MACHINE_RE.search(text)
     if not match:
         return None
     number = int(match.group(1))
     if _MACHINE_CODE_RANGE[0] <= number <= _MACHINE_CODE_RANGE[1]:
-        return number - _MACHINE_CODE_RANGE[0]
+        return MACHINE_NUMBER_BY_CODE.get(number)
     return number if number > 0 else None
 
 
@@ -691,7 +702,7 @@ def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFra
     Friday is skipped.  The queue is joined by normalized Bagno, while the
     displayed color/order fields come from Situazione Generale.
     """
-    columns = ["machine", "dye_date", "bagno", "colore", "titolo", "articolo", "partita", "rocche", "cliente", "ordine", "riga"]
+    columns = ["machine", "dye_date", "bagno", "colore", "titolo", "articolo", "partita", "rocche", "cliente", "ordine", "riga", "codice"]
     if situation_df is None or situation_df.empty or copertura_df is None or copertura_df.empty:
         return pd.DataFrame(columns=columns)
     if not {"bagno", "machine"}.issubset(copertura_df.columns) or "bagno" not in situation_df.columns:
@@ -774,7 +785,7 @@ def find_price_anomalies(df):
     out = []
     for _, row in df.iterrows():
         articolo = str(row.get("articolo", "") or "").strip()
-        colore = str(row.get("colore", "") or row.get("codice", "") or "").strip()
+        colore = clean_text(row.get("colore", "")) or clean_text(row.get("codice", ""))
         if not articolo:
             continue  # nothing to price-check on a blank row
 
@@ -787,11 +798,16 @@ def find_price_anomalies(df):
             issue = f"Prezzo Ord. ({prezzo_num:g}) diverso da Prezzo Listini ({prezzo_lisini_num:g})"
 
         if issue:
+            partita = clean_text(row.get("partita", ""))
+            partita_colore = partita or colore or clean_text(row.get("codice", ""))
+            if partita and colore and partita != colore:
+                partita_colore = f"{partita} ({colore})"
             out.append({
                 "cliente": row.get("cliente", ""),
                 "articolo": articolo,
                 "colore": colore,
-                "codice": row.get("codice", "") or colore,
+                "codice": clean_text(row.get("codice", "")) or colore,
+                "partita_colore": partita_colore,
                 "ordine": row.get("ordine", ""),
                 "riga": row.get("riga", ""),
                 "bagno": row.get("bagno", ""),
