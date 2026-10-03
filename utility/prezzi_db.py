@@ -11,6 +11,9 @@ import pandas as pd
 from utility.orders_db import DB_PATH
 
 
+_NUMERIC_COLUMNS = ("LIVELLOLPZ", "PREZZOLPZ")
+
+
 def _connect(db_path: Path | None = None) -> sqlite3.Connection:
     path = Path(db_path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,7 +39,15 @@ def load_prezzi_frame(
         ).fetchone()
         if row is None or row[0] != fingerprint_json:
             return None
-        return pd.read_json(StringIO(row[1]), orient="records", convert_dates=False)
+        # dtype=False: default dtype inference turned colour codes such as
+        # "00123" into the integer 123 (and 1.0 levels into 1), so a frame
+        # read back from this cache differed from a freshly parsed one.
+        # Strings stay strings; only the two real numeric columns are coerced.
+        frame = pd.read_json(StringIO(row[1]), orient="records", convert_dates=False, dtype=False)
+        for column in _NUMERIC_COLUMNS:
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return None
     finally:

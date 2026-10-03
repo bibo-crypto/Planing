@@ -291,6 +291,19 @@ def keep_window_on_top(window) -> None:
             pass
 
 
+def bind_escape_to_close(window, close_command=None) -> None:
+    """Make Escape close a Toplevel (dialog, ticket, report window...) the
+    same as clicking its own Close/X button -- applied once, right after
+    creating any such window, so every sub-window in the app gets this for
+    free instead of each one needing its own binding.
+
+    close_command defaults to window.destroy; pass the window's own
+    close handler instead when it does more than just destroy (e.g.
+    prompts to save, releases a lock) so Escape goes through the exact
+    same path as its Close button, not a shortcut around it."""
+    window.bind("<Escape>", lambda _event, cmd=close_command or window.destroy: cmd())
+
+
 def lazy_call(module_path: str, function_name: str):
     """Return a callable that imports `module_path` on first use and then
     calls `function_name` from it, instead of importing it eagerly.

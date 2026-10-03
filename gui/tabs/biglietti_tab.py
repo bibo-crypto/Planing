@@ -43,7 +43,7 @@ from utility.email_compose import (
     open_outlook_account_setup,
     open_outlook_email,
 )
-from utility.utils import keep_window_on_top
+from utility.utils import keep_window_on_top, bind_escape_to_close
 
 # Filato x Tinturia here follows the same convention as Ordine Kamal/Ordine
 # ELVY: a fixed filename, cleared and rewritten with only this run's rows
@@ -219,6 +219,7 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
         session."""
         template = self.email_templates.get(kind, EmailTemplate())
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         window.title(f"Email Template — {kind.upper().replace('_', ' ')}")
         window.geometry("520x440")
@@ -324,6 +325,7 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
             messagebox.showwarning("Outlook Accounts", "No connected Outlook email accounts were found.")
             return
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         window.title("Change sender email")
         window.transient(self.winfo_toplevel())
@@ -346,6 +348,7 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
         def add_account():
             try:
                 add_window = tk.Toplevel(window)
+                bind_escape_to_close(add_window)
                 keep_window_on_top(add_window)
                 add_window.title("Add / connect email account")
                 add_window.transient(window)

@@ -20,7 +20,7 @@ import calculate.situazione as business_logic
 import calculate.reports as reports
 from calculate.abbina_suggestions import build_suggestions
 from gui.tabs.yarn_shortage_tab import YarnShortageTab
-from utility.utils import keep_window_on_top, logger
+from utility.utils import keep_window_on_top, logger, bind_escape_to_close
 from utility.excel_io import safe_save_workbook
 from .situazione_sources import SOURCE_BUTTON_NAMES, SOURCE_ORDER, SituationSourcesMixin
 from .situazione_refresh import SituationRefreshMixin
@@ -328,6 +328,7 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
             return summary
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         self._child_windows["copertura"] = window
         window.title("Copertura — macchine 3–12")
@@ -469,6 +470,7 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
             return
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         self._child_windows["on_time"] = window
         window.title("On-Time Delivery by Client")
@@ -733,6 +735,7 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
             return
         suggestions = build_suggestions(self.current_df, max_extra_percent=0.20)
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         self._child_windows["abbina"] = window
         window.title("Da abbinare")
@@ -842,6 +845,11 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
                 ).drop_duplicates()
             )
         }
+        # Styling via `for cell in ws[ws.max_row]:` after every append() is
+        # quadratic in row count (`ws[n]` rescans every cell written so far),
+        # so track the row number by hand and write via ws.cell(...) instead.
+        row_num = 1
+        body_font = Font(name="Arial")
         for _, row in suggestions.iterrows():
             group = f"{row.get('codice', '')}|{row.get('colore', '')}|{row.get('motivo', '')}"
             values = [row.get("titolo", ""), row.get("codice", ""), row.get("colore", ""),
@@ -849,11 +857,12 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
                       row.get("abbina", ""), row.get("tot_rocche", ""), row.get("mc_target", ""),
                       row.get("polmoni", ""), f"{row.get('extra_percent', 0):.1%}",
                       row.get("motivo", ""), row.get("new_comment", "")]
-            ws.append(values)
             fill = PatternFill("solid", fgColor=group_colors[group_tags[group]])
-            for cell in ws[ws.max_row]:
+            row_num += 1
+            for col_num, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_num, column=col_num, value=value)
                 cell.fill = fill
-                cell.font = Font(name="Arial")
+                cell.font = body_font
                 cell.alignment = center
                 cell.border = border
 
@@ -895,6 +904,7 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
             window.destroy()
 
         window.protocol("WM_DELETE_WINDOW", on_close)
+        bind_escape_to_close(window, on_close)
         shortage_view.refresh()
 
     # -------------------------------------------------------------- export
@@ -971,7 +981,12 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
 
         red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
         date_format = "dd/mm/yyyy"
+        body_font = Font(name="Arial")
 
+        # Same quadratic-vs-linear reasoning as the Abbina export above:
+        # on a few thousand Situazione rows the old per-row ws.max_row /
+        # ws[ws.max_row] lookups made the export effectively hang.
+        row_num = 1
         for _, r in export_df.iterrows():
             row_values = []
             for key, _header, ctype in COLUMN_SPEC:
@@ -982,15 +997,15 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
                     row_values.append(self._to_date(raw))
                 else:
                     row_values.append(raw if raw not in (None, "") else None)
-            ws.append(row_values)
+            row_num += 1
 
             status = str(r.get("new_comment", ""))
             color = color_for_status(status if not status.startswith("Ritinta") else "Ritinta")
             fill = PatternFill(start_color=color.replace("#", ""), end_color=color.replace("#", ""), fill_type="solid")
-            for col_index, (key, _header, ctype) in enumerate(COLUMN_SPEC, start=1):
-                cell = ws.cell(row=ws.max_row, column=col_index)
+            for col_index, ((key, _header, ctype), value) in enumerate(zip(COLUMN_SPEC, row_values), start=1):
+                cell = ws.cell(row=row_num, column=col_index, value=value)
                 cell.fill = fill
-                cell.font = Font(name="Arial")
+                cell.font = body_font
                 cell.alignment = center
                 cell.border = border
                 if ctype == "date" and cell.value is not None:

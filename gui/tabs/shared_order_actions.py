@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from utility.master_data import raw_articolo_for
 from utility.path_manager import source_path
-from utility.utils import keep_window_on_top
+from utility.utils import keep_window_on_top, bind_escape_to_close
 from .biglietti_exports import (
     RawYarnMatch,
     _filato_rows,
@@ -494,6 +494,7 @@ class SharedOrdersActionsMixin:
             return messagebox.showinfo("Smart Auto-Assign", "No matching raw-yarn stock found in Magazino Filato for current PG-X rows.", parent=parent_window)
 
         preview = tk.Toplevel(parent_window)
+        bind_escape_to_close(preview)
         preview.title("⚡ Smart Auto-Assign Matches")
         preview.geometry("860x460")
         preview.minsize(700, 350)

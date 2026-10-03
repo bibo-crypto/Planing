@@ -40,6 +40,7 @@ from utility.excel_io import safe_save_workbook
 import tkinter as tk
 import threading
 from tkinter import filedialog, messagebox, ttk
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -47,7 +48,7 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from utility.utils import load_settings, parse_number
+from utility.utils import load_settings, parse_number, bind_escape_to_close
 from utility import notifications
 import calculate.situazione as business_logic
 
@@ -392,6 +393,14 @@ def _format_display_dates(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         formatted = parsed.dt.strftime("%d/%m/%Y")
         result[column] = formatted.where(parsed.notna(), original)
     return result
+
+
+def _delivery_due_within_days(delivery_dates: pd.Series, days: int, today=None) -> pd.Series:
+    """Select delivery dates from today through the requested number of days."""
+    dates = pd.to_datetime(delivery_dates, errors="coerce").dt.normalize()
+    start = pd.Timestamp.now().normalize() if today is None else pd.Timestamp(today).normalize()
+    end = start + timedelta(days=days)
+    return dates.notna() & dates.ge(start) & dates.le(end)
 
 
 class OverviewTab(ttk.Frame):
@@ -784,7 +793,14 @@ class OverviewTab(ttk.Frame):
         elvy_df = df.loc[elvy_mask].copy()
         elvy_delivery = pd.to_datetime(elvy_df.get("delivery_date", pd.Series(index=elvy_df.index)), errors="coerce")
         elvy_total_colors = elvy_df["colore"].nunique() if not elvy_df.empty and "colore" in elvy_df else 0
-        elvy_due_colors = int((elvy_delivery.notna() & elvy_delivery.le(pd.Timestamp.now().normalize() + pd.Timedelta(days=DELIVERY_ALERT_DAYS))).sum())
+        today = pd.Timestamp.now().normalize()
+        elvy_due_mask = _delivery_due_within_days(elvy_delivery, DELIVERY_ALERT_DAYS, today)
+        elvy_due_colors = int(elvy_due_mask.sum())
+        elvy_due_df = elvy_df.loc[elvy_due_mask].copy()
+        elvy_due_df["days_to_delivery"] = (
+            elvy_delivery.loc[elvy_due_mask].dt.normalize()
+            - today
+        ).dt.days
         total_yarn_kg = (
             magazino["mag_peso"].sum() if not magazino.empty and "mag_peso" in magazino else 0.0
         )
@@ -809,9 +825,8 @@ class OverviewTab(ttk.Frame):
         self._add_card(5, "📅 Ritardo Consegna", f"{len(delivery_df):,}", alert=True,
                         on_click=lambda: self._open_data_ticket(f"Ritardo consegna / entro {DELIVERY_ALERT_DAYS} giorni (C.Q = OO)", delivery_df, delivery_cols, "ordini_urgenti_consegna.xlsx"))
         elvy_cols = ["articolo", "titolo", "codice", "colore", "prezzo", "ordine", "riga", "data",
-                     "partita", "rocche", "mc", "comment", "cq", "bagno", "new_comment", "delivery_date"]
-        elvy_due_mask = elvy_delivery.notna() & elvy_delivery.le(pd.Timestamp.now().normalize() + pd.Timedelta(days=DELIVERY_ALERT_DAYS))
-        elvy_due_df = elvy_df.loc[elvy_due_mask]
+                     "partita", "rocche", "mc", "comment", "cq", "bagno", "new_comment",
+                     "delivery_date", "days_to_delivery"]
         self._add_card(6, "🎨 Elvy: totale colori", f"{elvy_total_colors:,}",
                         on_click=lambda: self._open_data_ticket("Tutti i colori Elvy", elvy_df, elvy_cols, "colori_elvy.xlsx"))
         self._add_card(7, f"📅 Elvy: entro {DELIVERY_ALERT_DAYS} giorni", f"{elvy_due_colors:,}", alert=elvy_due_colors > 0,
@@ -894,13 +909,18 @@ class OverviewTab(ttk.Frame):
     def _open_machine_schedule(self, machine: int, schedule: pd.DataFrame) -> None:
         """Show the Copertura-ordered dyeing sequence for one machine."""
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         machine_name = business_logic.machine_label(machine)
         window.title(f"Copertura macchine — {machine_name}")
         window.geometry("1180x620")
         window.minsize(850, 420)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
-        ttk.Label(window, text=f"Dyeing schedule for {machine_name} — 2 colors/day; Friday off", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)
+        ttk.Label(
+            window,
+            text=f"Dyeing schedule for {machine_name} — 2 colors/day; Friday off; 3 days for quality/invoice",
+            font=("Segoe UI", 12, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=8)
         toolbar = ttk.Frame(window)
         toolbar.grid(row=0, column=0, sticky="e", padx=10, pady=8)
         search = tk.StringVar()
@@ -908,13 +928,37 @@ class OverviewTab(ttk.Frame):
         entry = ttk.Entry(toolbar, textvariable=search, width=28)
         entry.pack(side="left", padx=5)
         ttk.Button(toolbar, text="Clear", command=lambda: search.set("")).pack(side="left", padx=(5, 0))
-        # Same field order as Situazione Generale's own COLUMN_SPEC.
-        columns = ["cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
-                   "partita", "rocche", "machine", "dye_date", "bagno"]
-        labels = {"dye_date": "Data tintura", "machine": "M/C", "bagno": "Bagno", "colore": "Colore",
-                   "codice": "Codice",
-                   "titolo": "Titolo", "articolo": "Articolo", "partita": "Partita", "rocche": "Rocche",
-                   "cliente": "Cliente", "ordine": "Ordine", "riga": "Riga"}
+        columns = [
+            "cliente", "articolo", "titolo", "codice", "colore", "ordine", "riga",
+            "partita", "rocche", "dye_date", "delivery_target",
+            "delivery_difference", "bagno",
+        ]
+        machine_df = schedule[schedule["machine"] == machine][columns].copy() if not schedule.empty else schedule.reindex(columns=columns)
+        if not machine_df.empty:
+            clients = machine_df["cliente"].map(business_logic._is_elvy_client)
+            if clients.all():
+                delivery_label = "Delivery Date"
+            elif clients.any():
+                delivery_label = "Consegna / Delivery Date"
+            else:
+                delivery_label = "Consegna"
+
+        # Delivery target is Delivery Date for ELVY (3009), Consegna otherwise.
+        labels = {
+            "dye_date": "Data tintura",
+            "delivery_target": delivery_label if not machine_df.empty else "Consegna",
+            "delivery_difference": "Differenza (gg)",
+            "bagno": "Bagno",
+            "colore": "Colore",
+            "codice": "Codice",
+            "titolo": "Titolo",
+            "articolo": "Articolo",
+            "partita": "Partita",
+            "rocche": "Rocche",
+            "cliente": "Cliente",
+            "ordine": "Ordine",
+            "riga": "Riga",
+        }
         tree = ttk.Treeview(window, columns=columns, show="headings")
         sort_state: dict[str, bool] = {}
 
@@ -923,7 +967,12 @@ class OverviewTab(ttk.Frame):
             if machine_df.empty:
                 return
             ascending = sort_state.get(col, True)
-            machine_df = machine_df.sort_values(by=col, ascending=ascending, key=lambda s: s.astype(str))
+            sort_key = (
+                (lambda values: pd.to_numeric(values, errors="coerce"))
+                if col == "delivery_difference"
+                else (lambda values: values.astype(str))
+            )
+            machine_df = machine_df.sort_values(by=col, ascending=ascending, key=sort_key)
             sort_state[col] = not ascending
             render()
 
@@ -935,18 +984,17 @@ class OverviewTab(ttk.Frame):
         scroll.grid(row=1, column=1, sticky="ns")
         tree.configure(yscrollcommand=scroll.set)
 
-        # Select by column NAME (not position) so the Treeview's column
-        # order can never drift out of sync with the row values again --
-        # that mismatch was exactly what swapped M/C and Data tintura before.
-        machine_df = schedule[schedule["machine"] == machine][columns].copy() if not schedule.empty else schedule.reindex(columns=columns)
-        if not machine_df.empty:
-            machine_df["machine"] = machine_name
-
         def render(*_args):
             tree.delete(*tree.get_children())
             term = search.get().strip().casefold()
             for row in machine_df.itertuples(index=False, name=None):
-                values = tuple("" if value is None else value for value in row)
+                values = []
+                for col, value in zip(columns, row):
+                    if col in {"dye_date", "delivery_target"} and value not in (None, ""):
+                        parsed = pd.to_datetime(value, errors="coerce")
+                        value = value if pd.isna(parsed) else parsed.strftime("%d/%m/%Y")
+                    values.append("" if value is None else value)
+                values = tuple(values)
                 if not term or term in " ".join(str(value).casefold() for value in values):
                     tree.insert("", "end", values=values)
         search.trace_add("write", render)
@@ -1007,6 +1055,7 @@ class OverviewTab(ttk.Frame):
         classifies each column's format from its own data -- the same
         pattern used for the Copertura macchine per-machine ticket."""
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         window.title(title)
         window.geometry("1180x620")
         window.minsize(850, 420)
@@ -1031,7 +1080,12 @@ class OverviewTab(ttk.Frame):
             if subset_df.empty:
                 return
             ascending = sort_state.get(col, True)
-            subset_df = subset_df.sort_values(by=col, ascending=ascending, key=lambda s: s.astype(str))
+            sort_key = (
+                (lambda values: pd.to_numeric(values, errors="coerce"))
+                if col == "days_to_delivery"
+                else (lambda values: values.astype(str))
+            )
+            subset_df = subset_df.sort_values(by=col, ascending=ascending, key=sort_key)
             sort_state[col] = not ascending
             render()
 

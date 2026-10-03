@@ -18,7 +18,7 @@ from calculate import prezzi as logic
 from utility.prezzi_cache import load_prezzi_cache, save_prezzi_cache
 from utility.excel_io import safe_save_workbook
 from utility.path_manager import save_source
-from utility.utils import keep_window_on_top, logger
+from utility.utils import keep_window_on_top, logger, bind_escape_to_close
 
 COLUMNS = logic.DISPLAY_COLUMNS
 HEADERS = logic.HEADERS
@@ -453,6 +453,7 @@ class PrezziTab(ttk.Frame):
             self._anomalies_window = None
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         keep_window_on_top(window)
         self._anomalies_window = window
         window.title("Listini — Price Changes (10%+)")

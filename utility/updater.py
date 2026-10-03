@@ -312,6 +312,23 @@ function Restore-Backup {{
     }} catch {{ $_ | Out-File -FilePath $log -Append }}
 }}
 function Start-Planing {{
+    # Planing.exe itself should never run as Administrator ongoing -- only
+    # copying into Program Files needs that. When this whole script runs
+    # elevated (see _needs_elevation/_run_update_script), a plain
+    # Start-Process would launch Planing.exe elevated too, and an elevated
+    # GUI started from a background context is subject to Windows'
+    # focus-stealing prevention: it runs but never comes to the front,
+    # which looks exactly like "the app did not reopen". Shell.Application's
+    # ShellExecute hands the launch to the already-running, non-elevated
+    # explorer.exe instead, so the new process gets a normal-user token.
+    # It doesn't return a PID, so success here just means "launch was
+    # requested"; the caller's own wait loop (polls by process name, up to
+    # 3 minutes) is what confirms it actually came up.
+    try {{
+        $shellApp = New-Object -ComObject "Shell.Application"
+        $shellApp.ShellExecute($exePath, "", $target, "open", 1)
+        return $true
+    }} catch {{ $_ | Out-File -FilePath $log -Append }}
     try {{
         $started = Start-Process -FilePath $exePath -WorkingDirectory $target -PassThru -ErrorAction Stop
         Start-Sleep -Seconds 2

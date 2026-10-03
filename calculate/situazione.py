@@ -699,10 +699,15 @@ def compute_machine_totals(situation_df, copertura_df) -> dict[int, int]:
 def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFrame:
     """Build the dyeing queue in Copertura order, two colors per machine/day.
 
-    Friday is skipped.  The queue is joined by normalized Bagno, while the
-    displayed color/order fields come from Situazione Generale.
+    Friday is skipped. Delivery target is Delivery Date for ELVY and Consegna
+    for other clients. The delivery difference is target minus the dye date
+    plus three calendar days for quality checks and invoicing.
     """
-    columns = ["machine", "dye_date", "bagno", "colore", "titolo", "articolo", "partita", "rocche", "cliente", "ordine", "riga", "codice"]
+    columns = [
+        "machine", "dye_date", "delivery_target", "delivery_difference",
+        "bagno", "colore", "titolo", "articolo", "partita", "rocche",
+        "cliente", "ordine", "riga", "codice",
+    ]
     if situation_df is None or situation_df.empty or copertura_df is None or copertura_df.empty:
         return pd.DataFrame(columns=columns)
     if not {"bagno", "machine"}.issubset(copertura_df.columns) or "bagno" not in situation_df.columns:
@@ -733,6 +738,19 @@ def build_machine_schedule(situation_df, copertura_df, today=None) -> pd.DataFra
                 day += timedelta(days=1)
     merged["dye_date"] = merged.index.map(lambda idx: dates[idx].strftime("%Y-%m-%d"))
     merged["machine"] = merged["_machine_number"].astype(int)
+    def delivery_target(row):
+        field = "delivery_date" if _is_elvy_client(row.get("cliente", "")) else "consegna"
+        return clean_text(row.get(field, ""))
+
+    merged["delivery_target"] = merged.apply(delivery_target, axis=1)
+    def delivery_difference(row):
+        dye_date = _parse_delivery_date(row["dye_date"])
+        target_date = _parse_delivery_date(row["delivery_target"])
+        if dye_date is None or target_date is None:
+            return ""
+        return int((target_date - (dye_date + timedelta(days=3))).days)
+
+    merged["delivery_difference"] = merged.apply(delivery_difference, axis=1)
     for col in columns:
         if col not in merged.columns:
             merged[col] = ""

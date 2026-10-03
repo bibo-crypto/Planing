@@ -15,8 +15,9 @@ Not replicated (left as follow-ups, flagged rather than guessed at):
   rule keyed off a starting Bagno letter+number that isn't available yet).
 - The exact Prezzo lookup key the macro uses (Colore + a category "type"
   derived from an external Category Colori.xlsx this session doesn't have
-  visibility into) -- Prezzo here reuses the same Articolo+Codice Listini
-  lookup Biglietti already uses, which is close but not proven identical.
+  visibility into) -- Prezzo here reuses Biglietti's Articolo+Codice Listini
+  lookup, with an article-and-colour-description fallback for MED order
+  colour codes that differ from Listini codes.
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ from typing import Any
 
 import openpyxl
 
-from exporters.biglietti_exporter import _clean, _get, _key, _number, _read_sheet_rows  # noqa: F401 -- shared normalization helpers
+from exporters.biglietti_exporter import (
+    _clean, _get, _key, _number, _prezzo_match_for, _read_sheet_rows,
+)  # noqa: F401 -- shared normalization helpers
 from calculate.constants import ABBINA_MACHINE_CODES
 from utility.master_data import raw_articolo_for
 
@@ -244,14 +247,22 @@ def assign_consegna(records: list[OrdineMedRow], machine_totals: dict[int, int])
 
 
 # ---------------------------------------------------------------------------
-# Prezzo -- reuses the same Articolo+Codice Listini lookup Biglietti uses.
+# Prezzo -- use Biglietti's Listini lookup, falling back to a unique matching
+# colour description when the MED order's colour code differs from Listini.
 # ---------------------------------------------------------------------------
 
 def compute_prezzo(records: list[OrdineMedRow], price_lookup: dict[tuple, tuple]) -> None:
     for r in records:
-        key = (r.articolo, r.colore)
-        if key in price_lookup:
-            r.livello, r.prezzo = price_lookup[key]
+        prezzo, _, _, livello = _prezzo_match_for(r.articolo, r.colore, price_lookup)
+        if prezzo in ("", None) and r.descr_col:
+            description_key = (
+                "__ARTICLE_COLOR_DESCRIPTION__",
+                _clean(r.articolo).upper(),
+                _clean(r.descr_col).casefold(),
+            )
+            livello, prezzo = price_lookup.get(description_key, (None, None))
+        r.prezzo = "" if prezzo is None else prezzo
+        r.livello = "" if livello is None else livello
 
 
 # Machines (by their Rocche-based M/C total) that get a $2 surcharge on

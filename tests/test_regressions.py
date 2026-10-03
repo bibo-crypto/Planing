@@ -65,6 +65,36 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(schedule.loc[0, "codice"], "00123")
         self.assertEqual(schedule.loc[0, "colore"], "Blu")
 
+    def test_machine_schedule_uses_elvy_delivery_date_and_three_day_buffer(self):
+        from calculate.situazione import build_machine_schedule
+
+        situation = pd.DataFrame([
+            {
+                "bagno": "B-1", "cliente": "3009", "articolo": "C130001S",
+                "consegna": "2026-10-10", "delivery_date": "2026-10-15",
+            },
+            {
+                "bagno": "B-2", "cliente": "3004", "articolo": "C010001S",
+                "consegna": "2026-10-18", "delivery_date": "2026-10-12",
+            },
+        ])
+        copertura = pd.DataFrame([
+            {"bagno": "B-1", "machine": "3309"},
+            {"bagno": "B-2", "machine": "3309"},
+        ])
+
+        schedule = build_machine_schedule(
+            situation, copertura, today=date(2026, 10, 5)
+        )
+
+        elvy = schedule.loc[schedule["cliente"] == "3009"].iloc[0]
+        other = schedule.loc[schedule["cliente"] == "3004"].iloc[0]
+        self.assertEqual(elvy["delivery_target"], "2026-10-15")
+        self.assertEqual(other["delivery_target"], "2026-10-18")
+        self.assertEqual(elvy["dye_date"], "2026-10-05")
+        self.assertEqual(elvy["delivery_difference"], 7)
+        self.assertEqual(other["delivery_difference"], 10)
+
     def test_situazione_densita_uses_raw_batch_from_pg_comment(self):
         from gui.tabs.situazione_tab import SituazioneTab
 
@@ -95,6 +125,36 @@ class PlanningRegressionTests(unittest.TestCase):
                 result, _pending = tab._recompute_prezzo_densita_for_frame(frame)
 
         self.assertEqual(result.loc[0, "densita"], 378)
+
+    def test_situazione_price_uses_category_for_new_article_and_zero_padded_color(self):
+        from calculate.prezzi import build_price_lookup
+        from gui.tabs.situazione_tab import SituazioneTab
+
+        tab = object.__new__(SituazioneTab)
+        tab._on_notification = None
+        frame = pd.DataFrame([{
+            "articolo": "C010006S",
+            "codice": "141",
+            "colore": "Cielo",
+            "partita": "158877",
+            "prezzo": "",
+            "mc": 672,
+            "comment": "",
+        }])
+        price_lookup = build_price_lookup(pd.DataFrame([
+            {"CLARTICOLO": "C010003S", "CLCOLORE": "000141", "LIVELLOLPZ": 66,
+             "PREZZOLPZ": 5.39, "CATEGORY": "MED-Cottone"},
+            {"CLARTICOLO": "C010005S", "CLCOLORE": "000141", "LIVELLOLPZ": 66,
+             "PREZZOLPZ": 5.39, "CATEGORY": "MED-Cottone"},
+        ]))
+
+        with patch(
+            "exporters.biglietti_exporter.load_prezzo_lookup",
+            return_value=(price_lookup, "LISTINI.xlsx"),
+        ):
+            result, _pending = tab._recompute_prezzo_densita_for_frame(frame)
+
+        self.assertEqual(result.loc[0, "prezzo_lisini"], 5.39)
 
     def test_machine_lookup_rejects_empty_counts(self):
         self.assertEqual(_machine_for_count(None), "")
@@ -285,6 +345,18 @@ class PlanningRegressionTests(unittest.TestCase):
         frame = pd.DataFrame([{"cliente": "3004", "data": "2026-09-07", "mc": 24}])
         result = compute_delivery_dates(frame)
         self.assertEqual(result.loc[0, "delivery_date"], "")
+
+    def test_elvy_within_three_days_ticket_excludes_past_and_later_dates(self):
+        from gui.tabs.overview_tab import _delivery_due_within_days
+
+        dates = pd.Series([
+            "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-06",
+            "2026-10-07", "",
+        ])
+
+        mask = _delivery_due_within_days(dates, 3, today=date(2026, 10, 3))
+
+        self.assertEqual(mask.tolist(), [False, True, True, True, False, False])
 
     def test_master_import_recognizes_lotto_serial_filename(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -495,7 +567,53 @@ class PlanningRegressionTests(unittest.TestCase):
     def test_price_lookup_cache_reuses_same_source(self):
         import exporters.biglietti_exporter as biglietti_exporter
         self.assertTrue(hasattr(biglietti_exporter, "_PREZZO_LOOKUP_CACHE"))
-        self.assertTrue(hasattr(biglietti_exporter, "_ARTICOLI_MARCA_CACHE"))
+
+    def test_articoli_marca_map_is_disk_cached(self):
+        # load_articoli_marca_map used to have its own bespoke in-memory-
+        # only cache (_ARTICOLI_MARCA_CACHE); it's now on the same shared,
+        # persistent (survives an app restart) disk_cache every other
+        # heavy Excel loader uses -- verify a second call for the exact
+        # same file returns the identical dict object (the in-memory hit
+        # path), not just an equal one, and that a real cache file lands
+        # on disk for it (the persistence half of the same guarantee).
+        from exporters.biglietti_exporter import load_articoli_marca_map
+        from utility import disk_cache
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "Articoli.xlsx"
+            wb = openpyxl.Workbook()
+            ws1 = wb.active
+            ws1.title = "Sheet1"
+            ws2 = wb.create_sheet("Sheet2")
+            ws2.append(["Articolo Filato", "Marca"])
+            ws2.append(["G010032S", "100/2 - COTTON 100%"])
+            wb.save(path)
+
+            disk_cache.invalidate("articoli_marca")
+            first, errors = load_articoli_marca_map(path)
+            self.assertEqual(errors, [])
+            self.assertEqual(first["G010032S"], "100/2 - COTTON 100%")
+
+            second, _errors = load_articoli_marca_map(path)
+            self.assertIs(first, second)  # in-memory cache hit, not just an equal dict
+
+            key = disk_cache.file_cache_key(path)
+            self.assertTrue(disk_cache._cache_path("articoli_marca", key).is_file())
+
+    def test_disk_cache_directory_failure_falls_back_to_loader(self):
+        from utility import disk_cache
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.xlsx"
+            source.touch()
+            with patch(
+                "utility.disk_cache._cache_path",
+                side_effect=PermissionError("cache directory is read-only"),
+            ):
+                result = disk_cache.cached_load("unwritable-test", source, lambda: "loaded")
+
+        self.assertEqual(result, "loaded")
 
     def test_filato_rows_uses_order_total_rocche_and_scaled_magazino_peso(self):
         # Rocche always comes from the order itself now -- stock was
@@ -838,6 +956,63 @@ class PlanningRegressionTests(unittest.TestCase):
         )
         compute_check_articolo([record], {("G130027S", "324229")})
         self.assertEqual(record.check_articolo, "")
+
+    def test_med_price_lookup_matches_color_description_when_codes_differ(self):
+        from calculate.prezzi import build_price_lookup
+        from pipelines.ordine_med import OrdineMedRow, compute_prezzo, compute_prezzo_plus2
+
+        record = OrdineMedRow(
+            riga=1, code_org="C010034S", titolo="", descr_col="FLEUR", articolo="C010034S",
+            colore="806", rocc=1, abbin="", consegna_input=None, pt_grg="",
+            pt_med="", polmoni="", cliente_note="", nota_grg="", nota_col="",
+            kg_note="", fabb=None, prezz_note=None, mc=56,
+        )
+        ambiguous_record = OrdineMedRow(
+            riga=2, code_org="C010878S", titolo="", descr_col="@PERLANA", articolo="C010878S",
+            colore="7777", rocc=1, abbin="", consegna_input=None, pt_grg="",
+            pt_med="", polmoni="", cliente_note="", nota_grg="", nota_col="",
+            kg_note="", fabb=None, prezz_note=None, mc=56,
+        )
+        price_lookup = build_price_lookup(pd.DataFrame([
+            {
+                "CLARTICOLO": "C010034S", "CLCOLORE": "000806", "CLDESCR": "FLEUR",
+                "LIVELLOLPZ": 59, "PREZZOLPZ": 4.47,
+            },
+            {
+                "CLARTICOLO": "C010878S", "CLCOLORE": "001115", "CLDESCR": "@PERLANA",
+                "LIVELLOLPZ": 60, "PREZZOLPZ": 4.59,
+            },
+            {
+                "CLARTICOLO": "C010878S", "CLCOLORE": "091115", "CLDESCR": "@PERLANA",
+                "LIVELLOLPZ": 61, "PREZZOLPZ": 4.72,
+            },
+        ]))
+
+        records = [record, ambiguous_record]
+        compute_prezzo(records, price_lookup)
+        compute_prezzo_plus2(records)
+
+        self.assertEqual(record.livello, 59)
+        self.assertEqual(record.prezzo, 4.47)
+        self.assertEqual(record.prezzo_plus2, 6.47)
+        self.assertEqual(ambiguous_record.livello, "")
+        self.assertEqual(ambiguous_record.prezzo, "")
+
+        from pipelines.ordine_med import export_ordine_med_workbook
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "Ordine_MED.xlsx"
+            export_ordine_med_workbook(output, records, [])
+            workbook = openpyxl.load_workbook(output, data_only=True)
+            worksheet = workbook["Ordine da creare"]
+            exported_headers = {
+                cell.value: worksheet.cell(row=2, column=cell.column).value
+                for cell in worksheet[1]
+            }
+            workbook.close()
+
+        self.assertEqual(exported_headers["LIVELLO"], 59)
+        self.assertEqual(exported_headers["PREZZO"], 4.47)
+        self.assertEqual(exported_headers["PREZZO + 2$"], 6.47)
 
     def test_excel_export_keeps_yarn_waiting_comment(self):
         workbook = openpyxl.Workbook()
@@ -1206,6 +1381,58 @@ class PlanningRegressionTests(unittest.TestCase):
             # = 'Stop' must not skip relaunching something entirely).
             self.assertEqual(script.count("Restore-Backup"), 4)  # 1 definition + 3 call sites
 
+    def test_install_update_relaunches_de_elevated(self):
+        # Regression guard for the real-world symptom this was built to
+        # catch: after the elevation fix made updates actually succeed
+        # (see test_install_update_elevates_when_install_dir_unwritable),
+        # the app stopped reopening on its own afterwards -- a plain
+        # Start-Process for Planing.exe, called from a script that may
+        # itself be running elevated, launches Planing.exe elevated too,
+        # and Windows' focus-stealing prevention can leave that window
+        # never visibly coming to the front. Every relaunch (success and
+        # every rollback path) must go through the Shell.Application-based
+        # de-elevated launch, and the one legitimate raw Start-Process left
+        # (Start-PlaningNormally's own fallback if COM is unavailable) must
+        # not recurse into itself.
+        import sys
+        import zipfile
+        from unittest.mock import patch
+        import utility.updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            zip_path = temp_dir / "update.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("Planing/Planing.exe", "fake exe bytes")
+            install_dir = temp_dir / "install"
+            install_dir.mkdir()
+
+            captured = {}
+
+            def fake_popen(args, **kwargs):
+                captured["script"] = Path(args[-1]).read_text(encoding="utf-8")
+                return object()
+
+            with patch.object(sys, "frozen", True, create=True), patch("subprocess.Popen", side_effect=fake_popen):
+                updater.install_update(zip_path, install_dir, "2.0.0")
+
+            script = captured["script"]
+            self.assertIn("function Start-Planing", script)
+            self.assertNotIn("Start-PlaningNormally", script)
+            # De-elevated launch through the non-elevated explorer shell comes first...
+            self.assertIn('New-Object -ComObject "Shell.Application"', script)
+            self.assertIn("ShellExecute($exePath", script)
+            # ...and every relaunch site (success + 3 rollback/failure paths) goes
+            # through the wrapper: 1 definition + 4 call sites.
+            self.assertEqual(script.count("Start-Planing"), 5)
+            # Raw Start-Process / cmd start for $exePath live only inside the wrapper's fallbacks.
+            wrapper_start = script.index("function Start-Planing")
+            wrapper_end = script.index("\ntry {", wrapper_start)  # next top-level statement after the function
+            for needle in ("Start-Process -FilePath $exePath", "Start-Process -FilePath 'cmd.exe'"):
+                if needle in script:
+                    self.assertGreater(script.index(needle), wrapper_start)
+                    self.assertLess(script.index(needle), wrapper_end)
+
     def test_install_update_detaches_helper_from_any_job_object(self):
         # Regression guard: if Planing.exe runs inside a Windows Job Object
         # (some launchers/security software do this), closing the parent
@@ -1350,7 +1577,3 @@ class PlanningRegressionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 download_installer(release)
         self.assertIn("corrupt", str(ctx.exception).lower())
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -431,25 +431,34 @@ class MagazinoFilatoTab(ttk.Frame):
         center = Alignment(horizontal="center", vertical="center")
         header_fill = PatternFill(start_color="16324F", end_color="16324F", fill_type="solid")
 
+        header_font = Font(bold=True, name="Arial", color="FFFFFF")
+        body_font = Font(name="Arial")
         wb = Workbook()
         ws = wb.active
         ws.title = "Magazino Filato"
         ws.append([HEADERS[c] for c in COLUMNS])
         for cell in ws[1]:
-            cell.font = Font(bold=True, name="Arial", color="FFFFFF")
+            cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
             cell.border = border
 
+        # Styling via `for cell in ws[ws.max_row]:` after every append()
+        # is quadratic in row count -- `ws[n]` recomputes max_column by
+        # rescanning every cell written so far. Tracking (row, column)
+        # numbers by hand and writing via ws.cell(...) instead keeps this
+        # linear (same fix, same reasoning, as calculate/prezzi.py's
+        # export -- see gui/tabs/prezzi_tab.py's own comment on this).
+        row_num = 1
         for _, r in self.summary_df.iterrows():
             lotto_val = r.get("lotto", "")
             lotto_val = "" if pd.isna(lotto_val) else lotto_val
-            ws.append([
-                r["articolo"], r.get("titolo", ""), r["partita"],
-                r["mag_rocche"], r["mag_peso"], lotto_val,
-            ])
-            for cell in ws[ws.max_row]:
-                cell.font = Font(name="Arial")
+            row_num += 1
+            for col_num, value in enumerate(
+                [r["articolo"], r.get("titolo", ""), r["partita"], r["mag_rocche"], r["mag_peso"], lotto_val], start=1
+            ):
+                cell = ws.cell(row=row_num, column=col_num, value=value)
+                cell.font = body_font
                 cell.alignment = center
                 cell.border = border
 

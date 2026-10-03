@@ -225,6 +225,14 @@ def load_articoli_marca_map(path: Path) -> tuple[dict[str, str], list[str]]:
     '100/2 - COTTON 100%') -- confirmed against real data as the actual
     source for the ticket's Titolo, NOT the shorter 'TITOLO' column that
     Situazione's own Articoli upload uses."""
+    from utility import disk_cache
+    return disk_cache.cached_load(
+        "articoli_marca", path, lambda: _load_articoli_marca_map_uncached(path),
+        is_valid=lambda result: bool(result[0]),
+    )
+
+
+def _load_articoli_marca_map_uncached(path: Path) -> tuple[dict[str, str], list[str]]:
     errors: list[str] = []
     out: dict[str, str] = {}
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
@@ -242,13 +250,14 @@ def load_articoli_marca_map(path: Path) -> tuple[dict[str, str], list[str]]:
     return out, errors
 
 
-_ARTICOLI_MARCA_CACHE: tuple[str, int, int, dict[str, str]] | None = None
-
-
 def load_articoli_marca_lookup() -> dict[str, str]:
     """Convenience: re-read whatever Articoli.xlsx was last uploaded via
     the Biglietti tab's own Articoli button (path cached in
-    articoli_cache.py), returning {} if none has been uploaded yet."""
+    articoli_cache.py), returning {} if none has been uploaded yet.
+    load_articoli_marca_map is itself disk-cached (see utility.disk_cache),
+    so repeat calls across tabs -- or across app restarts, for an
+    unchanged file -- skip the Excel parse without needing a second cache
+    layer here."""
     try:
         import utility.articoli_cache as articoli_cache
     except Exception:
@@ -257,14 +266,7 @@ def load_articoli_marca_lookup() -> dict[str, str]:
     path = cache.get("source_path")
     if not path or not Path(path).is_file():
         return {}
-    source = Path(path)
-    stat = source.stat()
-    cache_key = (str(source), stat.st_mtime_ns, stat.st_size)
-    global _ARTICOLI_MARCA_CACHE
-    if _ARTICOLI_MARCA_CACHE and _ARTICOLI_MARCA_CACHE[:3] == cache_key:
-        return _ARTICOLI_MARCA_CACHE[3]
-    marca_map, _errors = load_articoli_marca_map(source)
-    _ARTICOLI_MARCA_CACHE = (*cache_key, marca_map)
+    marca_map, _errors = load_articoli_marca_map(Path(path))
     return marca_map
 
 
@@ -370,25 +372,25 @@ def compute_delivery_date(records: list["OrderRecord"]) -> None:
 def _prezzo_match_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) -> tuple[Any, bool, str, Any]:
     if not lookup:
         return "", False, "", None
+    from calculate.prezzi import _price_color_key, _price_color_variants
+
     article = _clean(articolo).upper()
     code = _clean(codice)
-    if not (code.isdigit() and len(code) > 1 and code.startswith("0")):
-        try:
-            code_number = float(code.replace(",", "."))
-            code = str(int(code_number)) if code_number.is_integer() else code
-        except (TypeError, ValueError):
-            pass
-    if code.isdigit() and len(code) < 5:
-        code = code.zfill(5)
-    for key in ((article, code), (_clean(articolo), _clean(codice))):
-        if key in lookup:
+    direct_matches: list[tuple[Any, Any]] = []
+    for color_variant in _price_color_variants(code):
+        for key in ((article, color_variant), (_clean(articolo), color_variant)):
+            if key not in lookup:
+                continue
             level, price = lookup[key]
             try:
                 has_price = price is not None and float(price) != 0
             except (TypeError, ValueError):
                 has_price = bool(_clean(price))
-            if has_price:
-                return price, False, "", level
+            if has_price and (level, price) not in direct_matches:
+                direct_matches.append((level, price))
+    if len(direct_matches) == 1:
+        level, price = direct_matches[0]
+        return price, False, "", level
     category = lookup.get(("__ARTICLE_CATEGORY__", article), "")
     if not category:
         try:
@@ -396,7 +398,15 @@ def _prezzo_match_for(articolo: str, codice: str, lookup: dict[tuple, tuple]) ->
         except Exception:
             category = ""
     if category:
-        value = lookup.get(("__CATEGORY__", code, str(category).casefold()))
+        category_key = str(category).casefold()
+        value = next(
+            (
+                lookup[("__CATEGORY__", color_variant, category_key)]
+                for color_variant in _price_color_variants(code)
+                if ("__CATEGORY__", color_variant, category_key) in lookup
+            ),
+            None,
+        )
         if value:
             level, price = value
             if price is not None and price != 0:
@@ -443,6 +453,14 @@ def apply_machine_surcharge(price: Any, machine: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def load_densita_query(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]]:
+    from utility import disk_cache
+    return disk_cache.cached_load(
+        "densita_query", path, lambda: _load_densita_query_uncached(path),
+        is_valid=lambda result: bool(result[0]),
+    )
+
+
+def _load_densita_query_uncached(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]]:
     errors: list[str] = []
     out: dict[int, dict[str, Any]] = {}
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
@@ -488,6 +506,14 @@ def load_vmm22_ratio_from_magazino(path: Path) -> tuple[dict[int, float], list[s
     upload needed. Per Partita: sum ESISTENZA (kg) and COLLI (cones)
     across MAGAZZINO 900910, 900160 and 900923, ratio = kg per cone.
     VMM22 for an order line = that ratio * the line's own Rocche."""
+    from utility import disk_cache
+    return disk_cache.cached_load(
+        "vmm22_ratio", path, lambda: _load_vmm22_ratio_from_magazino_uncached(path),
+        is_valid=lambda result: bool(result[0]),
+    )
+
+
+def _load_vmm22_ratio_from_magazino_uncached(path: Path) -> tuple[dict[int, float], list[str]]:
     errors: list[str] = []
     totals: dict[int, list[float]] = {}  # partita -> [esistenza_sum, colli_sum]
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)

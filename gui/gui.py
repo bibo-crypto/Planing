@@ -41,7 +41,7 @@ from utility.updater import APP_VERSION, ReleaseInfo, check_for_updates_async, d
 from utility import notifications
 from utility.backup import create_backup, restore_backup
 from gui.modern_widgets import RoundedButton
-from utility.utils import keep_window_on_top
+from utility.utils import keep_window_on_top, bind_escape_to_close
 
 # Keep the existing button call sites and their commands, but render them as
 # rounded pill controls throughout the application.
@@ -641,6 +641,7 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
 
     def _open_notifications(self) -> None:
         win = tk.Toplevel(self)
+        bind_escape_to_close(win)
         win.title("Notifications")
         win.geometry("860x380")
         win.minsize(680, 280)

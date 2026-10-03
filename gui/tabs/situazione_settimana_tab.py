@@ -415,13 +415,20 @@ class SettimanaTab(ttk.Frame):
 
         summary = summary.sort_values(["cliente", "week_of_year", "machine_name"])
         clientes_seen = []
+        # Styling via `for cell in ws[ws.max_row]:` after every append() is
+        # quadratic in row count -- `ws[n]` recomputes max_column by
+        # rescanning every cell written so far. Tracking the row number by
+        # hand and writing via ws.cell(...) instead keeps this linear (same
+        # fix, same reasoning, as gui/tabs/prezzi_tab.py's own export).
+        row_num = 1
         for _, r in summary.iterrows():
             if r["cliente"] not in clientes_seen:
                 clientes_seen.append(r["cliente"])
             shade = customer_fills[clientes_seen.index(r["cliente"]) % 2]
-            ws.append([r["cliente"], int(r["week_of_year"]), r["machine_name"],
-                       r["total_peso"], int(r["batch_count"])])
-            for cell in ws[ws.max_row]:
+            row_num += 1
+            values = [r["cliente"], int(r["week_of_year"]), r["machine_name"], r["total_peso"], int(r["batch_count"])]
+            for col_num, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_num, column=col_num, value=value)
                 cell.fill = shade
                 cell.font = Font(name="Arial")
                 cell.alignment = center

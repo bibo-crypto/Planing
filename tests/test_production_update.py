@@ -119,6 +119,33 @@ def test_color_code_lookup_pads_to_five_digits():
     assert ("C100", "00123") in lookup
 
 
+def test_price_match_handles_six_digit_listini_color_after_excel_drops_zeros():
+    from exporters.biglietti_exporter import prezzo_match_for
+
+    lookup = prezzi.build_price_lookup(pd.DataFrame([{
+        "CLARTICOLO": "C010034S", "CLCOLORE": "000141",
+        "LIVELLOLPZ": 66, "PREZZOLPZ": 5.39, "CATEGORY": "MED-Lino-23/1",
+    }]))
+
+    assert prezzo_match_for("C010034S", "141", lookup) == (5.39, False, "", 66)
+
+
+def test_new_article_uses_category_price_with_six_digit_color():
+    from exporters.biglietti_exporter import prezzo_match_for
+
+    frame = pd.DataFrame([
+        {"CLARTICOLO": "C010003S", "CLCOLORE": "000141", "LIVELLOLPZ": 66,
+         "PREZZOLPZ": 5.39, "CATEGORY": "MED-Cottone"},
+        {"CLARTICOLO": "C010005S", "CLCOLORE": "000141", "LIVELLOLPZ": 66,
+         "PREZZOLPZ": 5.39, "CATEGORY": "MED-Cottone"},
+    ])
+    lookup = prezzi.build_price_lookup(frame)
+
+    assert prezzo_match_for("C010006S", "141", lookup) == (
+        5.39, True, "MED-Cottone", 66
+    )
+
+
 def test_prezzi_color_search_prefers_exact_zero_padded_code_over_partial_matches():
     from gui.tabs.prezzi_tab import _filter_color_code
 
@@ -164,12 +191,14 @@ def test_price_changes_preserve_history_and_category_findings():
 
     result = prezzi.detect_price_anomalies(frame)
 
-    assert len(result) == 3
-    assert set(result["changed_on"]) == {"2025-02-01", "Category rule", "Category suggestion"}
+    # A was simply repriced 10 -> 12: that is history, not a category conflict
+    # with itself, and the suggestion for B uses the price now in force (12).
+    assert len(result) == 2
+    assert set(result["changed_on"]) == {"2025-02-01", "Category suggestion"}
     historical = result[result["issue"] == "Historical price change"].iloc[0]
     assert historical["pct_change"] == 20.0
     suggestion = result[result["changed_on"] == "Category suggestion"].iloc[0]
-    assert suggestion["issue"] == "Missing category price; suggested 10.00 / level 1"
+    assert suggestion["issue"] == "Missing category price; suggested 12.00 / level 1"
 
 
 def test_price_validation_reports_conflicts_and_suspicious_prices():
@@ -266,3 +295,180 @@ def test_normalized_snapshot_round_trip(tmp_path, monkeypatch):
     conn = sqlite3.connect(db_path)
     assert conn.execute("SELECT COUNT(*) FROM source_snapshot_row").fetchone()[0] == 1
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Category logic hardening (review of prezzi category design)
+# ---------------------------------------------------------------------------
+
+def _rows(article, items):
+    return [
+        {"CLARTICOLO": article, "CLCOLORE": c, "LIVELLOLPZ": lv, "PREZZOLPZ": p}
+        for c, lv, p in items
+    ]
+
+
+def test_article_without_any_listini_row_gets_category_price_from_reference_map():
+    from exporters.biglietti_exporter import prezzo_match_for
+
+    # C010003S / C010005S / C010006S are all MED-COTTONE in the reference map;
+    # C010006S has no Listini row at all (never dyed before).
+    frame = prezzi.enrich_categories(pd.DataFrame(
+        _rows("C010003S", [("00101", 1, 4.0)]) + _rows("C010005S", [("00101", 1, 4.0)])
+    ))
+    lookup = prezzi.build_price_lookup(frame)
+
+    assert prezzo_match_for("C010006S", "101", lookup)[:3] == (4.0, True, "MED-Cottone")
+
+
+def test_category_lookup_works_for_g_prefixed_twin_of_mapped_article():
+    from exporters.biglietti_exporter import prezzo_match_for
+
+    frame = prezzi.enrich_categories(pd.DataFrame(_rows("C010003S", [("00101", 1, 4.0)])))
+    lookup = prezzi.build_price_lookup(frame)
+
+    assert prezzo_match_for("G010006S", "101", lookup)[:3] == (4.0, True, "MED-Cottone")
+    assert prezzi.category_for_article("G010006S") == "MED-Cottone"
+
+
+def test_category_price_does_not_depend_on_row_order_and_ties_offer_no_price():
+    rows = _rows("C010003S", [("00101", 1, 4.0)]) + _rows("C010005S", [("00101", 1, 5.0)])
+    forward = prezzi.build_price_lookup(prezzi.enrich_categories(pd.DataFrame(rows)))
+    backward = prezzi.build_price_lookup(prezzi.enrich_categories(pd.DataFrame(rows[::-1])))
+
+    key = ("__CATEGORY__", "00101", "med-cottone")
+    assert key not in forward and key not in backward  # 1 vs 1 -> ambiguous
+
+    rows += _rows("C010006S", [("00101", 1, 5.0)])
+    majority = prezzi.build_price_lookup(prezzi.enrich_categories(pd.DataFrame(rows)))
+    assert majority[key] == (1, 5.0)
+
+
+def test_unknown_article_with_a_single_coincidental_colour_match_is_flagged_for_review():
+    frame = pd.DataFrame(
+        _rows("C010003S", [("00101", 1, 4.0), ("00102", 1, 4.5)])
+        + _rows("C010032S", [("00101", 1, 9.0)])
+        + _rows("C010999S", [("00101", 1, 4.0), ("00777", 1, 6.0)])  # 1 of 2 colours matches
+    )
+
+    result = prezzi.enrich_categories(frame)
+
+    unknown = result[result["CLARTICOLO"] == "C010999S"]
+    assert (unknown["CATEGORY"] == "").all()
+    assert unknown["_CATEGORY_REVIEW"].all()
+
+
+def test_prezzi_sqlite_cache_keeps_leading_zero_colour_codes(tmp_path):
+    from utility.prezzi_db import load_prezzi_frame, save_prezzi_frame
+
+    fingerprint = (7, "listini.xlsx", 1, 2, None)
+    frame = pd.DataFrame({
+        "CLARTICOLO": ["C100", "C101"], "CLCOLORE": ["00123", "012345"],
+        "LIVELLOLPZ": [1.0, None], "PREZZOLPZ": [3.25, None],
+    })
+    db_path = tmp_path / "cache.sqlite3"
+    save_prezzi_frame(fingerprint, frame, db_path)
+
+    loaded = load_prezzi_frame(fingerprint, db_path)
+
+    assert loaded["CLCOLORE"].tolist() == ["00123", "012345"]
+    assert loaded["PREZZOLPZ"].iloc[0] == 3.25 and pd.isna(loaded["PREZZOLPZ"].iloc[1])
+
+
+def test_listini_cache_fingerprint_changes_with_reference_map(monkeypatch):
+    before = prezzi.reference_map_fingerprint()
+    assert before is not None
+    monkeypatch.setattr(prezzi, "_REFERENCE_MAP_PATH", prezzi._REFERENCE_MAP_PATH.with_name("missing.json"))
+    assert prezzi.reference_map_fingerprint() is None
+
+
+def test_reference_category_map_reloads_when_file_changes(tmp_path, monkeypatch):
+    path = tmp_path / "category-map.json"
+    path.write_text('{"A-One": ["C1"]}', encoding="utf-8")
+    monkeypatch.setattr(prezzi, "_REFERENCE_MAP_PATH", path)
+    prezzi._load_reference_category_map.cache_clear()
+    try:
+        assert prezzi._reference_category_map() == {"C1": "A-One"}
+
+        path.write_text('{"Category-Long": ["C1"]}', encoding="utf-8")
+
+        assert prezzi._reference_category_map() == {"C1": "Category-Long"}
+    finally:
+        prezzi._load_reference_category_map.cache_clear()
+
+
+def test_missing_reference_map_does_not_stop_listini_from_loading(tmp_path, monkeypatch):
+    monkeypatch.setattr(prezzi, "_REFERENCE_MAP_PATH", tmp_path / "missing.json")
+    prezzi._load_reference_category_map.cache_clear()
+    try:
+        frame = pd.DataFrame(_rows("C010003S", [("00101", 1, 4.0)]))
+        result = prezzi.enrich_categories(frame)
+        assert result["CATEGORY"].tolist() == [""]
+        assert prezzi.build_price_lookup(result)[("C010003S", "00101")] == (1, 4.0)
+    finally:
+        prezzi._load_reference_category_map.cache_clear()
+
+
+def test_duplicate_article_in_reference_map_keeps_first_and_does_not_raise(tmp_path, monkeypatch):
+    path = tmp_path / "map.json"
+    path.write_text('{"A-One": ["C1"], "B-Two": ["C1", "C2"]}', encoding="utf-8")
+    monkeypatch.setattr(prezzi, "_REFERENCE_MAP_PATH", path)
+    prezzi._load_reference_category_map.cache_clear()
+    try:
+        assert prezzi._load_reference_category_map() == {"C1": "A-One", "C2": "B-Two"}
+    finally:
+        prezzi._load_reference_category_map.cache_clear()
+
+
+def _cat_row(article, price, level=1, color="1"):
+    return {"CLARTICOLO": article, "CLCOLORE": color, "CLDESCR": "Blu", "CATEGORY": "Cotone",
+            "PREZZOLPZ": price, "LIVELLOLPZ": level, "_START_DATE": "2025-01-01"}
+
+
+def test_category_minority_price_is_reported_in_notifications_and_price_changes():
+    frame = pd.DataFrame([_cat_row("A", 10.0), _cat_row("B", 10.0), _cat_row("C", 12.0)])
+
+    issue = next(i for i in prezzi.validate_price_data(frame) if i["key"].startswith("prezzi-category-conflict:"))
+    assert issue["severity"] == "medium" and "Most frequent: 10.00" in issue["message"]
+
+    changes = prezzi.detect_price_anomalies(frame)
+    row = changes[changes["issue"] == "Category price/level conflict"].iloc[0]
+    assert row["CLARTICOLO"] == "C" and row["old_price"] == 10.0 and row["new_price"] == 12.0
+
+
+def test_category_price_tie_is_reported_in_notifications_and_price_changes():
+    frame = pd.DataFrame([_cat_row("A", 10.0), _cat_row("B", 12.0)])
+
+    issues = prezzi.validate_price_data(frame)
+    assert not [i for i in issues if i["key"].startswith("prezzi-category-conflict:")]
+    issue = next(i for i in issues if i["key"].startswith("prezzi-category-tie:"))
+    assert issue["severity"] == "high"
+    assert "No Category price is offered" in issue["message"]
+
+    changes = prezzi.detect_price_anomalies(frame)
+    ties = changes[changes["issue"] == "Category price tie - no category price offered"]
+    assert sorted(ties["CLARTICOLO"]) == ["A", "B"]
+    assert sorted(ties["new_price"]) == [10.0, 12.0]
+    # the price lookup agrees with what the warnings say: nothing is offered
+    assert ("__CATEGORY__", "00001", "cotone") not in prezzi.build_price_lookup(frame)
+
+
+def test_tied_category_gives_no_suggestion_for_missing_price():
+    frame = pd.DataFrame([_cat_row("A", 10.0), _cat_row("B", 12.0), _cat_row("D", 0.0, level=None)])
+
+    changes = prezzi.detect_price_anomalies(frame)
+
+    missing = changes[changes["changed_on"] == "Category suggestion"].iloc[0]
+    assert missing["issue"] == "Missing category price; category prices are tied, no price suggested"
+    assert missing["old_price"] == ""
+
+
+def test_repriced_article_does_not_make_a_tie_in_the_category_lookup():
+    older = _cat_row("A", 10.0); older["_START_DATE"] = "2025-01-01"
+    newer = _cat_row("A", 12.0); newer["_START_DATE"] = "2025-02-01"
+    frame = pd.DataFrame([older, newer, _cat_row("B", 12.0)])
+
+    lookup = prezzi.build_price_lookup(frame)
+
+    assert lookup[("__CATEGORY__", "00001", "cotone")] == (1, 12.0)
+    assert not [i for i in prezzi.validate_price_data(frame) if i["key"].startswith("prezzi-category-conflict:")]

@@ -10,6 +10,7 @@ from calculate.order_report import export_report, pg_x_demand, report_path, sche
 from utility.email_compose import EmailTemplate, open_outlook_email, send_outlook_email
 from utility.excel_io import safe_save_workbook
 from utility.master_data import finished_articolo_for, raw_articolo_for
+from utility.utils import bind_escape_to_close
 from .biglietti_exports import (
     deduplicate_create_excel,
     load_articoli_marca_lookup,
@@ -70,6 +71,7 @@ class SharedOrdersWindowMixin:
                 columns.append(pinned)
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         window.title("Extract Shipped/Invoiced History")
         window.geometry("1180x620")
         window.minsize(850, 420)
@@ -152,6 +154,7 @@ class SharedOrdersWindowMixin:
             return messagebox.showinfo("PG-X Report", "There are no open PG-X rows.")
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         window.title("PG-X Orders Report")
         window.geometry("980x600")
         window.minsize(760, 420)
@@ -264,6 +267,7 @@ class SharedOrdersWindowMixin:
     def _open_shared_orders_window(self, datasets):
 
         window = tk.Toplevel(self)
+        bind_escape_to_close(window)
         window.title("Select Orders for Biglietti")
         window.geometry("1100x560")
         window.minsize(850, 420)
@@ -468,6 +472,7 @@ class SharedOrdersWindowMixin:
                 return
             record = record_by_iid[iid]
             editor = tk.Toplevel(window)
+            bind_escape_to_close(editor)
             editor.title(f"Edit {current_sheet['name']} Color")
             editor.geometry("470x350")
             editor.resizable(False, False)
@@ -679,17 +684,41 @@ class SharedOrdersWindowMixin:
 
         tree.bind("<Double-1>", edit_pg_x_row)
 
+        # toggle() is debounced (delayed, then cancelled if a Double-1
+        # follows): every double-click first fires two ordinary
+        # click-release events, so double-clicking a row to open its editor
+        # in the checkbox column also toggled a checkbox -- and since the
+        # two clicks can resolve to different rows, sometimes a neighbour.
+        pending_toggle = {"after_id": None}
+
         def toggle(_event=None):
             iid = tree.identify_row(_event.y) if _event is not None else ""
             column = tree.identify_column(_event.x) if _event is not None else ""
             if not iid or column != "#1":
                 return
-            selected[iid] = not selected[iid]
-            values = list(tree.item(iid, "values"))
-            values[0] = "☑" if selected[iid] else "☐"
-            tree.item(iid, values=values)
-            tree.selection_set(iid)
+            if pending_toggle["after_id"] is not None:
+                tree.after_cancel(pending_toggle["after_id"])
 
+            def apply_toggle():
+                pending_toggle["after_id"] = None
+                if iid not in selected or not tree.exists(iid):
+                    return
+                selected[iid] = not selected[iid]
+                values = list(tree.item(iid, "values"))
+                values[0] = "☑" if selected[iid] else "☐"
+                tree.item(iid, values=values)
+                tree.selection_set(iid)
+
+            # Tk's double-click threshold is well under this delay, so a
+            # genuine double-click always cancels this before it fires.
+            pending_toggle["after_id"] = tree.after(300, apply_toggle)
+
+        def cancel_pending_toggle(_event=None):
+            if pending_toggle["after_id"] is not None:
+                tree.after_cancel(pending_toggle["after_id"])
+                pending_toggle["after_id"] = None
+
+        tree.bind("<Double-1>", cancel_pending_toggle, add="+")
         tree.bind("<ButtonRelease-1>", toggle)
         actions = ttk.Frame(window, padding=(10, 0, 10, 10))
         actions.grid(row=2, column=0, sticky="ew")

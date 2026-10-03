@@ -20,6 +20,18 @@ def _find_header_row(raw, required_cols, search_rows=20):
 
 
 def load_lotti(path, articolo_prefix: str | tuple[str, ...] | None = RAW_ARTICOLO_PREFIXES):
+    # LOTTI can have several sheets and is read from more than one tab --
+    # cache each distinct articolo_prefix filter separately (same reasoning
+    # as calculate.prezzi.load_prezzi's own caching).
+    from utility import disk_cache
+    namespace = f"lotti:{articolo_prefix!r}"
+    return disk_cache.cached_load(
+        namespace, path, lambda: _load_lotti_uncached(path, articolo_prefix),
+        is_valid=lambda result: result[0] is not None,
+    )
+
+
+def _load_lotti_uncached(path, articolo_prefix: str | tuple[str, ...] | None = RAW_ARTICOLO_PREFIXES):
     required = ["MAGAZZINO", "ARTICOLO", "PARTITA", "ORDINE", "QESI", "LOTTO"]
     sheets = pd.read_excel(path, header=None, sheet_name=None)
     raw = None

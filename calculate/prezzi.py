@@ -27,6 +27,10 @@ HEADERS = {
     "PREZZOLPZ": "Prezzo",
 }
 
+# Minimum number of matching colours before an article that is missing from the
+# category reference is inferred into a category from its price peers.
+MIN_CATEGORY_EVIDENCE = 2
+
 # Memoize the parsed result in-process as well as in SQLite.
 _PREZZI_CACHE: dict[tuple, pd.DataFrame] = {}
 
@@ -43,6 +47,27 @@ def _format_codice(value) -> str:
     if as_float.is_integer():
         return str(int(as_float))
     return str(as_float)
+
+
+def _price_color_key(value) -> str:
+    """Canonical comparison key for numeric color codes with lost zero padding."""
+    text = clean_text(value)
+    if text.isdigit():
+        return text.lstrip("0") or "0"
+    decimal_match = re.fullmatch(r"(\d+)[.,]0+", text)
+    if decimal_match:
+        digits = decimal_match.group(1)
+        return digits.lstrip("0") or "0"
+    return text.upper()
+
+
+def _price_color_variants(value) -> tuple[str, ...]:
+    """Return exact and common ERP-padded forms without partial-code matches."""
+    text = clean_text(value)
+    key = _price_color_key(text)
+    if key.isdigit():
+        return tuple(dict.fromkeys((text, key, key.zfill(5), key.zfill(6))))
+    return (text, key) if text != key else (text,)
 
 
 def _format_category(value) -> str:
@@ -74,32 +99,91 @@ def _find_column(columns, *aliases):
     return None
 
 
-@lru_cache(maxsize=1)
-def _load_reference_category_map() -> dict[str, str]:
-    reference_path = Path(__file__).resolve().parent.parent / "data" / "prezzi_category_map.json"
+_REFERENCE_MAP_PATH = Path(__file__).resolve().parent.parent / "data" / "prezzi_category_map.json"
+
+
+def reference_map_fingerprint() -> tuple[int, int] | None:
+    """(mtime_ns, size) of the category reference file, or None if missing.
+
+    Part of the Listini cache fingerprint: the cached frame has CATEGORY
+    already baked in from this file, so editing the file must invalidate it.
+    """
     try:
-        category_articles = json.loads(reference_path.read_text(encoding="utf-8"))
+        stat = _REFERENCE_MAP_PATH.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=1)
+def _load_reference_category_map(
+    cache_key: tuple[str, tuple[int, int] | None] | None = None,
+) -> dict[str, str]:
+    """Article -> category from data/prezzi_category_map.json.
+
+    A missing/corrupt file or a duplicated article must never stop Listini
+    from loading (prices are far more important than categories): problems
+    are logged loudly and the affected data is skipped instead. The current
+    path and file fingerprint are part of the cache key so edits take effect
+    without restarting the app.
+    """
+    path = Path(cache_key[0]) if cache_key is not None else _REFERENCE_MAP_PATH
+    try:
+        category_articles = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        logger.error("Prezzi: couldn't load category reference %s: %s", reference_path, exc)
-        raise RuntimeError(f"Price category reference file is unavailable: {reference_path}") from exc
+        logger.error("Prezzi: couldn't load category reference %s: %s -- continuing without it", path, exc)
+        return {}
     result: dict[str, str] = {}
     for category, articles in category_articles.items():
         for article in articles:
             article_key = clean_text(article).upper()
             if article_key in result and result[article_key] != category:
-                raise ValueError(f"Article {article_key} has multiple reference categories.")
+                logger.warning(
+                    "Prezzi: article %s is listed under both %r and %r in the category reference; keeping %r",
+                    article_key, result[article_key], category, result[article_key],
+                )
+                continue
             result[article_key] = category
     return result
 
 
+def _reference_category_map() -> dict[str, str]:
+    path = _REFERENCE_MAP_PATH.resolve()
+    return _load_reference_category_map((str(path), reference_map_fingerprint()))
+
+
+def category_for_article(article) -> str:
+    """Reference category for an article, whether or not it has any Listini row.
+
+    C<->G twins are treated as the same article, exactly like the direct
+    price lookup does (build_price_lookup).
+    """
+    key = clean_text(article).upper()
+    if not key:
+        return ""
+    mapping = _reference_category_map()
+    category = mapping.get(key, "")
+    if not category and key[:1] in {"C", "G"}:
+        twin = ("G" if key[0] == "C" else "C") + key[1:]
+        category = mapping.get(twin, "")
+    return _format_category(category) if category else ""
+
+
 def _category_customer_map(article_categories: dict[str, str]) -> dict[str, str]:
     customers: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for article, category in article_categories.items():
         prefix = article[:4]
         customer = category.split("-", 1)[0].strip().casefold()
         previous = customers.setdefault(prefix, customer)
         if previous != customer:
-            raise ValueError(f"Article family {prefix} has multiple category customers.")
+            ambiguous.add(prefix)
+    for prefix in ambiguous:
+        logger.warning(
+            "Prezzi: article family %s belongs to more than one customer in the category reference; "
+            "it is excluded from automatic category inference", prefix,
+        )
+        customers.pop(prefix, None)
     return customers
 
 
@@ -125,7 +209,7 @@ def enrich_categories(df: pd.DataFrame) -> pd.DataFrame:
         if "CATEGORY" in out.columns
         else pd.Series("", index=out.index, dtype="object")
     )
-    article_categories = _load_reference_category_map()
+    article_categories = _reference_category_map()
     customers = _category_customer_map(article_categories)
     article_keys = out["CLARTICOLO"].map(lambda value: clean_text(value).upper())
     out["CATEGORY"] = article_keys.map(article_categories).fillna("")
@@ -171,18 +255,24 @@ def enrich_categories(df: pd.DataFrame) -> pd.DataFrame:
             missing["_price_key"] = missing["PREZZOLPZ"].map(_signature_number)
             for article, group in missing.groupby("_article", sort=False):
                 category_counts: dict[str, int] = {}
+                comparable = 0
                 signatures = group[
                     ["_customer", "_color_key", "_level_key", "_price_key"]
                 ].drop_duplicates()
                 for signature_customer, color, level, price in signatures.itertuples(index=False, name=None):
                     if not signature_customer or not color or level is None or price is None:
                         continue
+                    comparable += 1
                     for category in signature_categories.get((signature_customer, color, level, price), ()):
                         category_counts[category] = category_counts.get(category, 0) + 1
                 if category_counts:
                     highest = max(category_counts.values())
                     winners = [category for category, count in category_counts.items() if count == highest]
-                    if len(winners) == 1:
+                    # One coincidental match is not enough when the article has
+                    # several priced colours to compare (identical prices repeat
+                    # a lot across categories): require MIN_CATEGORY_EVIDENCE
+                    # matching colours, or every colour it has if it has fewer.
+                    if len(winners) == 1 and highest >= min(MIN_CATEGORY_EVIDENCE, comparable):
                         out.loc[group.index, "CATEGORY"] = winners[0]
                         continue
                 unresolved.append(article)
@@ -216,29 +306,54 @@ def _normalize_prezzi_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=renames)
 
 
+def _latest_price_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the current row of each Articolo+Colore.
+
+    load_prezzi() keeps every distinct historical price of a combo, but only
+    the newest one is the price in force. Category rules (majority price,
+    ties, conflicts) must not count a superseded price as a "member" -- an
+    article that was simply repriced would otherwise look like a conflict
+    with itself.
+    """
+    if "_START_DATE" in df.columns:
+        df = df.sort_values("_START_DATE", kind="mergesort", na_position="first")
+    return df.drop_duplicates(["CLARTICOLO", "CLCOLORE"], keep="last")
+
+
 def _modal_category_references(usable: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
+    """Per (colour, category): the price/level most members agree on.
+
+    Same rule as build_price_lookup so the warnings never disagree with the
+    price actually offered: the strict majority price wins; when several
+    prices tie for most frequent, ``_price_tie`` is True (build_price_lookup
+    then offers no category price at all) and the lowest tied price is only
+    used as a stable stand-in so results never depend on row order.
+    """
     price_counts = (
         usable.groupby(group_keys + ["_price"], sort=False, dropna=False)
         .size().rename("_count").reset_index()
     )
-    modal_prices = (
-        price_counts.sort_values("_count", ascending=False, kind="mergesort")
-        .drop_duplicates(group_keys)
+    top = price_counts.groupby(group_keys, sort=False, dropna=False)["_count"].transform("max")
+    leaders = price_counts[price_counts["_count"].eq(top)]
+    leaders = leaders.assign(
+        _price_tie=leaders.groupby(group_keys, sort=False, dropna=False)["_price"].transform("size").gt(1)
     )
+    modal_prices = leaders.sort_values("_price", kind="mergesort").drop_duplicates(group_keys)
     selected = usable.merge(modal_prices[group_keys + ["_price"]], on=group_keys + ["_price"], how="inner")
     level_counts = (
         selected.groupby(group_keys + ["_level"], sort=False, dropna=False)
         .size().rename("_count").reset_index()
     )
     modal_levels = (
-        level_counts.sort_values("_count", ascending=False, kind="mergesort")
+        level_counts.sort_values(["_count", "_level"], ascending=[False, True], kind="mergesort")
         .drop_duplicates(group_keys)
     )
-    return modal_prices[group_keys + ["_price"]].merge(
+    merged = modal_prices[group_keys + ["_price", "_price_tie"]].merge(
         modal_levels[group_keys + ["_level"]],
         on=group_keys,
         how="inner",
     ).rename(columns={"_price": "_reference_price", "_level": "_reference_level"})
+    return merged[[*group_keys, "_reference_price", "_reference_level", "_price_tie"]]
 
 
 def load_prezzi(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:
@@ -246,8 +361,11 @@ def load_prezzi(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:
     try:
         source = Path(path).resolve()
         stat = source.stat()
+        # 7: CLCOLORE/LIVELLOLPZ round-trip fix (older SQLite frames lost
+        # leading zeros). The reference-map stat is included because CATEGORY
+        # is baked into the cached frame from data/prezzi_category_map.json.
         fingerprint = (
-            6, str(source), stat.st_mtime_ns, stat.st_size,
+            7, str(source), stat.st_mtime_ns, stat.st_size, reference_map_fingerprint(),
         )
     except OSError:
         pass
@@ -370,9 +488,9 @@ def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd
 
     category_rows = []
     if "CATEGORY" in df.columns:
-        work = df.copy()
+        work = _latest_price_rows(df).copy()
         work["CATEGORY"] = work["CATEGORY"].fillna("").astype(str).str.strip()
-        work["_price"] = pd.to_numeric(work["PREZZOLPZ"], errors="coerce")
+        work["_price"] = pd.to_numeric(work["PREZZOLPZ"], errors="coerce").round(4)
         work["_level"] = pd.to_numeric(work["LIVELLOLPZ"], errors="coerce")
         group_keys = ["CLCOLORE", "CATEGORY"]
         categorized = work[work["CATEGORY"].ne("")]
@@ -385,12 +503,14 @@ def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd
             level_suffix = missing["_reference_level"].map(
                 lambda value: f" / level {float(value):g}" if pd.notna(value) else ""
             )
+            tied = missing["_price_tie"].astype(bool)
             suggestions = pd.DataFrame({
                 "CLARTICOLO": missing["CLARTICOLO"],
                 "CLCOLORE": missing["CLCOLORE"],
                 "CLDESCR": missing["CLDESCR"],
                 "CATEGORY": missing["CATEGORY"],
-                "old_price": missing["_reference_price"],
+                # A tied category has no defensible price to suggest.
+                "old_price": missing["_reference_price"].where(~tied, ""),
                 "new_price": "",
                 "pct_change": "",
                 "changed_on": "Category suggestion",
@@ -398,7 +518,7 @@ def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd
                     "Missing category price; suggested "
                     + missing["_reference_price"].map(lambda value: f"{float(value):.2f}")
                     + level_suffix
-                ),
+                ).where(~tied, "Missing category price; category prices are tied, no price suggested"),
             })
             category_rows.append(suggestions)
 
@@ -407,14 +527,36 @@ def detect_price_anomalies(df: pd.DataFrame, min_pct_change: float = 10.0) -> pd
             & checked["_reference_level"].notna()
             & checked["_level"].ne(checked["_reference_level"])
         )
+        tie_group = checked["_price_tie"].astype(bool)
         conflict_mask = (
             checked["_price"].notna()
             & checked["_price"].ne(0)
+            & ~tie_group
             & (
                 (checked["_price"] - checked["_reference_price"]).abs().gt(0.01)
                 | level_conflict
             )
         )
+        # Prices tied for "most frequent": there is no reference to compare
+        # against and build_price_lookup offers no category price for the
+        # colour, so every priced member of the group is listed.
+        ties = checked.loc[
+            tie_group & checked["_price"].notna() & checked["_price"].gt(0.01)
+        ].drop_duplicates(
+            subset=["CLARTICOLO", "CLCOLORE", "CATEGORY", "_price", "_level"]
+        )
+        if not ties.empty:
+            category_rows.append(pd.DataFrame({
+                "CLARTICOLO": ties["CLARTICOLO"],
+                "CLCOLORE": ties["CLCOLORE"],
+                "CLDESCR": ties["CLDESCR"],
+                "CATEGORY": ties["CATEGORY"],
+                "old_price": "",
+                "new_price": ties["_price"],
+                "pct_change": "",
+                "changed_on": "Category rule",
+                "issue": "Category price tie - no category price offered",
+            }))
         conflicts = checked.loc[conflict_mask].drop_duplicates(
             subset=["CLARTICOLO", "CLCOLORE", "CATEGORY", "_price", "_level"]
         ).copy()
@@ -477,9 +619,9 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
         if row["level_count"] > 1:
             issues.append({"key": f"prezzi-conflict-level:{articolo}:{colore}", "title": "Conflicting color levels", "message": f"Articolo {articolo}, colore {colore} has {int(row['level_count'])} different LVL values.", "severity": "medium", **_color_fields(colore)})
     if "CATEGORY" in df.columns:
-        categorized = df.copy()
+        categorized = _latest_price_rows(df).copy()
         categorized["CATEGORY"] = categorized["CATEGORY"].fillna("").astype(str).str.strip()
-        categorized["_price"] = pd.to_numeric(categorized["PREZZOLPZ"], errors="coerce")
+        categorized["_price"] = pd.to_numeric(categorized["PREZZOLPZ"], errors="coerce").round(4)
         categorized["_level"] = pd.to_numeric(categorized["LIVELLOLPZ"], errors="coerce")
         categorized = categorized[
             categorized["CATEGORY"].ne("")
@@ -501,19 +643,36 @@ def validate_price_data(df: pd.DataFrame) -> list[dict[str, str]]:
         )
         for row in conflicting_groups.itertuples(index=False):
             color, category = row[0], row[1]
-            pair_count, common_price, common_level = row[2], row[3], row[4]
+            pair_count, common_price, common_level, price_tie = row[2], row[3], row[4], bool(row[5])
             level_text = f", livello {float(common_level):g}" if pd.notna(common_level) else ""
-            issues.append({
-                "key": f"prezzi-category-conflict:{_format_codice(color)}:{category.casefold()}",
-                "title": "Conflicting Category prices",
-                "message": (
+            if price_tie:
+                # build_price_lookup offers no Category price for a tie, so
+                # this is more serious than a plain minority-vs-majority conflict.
+                message = (
+                    f"Colore {color}, Category {category} has {pair_count} different price/level pairs "
+                    f"and no single price is the most frequent. No Category price is offered for "
+                    f"this colour until it is resolved."
+                )
+            else:
+                message = (
                     f"Colore {color}, Category {category} has {pair_count} different price/level pairs. "
                     f"Most frequent: {float(common_price):.2f}{level_text}."
+                )
+            # Distinct key/title for a tie: open notifications are de-duplicated
+            # by key, so a minority conflict that later becomes a tie must
+            # raise a fresh (high severity) notification instead of staying
+            # hidden behind the old one.
+            issues.append({
+                "key": (
+                    f"prezzi-category-{'tie' if price_tie else 'conflict'}:"
+                    f"{_format_codice(color)}:{category.casefold()}"
                 ),
-                "severity": "medium",
+                "title": "Category prices tied - no price offered" if price_tie else "Conflicting Category prices",
+                "message": message,
+                "severity": "high" if price_tie else "medium",
                 **_color_fields(color),
             })
-        article_customer = _category_customer_map(_load_reference_category_map())
+        article_customer = _category_customer_map(_reference_category_map())
         customer_categories = set(article_customer.values())
         category_customer = categorized["CATEGORY"].map(
             lambda value: value.split("-", 1)[0].strip().casefold()
@@ -573,18 +732,47 @@ def build_price_lookup(df: pd.DataFrame) -> dict[tuple[str, str], tuple]:
     has_category = "CATEGORY" in df.columns
     if has_category:
         fields.append("CATEGORY")
+    has_color_description = "CLDESCR" in df.columns
+    if has_color_description:
+        fields.append("CLDESCR")
     category_price_counts: dict[tuple[str, str], dict[object, int]] = {}
     category_level_counts: dict[tuple[str, str, object], dict[object, int]] = {}
     article_category_counts: dict[str, dict[str, int]] = {}
+    description_prices: dict[tuple[str, str], set[tuple[object, object]]] = {}
+    # Rows arrive oldest-first, so the last row of a key is its current price;
+    # superseded prices must not vote in the category majority.
+    current: dict[tuple[str, str], tuple] = {}
     for values in df[fields].itertuples(index=False, name=None):
         articolo, colore, nivel_value, prezzo_value = values[:4]
         category = clean_text(values[4]) if has_category else ""
+        description_value = values[4 + has_category] if has_color_description else None
+        description = (
+            clean_text(description_value).casefold()
+            if description_value is not None and pd.notna(description_value)
+            else ""
+        )
         key = (clean_text(articolo).upper(), _format_codice(colore))
         if key[1].isdigit() and len(key[1]) < 5:
             key = (key[0], key[1].zfill(5))
         livello = None if pd.isna(nivel_value) else nivel_value
         prezzo = None if pd.isna(prezzo_value) else prezzo_value
         lookup[key] = (livello, prezzo)
+        current[key] = (livello, prezzo, category, description)
+        if key[0][:1] in {"C", "G"}:
+            swapped = ("G" if key[0][0] == "C" else "C") + key[0][1:]
+            lookup.setdefault((swapped, key[1]), (livello, prezzo))
+    for key, (livello, prezzo, category, description) in current.items():
+        if description:
+            try:
+                valid_description_price = pd.notna(prezzo) and float(prezzo) > 0.01
+            except (TypeError, ValueError):
+                valid_description_price = False
+            if valid_description_price:
+                description_key = (key[0], description)
+                description_prices.setdefault(description_key, set()).add((livello, prezzo))
+                if key[0][:1] in {"C", "G"}:
+                    twin = ("G" if key[0][0] == "C" else "C") + key[0][1:]
+                    description_prices.setdefault((twin, description), set()).add((livello, prezzo))
         if category:
             article_counts = article_category_counts.setdefault(key[0], {})
             article_counts[category] = article_counts.get(category, 0) + 1
@@ -593,21 +781,71 @@ def build_price_lookup(df: pd.DataFrame) -> dict[tuple[str, str], tuple]:
             except (TypeError, ValueError):
                 valid_price = False
             if valid_price:
-                category_key = (key[1], category.casefold())
+                category_key = (_price_color_key(key[1]), category.casefold())
+                # Rounded only for counting, so 2.56 and 2.5600000001 (Excel
+                # float noise) are the same price and not a fake conflict.
+                price_key = round(float(prezzo), 4)
                 price_counts = category_price_counts.setdefault(category_key, {})
-                price_counts[prezzo] = price_counts.get(prezzo, 0) + 1
-                level_counts = category_level_counts.setdefault((*category_key, prezzo), {})
+                price_counts[price_key] = price_counts.get(price_key, 0) + 1
+                level_counts = category_level_counts.setdefault((*category_key, price_key), {})
                 level_key = None if pd.isna(livello) else livello
                 level_counts[level_key] = level_counts.get(level_key, 0) + 1
-        if key[0][:1] in {"C", "G"}:
-            swapped = ("G" if key[0][0] == "C" else "C") + key[0][1:]
-            lookup.setdefault((swapped, key[1]), (livello, prezzo))
+
+    for (article, description), prices in description_prices.items():
+        if len(prices) == 1:
+            lookup[("__ARTICLE_COLOR_DESCRIPTION__", article, description)] = next(iter(prices))
+
+    conflicting: list[tuple[str, str, list]] = []
+    dropped_ties = 0
     for category_key, price_counts in category_price_counts.items():
         color, category = category_key
-        most_common_price = max(price_counts, key=price_counts.get)
+        if len(price_counts) > 1:
+            conflicting.append((category, color, sorted(price_counts)))
+        # The price most members agree on wins. A tie has no defensible
+        # answer, and picking one by row order would silently change the
+        # price between two Listini files with identical data -- so no
+        # category price is offered for that colour at all.
+        top = max(price_counts.values())
+        leaders = [price for price, count in price_counts.items() if count == top]
+        if len(leaders) > 1:
+            dropped_ties += 1
+            continue
+        most_common_price = leaders[0]
         level_counts = category_level_counts[(*category_key, most_common_price)]
-        most_common_level = max(level_counts, key=level_counts.get)
-        lookup[("__CATEGORY__", color, category)] = (most_common_level, most_common_price)
+        top_level = max(level_counts.values())
+        # Deterministic level on ties: lowest numeric level, missing last.
+        most_common_level = sorted(
+            (level for level, count in level_counts.items() if count == top_level),
+            key=lambda level: (level is None, level if level is not None else 0),
+        )[0]
+        price_level = (most_common_level, most_common_price)
+        for color_variant in _price_color_variants(color):
+            lookup[("__CATEGORY__", color_variant, category)] = price_level
+    if conflicting:
+        examples = "; ".join(
+            f"{category} colour {color}: {', '.join(f'{price:g}' for price in prices)}"
+            for category, color, prices in conflicting[:5]
+        )
+        logger.warning(
+            "Prezzi: %d category/colour group(s) have members with different prices "
+            "(%d tie(s) -> no category price offered). First: %s",
+            len(conflicting), dropped_ties, examples,
+        )
+
     for article, category_counts in article_category_counts.items():
-        lookup[("__ARTICLE_CATEGORY__", article)] = max(category_counts, key=category_counts.get)
+        # Highest count first; ties broken by name so the result never
+        # depends on row order.
+        category = sorted(category_counts, key=lambda name: (-category_counts[name], name))[0]
+        lookup[("__ARTICLE_CATEGORY__", article)] = category
+        if article[:1] in {"C", "G"}:
+            twin = ("G" if article[0] == "C" else "C") + article[1:]
+            lookup.setdefault(("__ARTICLE_CATEGORY__", twin), category)
+    # Articles with no Listini row at all (never dyed before) still belong to
+    # their reference category -- this is the main reason the categories exist.
+    for article, category in _reference_category_map().items():
+        formatted = _format_category(category)
+        lookup.setdefault(("__ARTICLE_CATEGORY__", article), formatted)
+        twin = ("G" if article[:1] == "C" else "C") + article[1:] if article[:1] in {"C", "G"} else ""
+        if twin:
+            lookup.setdefault(("__ARTICLE_CATEGORY__", twin), formatted)
     return lookup

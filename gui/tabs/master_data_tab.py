@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from utility import master_data
+from utility.utils import bind_escape_to_close
 
 
 class MasterDataTab(ttk.Frame):
@@ -48,6 +49,7 @@ class MasterDataTab(ttk.Frame):
         tree = self._trees[key]; selected = tree.selection()
         old = self._data[key][tree.index(selected[0])] if selected else {}
         win = tk.Toplevel(self); win.title(f"{label} - Edit"); win.transient(self); win.grab_set()
+        bind_escape_to_close(win)
         entries = {}
         for row, col in enumerate(columns):
             ttk.Label(win, text=col.replace("_", " ").title()).grid(row=row, column=0, padx=8, pady=5, sticky="w")

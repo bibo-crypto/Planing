@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS codes (
     titolo          TEXT
 );
 
+-- partita is already indexed (it's the primary key). The rest are
+-- columns the app actually filters/searches/sorts by (Situazione
+-- Generale's own search box, and the delivery/exit-date-driven Overview
+-- cards) -- on a large history these were full table scans without an
+-- index.
+CREATE INDEX IF NOT EXISTS idx_partita_state_articolo ON partita_state(articolo);
+CREATE INDEX IF NOT EXISTS idx_partita_state_bagno ON partita_state(bagno);
+CREATE INDEX IF NOT EXISTS idx_partita_state_cliente ON partita_state(cliente);
+CREATE INDEX IF NOT EXISTS idx_partita_state_data_uscita ON partita_state(data_uscita);
+CREATE INDEX IF NOT EXISTS idx_partita_state_consegna ON partita_state(consegna);
+
 CREATE TABLE IF NOT EXISTS upload_log (
     source_name     TEXT PRIMARY KEY,
     file_name       TEXT,

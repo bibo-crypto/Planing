@@ -25,6 +25,19 @@ def _find_header_row(raw, required_cols, search_rows=20):
 
 
 def load_magazino(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
+    # Magazino Filato is read from several tabs (Biglietti, Kamal, Overview,
+    # Master Data sync) within the same session, sometimes with a different
+    # articolo_prefix filter -- cache each distinct filter separately (same
+    # reasoning as calculate.prezzi.load_prezzi's own caching).
+    from utility import disk_cache
+    namespace = f"magazino:{articolo_prefix!r}"
+    return disk_cache.cached_load(
+        namespace, path, lambda: _load_magazino_uncached(path, articolo_prefix),
+        is_valid=lambda result: result[0] is not None,
+    )
+
+
+def _load_magazino_uncached(path, articolo_prefix=RAW_ARTICOLO_PREFIXES):
     required = ["MAGAZZINO", "ARTICOLO", "PARTITA", "ORDINE", "ESISTENZA", "COLLI"]
     summary_raw = pd.read_excel(path, header=None)
     summary_header_row = _find_header_row(summary_raw, ["Articolo", "Partita", "Mag.rocche", "Mag.peso"])
