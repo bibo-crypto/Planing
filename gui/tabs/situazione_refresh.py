@@ -96,16 +96,29 @@ class SituationRefreshMixin:
         (raw_yarn_match) column has a real match -- yarn that a PG-X-
         flagged color was waiting for is now available in Magazino Filato.
         Keyed by partita so re-runs update/replace the same notice rather
-        than piling up duplicates while the match is still there."""
-        if not self._on_notification or self.current_df.empty or "raw_yarn_match" not in self.current_df.columns:
+        than piling up duplicates while the match is still there. Resolve
+        notices for partitas that no longer have a valid match."""
+        prefix = "situazione-raw-yarn-available:"
+        if self.current_df.empty or "raw_yarn_match" not in self.current_df.columns:
+            matched = self.current_df.iloc[0:0]
+        else:
+            matched = self.current_df[
+                self.current_df["raw_yarn_match"].astype(str).str.strip() != ""
+            ]
+        matched_rows = [
+            row for _, row in matched.iterrows()
+            if str(row.get("partita", "")).strip()
+        ]
+        current_keys = {
+            f"{prefix}{str(row.get('partita', '')).strip()}" for row in matched_rows
+        }
+        notifications.resolve_missing(prefix, current_keys)
+        if not self._on_notification:
             return
-        matched = self.current_df[self.current_df["raw_yarn_match"].astype(str).str.strip() != ""]
-        for _, row in matched.iterrows():
+        for row in matched_rows:
             partita = str(row.get("partita", "")).strip()
-            if not partita:
-                continue
             self._on_notification(
-                f"situazione-raw-yarn-available:{partita}",
+                f"{prefix}{partita}",
                 "Filato disponibile per un colore in attesa",
                 f"Partita {partita} (Bagno {row.get('bagno', '')}, Articolo {row.get('articolo', '')}): "
                 f"filato disponibile in Magazino — {row.get('raw_yarn_match', '')}.",
@@ -142,9 +155,11 @@ class SituationRefreshMixin:
         current stock -- best-effort, never blocks: if Magazino hasn't been
         loaded yet this just leaves the column blank."""
         if self.current_df.empty:
+            self._notify_raw_yarn_available()
             return
         if "comment" not in self.current_df.columns:
             self.current_df["raw_yarn_match"] = ""
+            self._notify_raw_yarn_available()
             return
         magazino_tab = self.magazino_tab
         magazino_summary = getattr(magazino_tab, "magazino_summary", None) if magazino_tab else None
@@ -155,7 +170,7 @@ class SituationRefreshMixin:
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Situazione: raw yarn auto-match failed: %s", exc)
-            self.current_df["raw_yarn_match"] = ""
+            return
         self._notify_raw_yarn_available()
     def refresh_raw_yarn_match(self) -> None:
         """Public hook: re-run the Filato Disponibile match against whatever

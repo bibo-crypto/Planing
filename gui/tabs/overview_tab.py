@@ -80,7 +80,7 @@ HEADERS_IT = {
     "riga": "Riga", "data": "Data", "consegna": "Consegna",
     "delivery_date": "Delivery Date",
     "partita": "Partita", "rocche": "Rocche", "mc": "M/C",
-    "partita_colore": "Partita Colore",
+    "partita_colore": "Partita Col.",
     "comment": "Commento", "raw_yarn_match": "Filato Disponibile",
     "cq": "C.Q", "tinto": "Tinto", "bagno": "Bagno",
     "old_comment": "Vecchio commento", "new_comment": "Nuovo commento",
@@ -437,23 +437,23 @@ class OverviewTab(ttk.Frame):
         style.configure("Overview.CardTitle.TLabel", background="#ffffff", foreground="#526173",
                         font=("Segoe UI", 10, "bold"))
         style.configure("Overview.CardValue.TLabel", background="#ffffff", foreground="#16324f",
-                        font=("Segoe UI", 24, "bold"))
+                        font=("Segoe UI", 20, "bold"))
         style.configure("Overview.Table.TLabelframe", background="#ffffff", borderwidth=1, relief="solid")
         style.configure("Overview.Table.TLabelframe.Label", background="#ffffff", foreground="#16324f",
                         font=("Segoe UI", 10, "bold"))
         style.configure("Overview.Treeview", background="#ffffff", fieldbackground="#ffffff",
-                        foreground="#25364d", rowheight=28, font=("Segoe UI", 9))
+                        foreground="#25364d", rowheight=25, font=("Segoe UI", 9))
         style.configure("Overview.Treeview.Heading", background="#16324f", foreground="#ffffff",
-                        font=("Segoe UI", 9, "bold"), padding=(7, 6))
+                        font=("Segoe UI", 9, "bold"), padding=(6, 4))
         style.map("Overview.Treeview", background=[("selected", "#2f80ed")],
                   foreground=[("selected", "#ffffff")])
         style.configure("Overview.AlertCard.TFrame", background="#fff7ed", relief="solid", borderwidth=1)
         style.configure("Overview.AlertCardTitle.TLabel", background="#fff7ed", foreground="#c2410c",
                         font=("Segoe UI", 10, "bold"))
         style.configure("Overview.AlertCardValue.TLabel", background="#fff7ed", foreground="#9a3412",
-                        font=("Segoe UI", 24, "bold"))
+                        font=("Segoe UI", 20, "bold"))
         style.configure("Overview.DangerCardValue.TLabel", background="#fff7ed", foreground="#c62828",
-                font=("Segoe UI", 24, "bold"))
+                font=("Segoe UI", 20, "bold"))
 
         toolbar = ttk.Frame(self)
         toolbar.pack(side="top", fill="x", padx=12, pady=(10, 4))
@@ -507,22 +507,22 @@ class OverviewTab(ttk.Frame):
         canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
 
         # ── Master Data Synchronization Card ──
-        sync_frame = ttk.LabelFrame(self._body, text=" 📂 Master Data Synchronization (Update All Data) ", padding=10)
-        sync_frame.pack(side="top", fill="x", padx=4, pady=(2, 8))
+        sync_frame = ttk.LabelFrame(self._body, text=" 📂 Master Data Synchronization (Update All Data) ", padding=(10, 5))
+        sync_frame.pack(side="top", fill="x", padx=4, pady=(2, 4))
         sync_frame.columnconfigure(1, weight=1)
 
-        ttk.Button(sync_frame, text="📂  Upload All Data from Folder...", command=self._on_choose_data_folder, width=28).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Button(sync_frame, text="📂  Upload All Data from Folder...", command=self._on_choose_data_folder, width=28).grid(row=0, column=0, sticky="w")
 
         folder_text = str(self._data_folder) if self._data_folder else "No data folder selected"
         folder_color = "#111827" if self._data_folder else "grey"
         self._lbl_folder = ttk.Label(sync_frame, text=folder_text, foreground=folder_color, anchor="w")
-        self._lbl_folder.grid(row=0, column=1, sticky="ew", padx=(10, 10), pady=2)
+        self._lbl_folder.grid(row=0, column=1, sticky="ew", padx=(10, 10))
 
         self._btn_sync = ttk.Button(sync_frame, text="🔄  Update All Data", command=self._on_sync_all_data, width=20)
-        self._btn_sync.grid(row=0, column=2, sticky="e", pady=2)
+        self._btn_sync.grid(row=0, column=2, sticky="e")
 
         sec_row = ttk.Frame(sync_frame)
-        sec_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        sec_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         sec_row.columnconfigure(0, weight=1)
 
         self._lbl_sync_status = ttk.Label(sec_row, text="● Ready to sync", foreground="#2E7D32", font=("Segoe UI", 9))
@@ -885,7 +885,7 @@ class OverviewTab(ttk.Frame):
             card = tk.Frame(
                 frame, bg="#fee2e2" if empty else "#eaf2f8",
                 highlightbackground="#ef4444" if empty else "#cbd5e1",
-                highlightthickness=1, width=110, height=82,
+                highlightthickness=1, width=110, height=68,
             )
             card.grid(row=0, column=index, padx=3, pady=3, sticky="ew")
             card.grid_propagate(False)
@@ -912,8 +912,8 @@ class OverviewTab(ttk.Frame):
         bind_escape_to_close(window)
         machine_name = business_logic.machine_label(machine)
         window.title(f"Copertura macchine — {machine_name}")
-        window.geometry("1180x620")
-        window.minsize(850, 420)
+        window.geometry("1100x520")
+        window.minsize(780, 380)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
         ttk.Label(
@@ -1039,7 +1039,8 @@ class OverviewTab(ttk.Frame):
             row=grid_row, column=grid_column, columnspan=span,
             padx=3, pady=4, sticky="nsew",
         )
-        self._cards_frame.rowconfigure(grid_row, weight=1, minsize=100)
+        self._cards_frame.rowconfigure(grid_row, weight=1, minsize=82)
+        card.configure(padding=(10, 8))
         title_label = ttk.Label(card, text=title, style=title_style, wraplength=150)
         title_label.pack(anchor="w")
         value_label = ttk.Label(card, text=value, style=value_style)
@@ -1057,8 +1058,8 @@ class OverviewTab(ttk.Frame):
         window = tk.Toplevel(self)
         bind_escape_to_close(window)
         window.title(title)
-        window.geometry("1180x620")
-        window.minsize(850, 420)
+        window.geometry("1100x520")
+        window.minsize(780, 380)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(1, weight=1)
         ttk.Label(window, text=title, font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=8)

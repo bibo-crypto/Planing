@@ -363,8 +363,7 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=0)   # notification bar
-        self.rowconfigure(1, weight=4)   # all application pages
-        self.rowconfigure(2, weight=1)   # log area
+        self.rowconfigure(1, weight=1)   # all application pages
 
         style = ttk.Style(self)
         # Use the same renderer that gives Situazione its reliable colored
@@ -525,6 +524,14 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         self._master_data_tab = MasterDataTab(notebook, on_data_changed=self._refresh_notification_badge)
         notebook.add(self._master_data_tab, text="Master Data")
 
+        log_tab = ttk.Frame(notebook)
+        notebook.add(log_tab, text="Log")
+        self._build_log_area(log_tab)
+        ttk.Button(
+            notification_bar, text="Open Log",
+            command=lambda: notebook.select(log_tab),
+        ).grid(row=0, column=4, padx=3)
+
         # Now that Magazino Filato exists, let Situazione auto-fill its
         # "Filato Disponibile" column from it.
         self._situazione_tab.magazino_tab = self._magazino_tab
@@ -546,13 +553,7 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
 
-        self._build_log_area()
-
         def _on_any_tab_changed(_event=None) -> None:
-            self._update_log_visibility(
-                notebook, self._situazione_tab, self._settimana_tab, self._magazino_tab,
-                ordine_notebook, situazione_notebook,
-            )
             try:
                 if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._situazione_tab):
                     self._situazione_tab.on_shown()
@@ -940,9 +941,11 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
     # Shared log area
     # ------------------------------------------------------------------
 
-    def _build_log_area(self) -> None:
-        log_frame = ttk.LabelFrame(self, text="Log", padding=6)
-        log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(4, 12))
+    def _build_log_area(self, parent: ttk.Frame) -> None:
+        log_frame = ttk.LabelFrame(parent, text="Application activity", padding=8)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
         self._log_frame = log_frame
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -956,13 +959,17 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
             fg="#d4d4d4",
             insertbackground="white",
             relief="flat",
-            height=12,
+            height=24,
         )
         self._log_text.grid(row=0, column=0, sticky="nsew")
 
         log_scroll = ttk.Scrollbar(log_frame, command=self._log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self._log_text.configure(yscrollcommand=log_scroll.set)
+        self._log_text.tag_configure("INFO", foreground="#4FC1FF")
+        self._log_text.tag_configure("WARNING", foreground="#FFD700")
+        self._log_text.tag_configure("ERROR", foreground="#F44747")
+        self._log_text.tag_configure("DEBUG", foreground="#858585")
 
     def _update_log_visibility(self, notebook: ttk.Notebook, situazione_tab: ttk.Frame,
                                 settimana_tab: ttk.Frame, magazino_tab: ttk.Frame,

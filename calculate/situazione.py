@@ -479,12 +479,14 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
     }
 
     lotto_to_batches: dict[str, list[tuple[str, str]]] = {}
+    batch_to_lotto: dict[tuple[str, str], str] = {}
     if not lotti_summary.empty and "lotto" in lotti_summary.columns:
         merged = stock.merge(lotti_summary, on="partita", how="inner")
         for _, r in merged.iterrows():
             lotto_key = clean_text(r["lotto"])
             if lotto_key:
                 batch_key = (str(r["articolo"]), str(r["partita"]))
+                batch_to_lotto[batch_key] = lotto_key
                 if batch_key not in lotto_to_batches.setdefault(lotto_key, []):
                     lotto_to_batches[lotto_key].append(batch_key)
 
@@ -505,11 +507,13 @@ def compute_raw_yarn_matches(df: pd.DataFrame, magazino_summary: pd.DataFrame,
             remaining[key] -= needed
             return [key[1]]
         # A split match may use two Partitas, never three or more.  Choose
-        # the smallest pair that covers the colour so excess stock is not
-        # consumed unnecessarily.
+        # the smallest same-Lotto pair that covers the colour so excess
+        # stock is not consumed unnecessarily or mixed across lots.
         pairs = [
             pair for pair in combinations(candidates, 2)
-            if remaining[pair[0]] + remaining[pair[1]] >= needed
+            if batch_to_lotto.get(pair[0])
+            and batch_to_lotto.get(pair[0]) == batch_to_lotto.get(pair[1])
+            and remaining[pair[0]] + remaining[pair[1]] >= needed
         ]
         if not pairs:
             return None
@@ -817,15 +821,12 @@ def find_price_anomalies(df):
 
         if issue:
             partita = clean_text(row.get("partita", ""))
-            partita_colore = partita or colore or clean_text(row.get("codice", ""))
-            if partita and colore and partita != colore:
-                partita_colore = f"{partita} ({colore})"
             out.append({
                 "cliente": row.get("cliente", ""),
                 "articolo": articolo,
                 "colore": colore,
                 "codice": clean_text(row.get("codice", "")) or colore,
-                "partita_colore": partita_colore,
+                "partita_colore": partita,
                 "ordine": row.get("ordine", ""),
                 "riga": row.get("riga", ""),
                 "bagno": row.get("bagno", ""),

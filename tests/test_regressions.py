@@ -341,6 +341,31 @@ class PlanningRegressionTests(unittest.TestCase):
         row["yarn_arrival_date"] = "2026-09-08"
         self.assertEqual(compute_delivery_date(row), "2026-09-15")
 
+    def test_raw_yarn_split_match_requires_partitas_from_same_lotto(self):
+        from calculate.situazione import compute_raw_yarn_matches
+
+        shortage = pd.DataFrame([{
+            "articolo": "C010032S", "comment": "PG-X", "rocche": 10,
+        }])
+        stock = pd.DataFrame([
+            {"articolo": "G010032S", "partita": "P1", "mag_rocche": 6},
+            {"articolo": "G010032S", "partita": "P2", "mag_rocche": 6},
+        ])
+
+        different_lotti = pd.DataFrame([
+            {"partita": "P1", "lotto": "L1"},
+            {"partita": "P2", "lotto": "L2"},
+        ])
+        self.assertEqual(
+            compute_raw_yarn_matches(shortage, stock, different_lotti).loc[0], ""
+        )
+
+        same_lotto = different_lotti.assign(lotto="L1")
+        self.assertEqual(
+            compute_raw_yarn_matches(shortage, stock, same_lotto).loc[0],
+            "G010032S / P1 + P2",
+        )
+
     def test_delivery_dates_leave_non_elvy_blank(self):
         frame = pd.DataFrame([{"cliente": "3004", "data": "2026-09-07", "mc": 24}])
         result = compute_delivery_dates(frame)
@@ -535,8 +560,31 @@ class PlanningRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(color_errors), 1)
         self.assertEqual(color_errors.loc[0, "articolo"], "A1")
-        self.assertEqual(color_errors.loc[0, "partita_colore"], "P-100 (Blu)")
+        self.assertEqual(color_errors.loc[0, "partita_colore"], "P-100")
         self.assertNotIn("key", color_errors.columns)
+
+    def test_situazione_raw_yarn_notifications_resolve_when_match_disappears(self):
+        from gui.tabs.situazione_refresh import SituationRefreshMixin
+        from utility import notifications
+
+        key_prefix = "situazione-raw-yarn-available:"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(notifications, "_PATH", Path(temp_dir) / "notifications.json"):
+                notifications.add(f"{key_prefix}P1", "Available", "match", "Situazione Generale")
+                notifications.add(f"{key_prefix}P2", "Available", "match", "Situazione Generale")
+
+                tab = object.__new__(SituationRefreshMixin)
+                tab.current_df = pd.DataFrame([{
+                    "partita": "P1", "raw_yarn_match": "G010032S / R1",
+                }])
+                tab._on_notification = lambda *args: None
+
+                tab._notify_raw_yarn_available()
+
+                self.assertEqual(
+                    {item["key"] for item in notifications.list_open()},
+                    {f"{key_prefix}P1"},
+                )
 
     def test_canonical_ui_tab_imports(self):
         from gui.tabs.biglietti_tab import BigliettiTab
