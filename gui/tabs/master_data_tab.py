@@ -32,6 +32,9 @@ class MasterDataTab(ttk.Frame):
             for col in columns:
                 tree.heading(col, text=col.replace("_", " ").title())
                 tree.column(col, width=180, anchor="w")
+            scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            scroll.grid(row=0, column=3, sticky="ns")
+            tree.configure(yscrollcommand=scroll.set)
             tree.grid(row=0, column=0, columnspan=3, sticky="nsew")
             ttk.Button(frame, text="Add", command=lambda k=key: self._edit(k)).grid(row=1, column=0, sticky="w", pady=(8, 0))
             ttk.Button(frame, text="Edit", command=lambda k=key: self._edit(k)).grid(row=1, column=1, padx=5, pady=(8, 0))
