@@ -1100,6 +1100,54 @@ def _partita_key(value: Any) -> str:
     return value.casefold()
 
 
+def pg_x_batch_stock_status(articles: list[str], partita_gg: str, magazino_summary) -> str:
+    """Classify an uploaded raw batch against the required raw articles."""
+    expected_articles = {
+        raw_articolo_for(article).strip().upper()
+        for article in articles
+        if _clean(article)
+    }
+    if not expected_articles:
+        return "mismatch"
+    if magazino_summary is None or magazino_summary.empty:
+        return "missing"
+
+    batch_key = _partita_key(partita_gg)
+    batch_stock = magazino_summary[
+        magazino_summary["partita"].map(_partita_key) == batch_key
+    ]
+    if batch_stock.empty:
+        return "missing"
+
+    stocked_articles = set(
+        batch_stock["articolo"].astype(str).str.strip().str.upper()
+    )
+    return "available" if expected_articles.issubset(stocked_articles) else "mismatch"
+
+
+def remove_uploaded_pgx_rows(path: Path, row_indices: list[int]) -> int:
+    """Remove successfully processed data rows from the uploaded workbook."""
+    if not row_indices:
+        return 0
+
+    from openpyxl import load_workbook
+
+    path = Path(path)
+    workbook = load_workbook(path, keep_vba=path.suffix.casefold() == ".xlsm")
+    try:
+        worksheet = workbook.active
+        removed = 0
+        for row_index in sorted(set(row_indices), reverse=True):
+            if row_index > 1 and row_index <= worksheet.max_row:
+                worksheet.delete_rows(row_index, 1)
+                removed += 1
+        if removed:
+            safe_save_workbook(workbook, path)
+        return removed
+    finally:
+        workbook.close()
+
+
 def _is_pg_x(value: Any) -> bool:
     text = _clean(value).upper().replace(" ", "")
     return not text or text in {"X", "PG-X", "PGX"}
@@ -1473,13 +1521,16 @@ def save_pg_x_partita(
     magazino_summary=None,
     allow_article_mismatch: bool = False,
     lotto: str = "",
+    allow_missing_magazino_batch: bool = False,
+    move_to_orders: bool = True,
 ) -> dict[str, Any]:
-    """Assign raw yarn to a PG-X color, enrich it, and move it to Orders.
+    """Assign raw yarn to a PG-X color and optionally move it to Orders.
 
     ``lotto`` is an optional identifier extracted from ``Commento``.  When it
     is supplied, callers may validate it against the warehouse summary before
     calling this function; the final Partita GG is always the selected stock
-    batch.
+    batch. Set ``move_to_orders=False`` to leave the assigned row in PG-X for
+    a later manual move.
     """
     from openpyxl import load_workbook
 
@@ -1513,14 +1564,8 @@ def save_pg_x_partita(
         raise ValueError(f"Partita Col '{partita_col}' was not found in PG-X.")
 
     source_map = {header: index + 1 for index, header in enumerate(pg_headers)}
-    updates = {"Partita GG": partita_gg}
     batch_number = _number(partita_gg)
     density_entry = densita_map.get(int(batch_number)) if batch_number is not None else None
-    if density_entry:
-        updates["KG"] = [
-            _number(pg_ws.cell(row=row_idx, column=header_col(pg_headers, "Rocche")).value) or 0
-            for row_idx in matching_rows
-        ]
     moved_rows = []
     available_total = 0.0
     for row_idx in matching_rows:
@@ -1544,12 +1589,16 @@ def save_pg_x_partita(
             color_article = _clean(values.get("Articolo")).upper()
             expected_raw_article = raw_articolo_for(color_article)
             batch_key = str(int(batch_number)) if batch_number is not None else _clean(partita_gg)
+            batch_stock = magazino_summary[
+                magazino_summary["partita"].map(_partita_key) == batch_key
+            ]
             matching_stock = magazino_summary[
                 (magazino_summary["articolo"].astype(str).str.strip().str.upper() == expected_raw_article)
                 & (magazino_summary["partita"].map(_partita_key) == batch_key)
             ]
             if matching_stock.empty:
-                if not allow_article_mismatch:
+                batch_is_unknown = batch_stock.empty
+                if not (batch_is_unknown and allow_missing_magazino_batch) and not allow_article_mismatch:
                     wb.close()
                     raise ValueError(
                         f"Partita GG {partita_gg} does not belong to article {expected_raw_article} "
@@ -1566,16 +1615,17 @@ def save_pg_x_partita(
             values["VMM22"] = round(vmm_ratio_map[int(batch_number)] * (rocche or 0), 2)
         moved_rows.append([values.get(header, "") for header in order_headers])
 
-    # The old implementation updated the PG-X row in place but never
-    # appended the prepared row to Orders, so the UI claimed success while
-    # the assigned color disappeared on the next reload.
-    for row in moved_rows:
-        orders_ws.append(row)
+    if move_to_orders:
+        for row in moved_rows:
+            orders_ws.append(row)
 
-    for row_idx, row in zip(matching_rows, moved_rows):
-        values = dict(zip(order_headers, row))
-        for header, col_idx in ((header, index + 1) for index, header in enumerate(pg_headers)):
-            pg_ws.cell(row=row_idx, column=col_idx).value = values.get(header, "")
+        for row_idx in reversed(matching_rows):
+            pg_ws.delete_rows(row_idx, 1)
+    else:
+        for row_idx, row in zip(matching_rows, moved_rows):
+            values = dict(zip(order_headers, row))
+            for header, col_idx in source_map.items():
+                pg_ws.cell(row=row_idx, column=col_idx).value = values.get(header, "")
 
     def sort_sheet(ws, headers):
         col_idx = header_col(headers, "Partita Col")

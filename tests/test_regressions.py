@@ -554,6 +554,8 @@ class PlanningRegressionTests(unittest.TestCase):
             "partita": "P-100",
             "prezzo": 12.0,
             "prezzo_lisini": 10.0,
+            "ordine": "O-20",
+            "riga": 3,
         }])
 
         color_errors = _price_color_anomalies(situazione)
@@ -561,6 +563,8 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(len(color_errors), 1)
         self.assertEqual(color_errors.loc[0, "articolo"], "A1")
         self.assertEqual(color_errors.loc[0, "partita_colore"], "P-100")
+        self.assertEqual(color_errors.loc[0, "ordine"], "O-20")
+        self.assertEqual(color_errors.loc[0, "riga"], 3)
         self.assertNotIn("key", color_errors.columns)
 
     def test_situazione_raw_yarn_notifications_resolve_when_match_disappears(self):
@@ -780,6 +784,133 @@ class PlanningRegressionTests(unittest.TestCase):
             self.assertEqual(len(orders_rows), 0)
             self.assertEqual(pg_x_rows[0].bagno, "S999")
             self.assertEqual(pg_x_rows[0].quantity_cones, 40)
+
+    def test_uploading_pgx_batch_assigns_only_selected_row_without_moving_to_orders(self):
+        from exporters.biglietti_exporter import (
+            OrderRecord, append_create_excel, load_create_excel_records,
+            move_pg_x_to_orders,
+            pg_x_batch_stock_status, save_pg_x_partita,
+        )
+
+        def record(partita_col):
+            return OrderRecord(
+                customer_code="3009", customer_name="ELVY", article="C130027S",
+                description="", additional_raw="", color_code="5305",
+                color_name="EL-281311", order_no="7777", order_row="1",
+                colored_batch=partita_col, raw_batch="PG-X", quantity_cones=32,
+                raw_weight=30, dispo="D-00505450-001", bagno="S940",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            append_create_excel(path, [record("157890"), record("157891")], "ELVY")
+            available_stock = pd.DataFrame([
+                {"articolo": "G130027S", "partita": "158694", "mag_rocche": 32},
+            ])
+            self.assertEqual(
+                pg_x_batch_stock_status(["C130027S"], "158694", available_stock),
+                "available",
+            )
+
+            result = save_pg_x_partita(
+                path, "157890", "158694", magazino_summary=available_stock,
+                move_to_orders=False,
+            )
+            self.assertEqual(result["updated"], 1)
+            self.assertEqual(
+                load_create_excel_records(path, sheet_name="Orders"),
+                [],
+            )
+            remaining_pgx = load_create_excel_records(path, sheet_name="PG-X")
+            self.assertEqual([row.colored_batch for row in remaining_pgx], ["157890", "157891"])
+            self.assertEqual(remaining_pgx[0].raw_batch, "158694")
+
+            self.assertEqual(move_pg_x_to_orders(path, "157890"), 1)
+            self.assertEqual(
+                [row.colored_batch for row in load_create_excel_records(path, sheet_name="Orders")],
+                ["157890"],
+            )
+            self.assertEqual(
+                [row.colored_batch for row in load_create_excel_records(path, sheet_name="PG-X")],
+                ["157891"],
+            )
+
+            missing_stock = pd.DataFrame(columns=["articolo", "partita", "mag_rocche"])
+            self.assertEqual(
+                pg_x_batch_stock_status(["C130027S"], "999999", missing_stock),
+                "missing",
+            )
+            with self.assertRaisesRegex(ValueError, "does not belong to article"):
+                save_pg_x_partita(
+                    path, "157891", "999999", magazino_summary=missing_stock,
+                )
+            save_pg_x_partita(
+                path, "157891", "999999", magazino_summary=missing_stock,
+                allow_missing_magazino_batch=True,
+                move_to_orders=False,
+            )
+            self.assertEqual(
+                [row.raw_batch for row in load_create_excel_records(path, sheet_name="PG-X")],
+                ["999999"],
+            )
+
+    def test_upload_stock_warning_cannot_override_a_different_raw_article(self):
+        from exporters.biglietti_exporter import (
+            OrderRecord, append_create_excel, pg_x_batch_stock_status,
+            save_pg_x_partita,
+        )
+
+        record = OrderRecord(
+            customer_code="3009", customer_name="ELVY", article="C130027S",
+            description="", additional_raw="", color_code="5305",
+            color_name="EL-281311", order_no="7777", order_row="1",
+            colored_batch="157890", raw_batch="PG-X", quantity_cones=32,
+            raw_weight=30, dispo="D-00505450-001", bagno="S940",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared.xlsx"
+            append_create_excel(path, [record], "ELVY")
+            wrong_article_stock = pd.DataFrame([
+                {"articolo": "G999999S", "partita": "158694", "mag_rocche": 32},
+            ])
+            self.assertEqual(
+                pg_x_batch_stock_status(["C130027S"], "158694", wrong_article_stock),
+                "mismatch",
+            )
+            with self.assertRaisesRegex(ValueError, "does not belong to article"):
+                save_pg_x_partita(
+                    path, "157890", "158694",
+                    magazino_summary=wrong_article_stock,
+                    allow_missing_magazino_batch=True,
+                )
+
+    def test_pgx_upload_removes_only_successful_rows_from_source_file(self):
+        from exporters.biglietti_exporter import remove_uploaded_pgx_rows
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "raw-batches.xlsx"
+            workbook = openpyxl.Workbook()
+            worksheet = workbook.active
+            worksheet.append(["Partita Col", "Partita GG"])
+            worksheet.append(["157890", "158694"])
+            worksheet.append(["157891", "wrong article"])
+            worksheet.append(["157892", "not in magazino"])
+            workbook.save(path)
+            workbook.close()
+
+            self.assertEqual(remove_uploaded_pgx_rows(path, [2, 4]), 2)
+
+            workbook = openpyxl.load_workbook(path, data_only=True)
+            try:
+                self.assertEqual(
+                    list(workbook.active.values),
+                    [
+                        ("Partita Col", "Partita GG"),
+                        ("157891", "wrong article"),
+                    ],
+                )
+            finally:
+                workbook.close()
 
     def test_show_orders_deduplicates_partita_col_across_orders_and_pg_x(self):
         from exporters.biglietti_exporter import CREATE_EXCEL_HEADERS, deduplicate_create_excel

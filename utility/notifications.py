@@ -119,6 +119,34 @@ def resolve(key: str) -> None:
     update_status(key, "resolved")
 
 
+def resolve_missing(prefix: str, current_keys: Iterable[str]) -> int:
+    """Resolve open notifications under *prefix* whose issue no longer exists.
+
+    A pass that reports the complete list of current problems for a feature
+    passes that list as *current_keys*; any open notification with this key
+    prefix that is NOT in it was fixed, so it closes by itself instead of
+    staying open until someone resolves it by hand. Snoozed notifications are
+    closed too. Returns how many were resolved.
+
+    Call this only after the pass actually completed -- never after a
+    failure, or every notification would look "fixed".
+    """
+    keep = set(current_keys)
+    items = _read()
+    resolved = 0
+    for item in items:
+        key = str(item.get("key", ""))
+        if item.get("resolved") or not key.startswith(prefix) or key in keep:
+            continue
+        item["status"] = "resolved"
+        item["resolved"] = True
+        item["snoozed_until"] = ""
+        resolved += 1
+    if resolved:
+        _write(items)
+    return resolved
+
+
 def update_status(key: str, status: str) -> None:
     items = _read()
     changed = False

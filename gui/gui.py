@@ -521,7 +521,10 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         )
         notebook.add(self._prezzi_tab, text="Prezzi")
 
-        self._master_data_tab = MasterDataTab(notebook, on_data_changed=self._refresh_notification_badge)
+        self._master_data_tab = MasterDataTab(
+            notebook, on_data_changed=self._refresh_notification_badge,
+            prezzi_tab=self._prezzi_tab,
+        )
         notebook.add(self._master_data_tab, text="Master Data")
 
         log_tab = ttk.Frame(notebook)
@@ -966,60 +969,6 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         log_scroll = ttk.Scrollbar(log_frame, command=self._log_text.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
         self._log_text.configure(yscrollcommand=log_scroll.set)
-        self._log_text.tag_configure("INFO", foreground="#4FC1FF")
-        self._log_text.tag_configure("WARNING", foreground="#FFD700")
-        self._log_text.tag_configure("ERROR", foreground="#F44747")
-        self._log_text.tag_configure("DEBUG", foreground="#858585")
-
-    def _update_log_visibility(self, notebook: ttk.Notebook, situazione_tab: ttk.Frame,
-                                settimana_tab: ttk.Frame, magazino_tab: ttk.Frame,
-                                ordine_notebook: ttk.Notebook,
-                                situazione_notebook: ttk.Notebook) -> None:
-        """Hide the shared log where the page has its own full-screen workspace."""
-        selected_top = notebook.select()
-        top_text = notebook.tab(selected_top, "text")
-        data_elvy_selected = top_text == "Data Elvy"
-        magazino_selected = selected_top == str(magazino_tab)
-        overview_selected = selected_top == str(self._overview_tab)
-        prezzi_selected = selected_top == str(self._prezzi_tab)
-        biglietti_selected = top_text == "Create (EXCEL+Biglietti)" or selected_top == str(self._biglietti_tab)
-
-        situazione_selected = settimana_selected = False
-        kamal_selected = ordini_selected = ordine_med_selected = False
-        if top_text == "Situazione":
-            inner = situazione_notebook.select()
-            situazione_selected = inner == str(situazione_tab)
-            settimana_selected = inner == str(settimana_tab)
-        elif top_text == "Ordine":
-            inner_text = ordine_notebook.tab(ordine_notebook.select(), "text")
-            kamal_selected = inner_text == "Ordine Kamal"
-            ordini_selected = inner_text == "Ordine Elvy"
-            ordine_med_selected = inner_text == "Ordine Med"
-        # Do not trigger heavy shared-file loading while switching tabs.
-        # Keep the UI responsive; shared DFM/Produzione loads happen only when
-        # the user explicitly refreshes or uploads on the target page.
-        if (
-            situazione_selected
-            or settimana_selected
-            or magazino_selected
-            or kamal_selected
-            or data_elvy_selected
-            or ordini_selected
-            or ordine_med_selected
-            or overview_selected
-            or prezzi_selected
-            or biglietti_selected
-        ):
-            self._log_frame.grid_remove()
-            self.rowconfigure(2, weight=0)
-            self.rowconfigure(1, weight=5)
-            notebook.configure(height=1)
-        else:
-            self._log_frame.grid()
-            self.rowconfigure(1, weight=3)
-            self.rowconfigure(2, weight=1)
-            notebook.configure(height=220)
-
         self._log_text.tag_configure("INFO", foreground="#4FC1FF")
         self._log_text.tag_configure("WARNING", foreground="#FFD700")
         self._log_text.tag_configure("ERROR", foreground="#F44747")

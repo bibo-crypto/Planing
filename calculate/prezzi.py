@@ -8,7 +8,7 @@ import re
 
 import pandas as pd
 
-from utility.utils import clean_text, logger
+from utility.utils import APP_DATA_DIR, clean_text, logger
 
 REQUIRED_COLUMNS = [
     "DATAFINEVAL", "DATAINIZIOVAL", "CLARTICOLO", "DESCRIZARTICOLOLI", "CLCOLORE",
@@ -100,6 +100,7 @@ def _find_column(columns, *aliases):
 
 
 _REFERENCE_MAP_PATH = Path(__file__).resolve().parent.parent / "data" / "prezzi_category_map.json"
+_CATEGORY_OVERRIDES_PATH = APP_DATA_DIR / "settings" / "prezzi_category_overrides.json"
 
 
 def reference_map_fingerprint() -> tuple[int, int] | None:
@@ -110,6 +111,14 @@ def reference_map_fingerprint() -> tuple[int, int] | None:
     """
     try:
         stat = _REFERENCE_MAP_PATH.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _category_overrides_fingerprint() -> tuple[int, int] | None:
+    try:
+        stat = _CATEGORY_OVERRIDES_PATH.stat()
     except OSError:
         return None
     return (stat.st_mtime_ns, stat.st_size)
@@ -152,6 +161,157 @@ def _reference_category_map() -> dict[str, str]:
     return _load_reference_category_map((str(path), reference_map_fingerprint()))
 
 
+def _load_category_overrides() -> dict[str, str]:
+    path = _CATEGORY_OVERRIDES_PATH
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.error("Prezzi: couldn't load manual category assignments %s: %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        logger.error("Prezzi: manual category assignments in %s must be a JSON object", path)
+        return {}
+    return {
+        clean_text(article).upper(): _format_category(category)
+        for article, category in raw.items()
+        if clean_text(article) and clean_text(category)
+    }
+
+
+def load_category_overrides() -> dict[str, str]:
+    """Return saved manual article-to-category assignments."""
+    return _load_category_overrides()
+
+
+def save_category_override(article: str, category: str) -> None:
+    article_key = clean_text(article).upper()
+    category_value = _format_category(category)
+    if not article_key or not category_value:
+        raise ValueError("Both article and category are required.")
+    overrides = _load_category_overrides()
+    overrides[article_key] = category_value
+    path = _CATEGORY_OVERRIDES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(overrides, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def remove_category_override(article: str) -> None:
+    article_key = clean_text(article).upper()
+    if not article_key:
+        return
+    overrides = _load_category_overrides()
+    if article_key not in overrides:
+        return
+    del overrides[article_key]
+    path = _CATEGORY_OVERRIDES_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(overrides, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def known_categories(df: pd.DataFrame | None = None) -> list[str]:
+    categories = set(_reference_category_map().values())
+    categories.update(_load_category_overrides().values())
+    if df is not None and not df.empty and "CATEGORY" in df.columns:
+        categories.update(
+            _format_category(value)
+            for value in df["CATEGORY"].dropna()
+            if clean_text(value)
+        )
+    return sorted((category for category in categories if category), key=str.casefold)
+
+
+def override_warning(article: str, category: str) -> str:
+    article_key = clean_text(article).upper()
+    category_customer = clean_text(category).split("-", 1)[0].casefold()
+    expected_customer = _category_customer_map(_reference_category_map()).get(article_key[:4], "")
+    if expected_customer and category_customer and category_customer != expected_customer:
+        return (
+            f"Article family {article_key[:4]} belongs to {expected_customer}, "
+            f"but this category belongs to {category_customer}."
+        )
+    return ""
+
+
+def category_review_table(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return one review row for each unresolved article in the Listini data."""
+    columns = ["articolo", "descrizione", "customer", "colori", "suggestion", "evidence"]
+    if df is None or df.empty or "_CATEGORY_REVIEW" not in df.columns:
+        return pd.DataFrame(columns=columns)
+
+    review = df[df["_CATEGORY_REVIEW"].fillna(False)].copy()
+    if review.empty:
+        return pd.DataFrame(columns=columns)
+    article_customers = _category_customer_map(_reference_category_map())
+    categorized = df[df["CATEGORY"].fillna("").astype(str).str.strip().ne("")].copy()
+    suggestions: dict[str, dict[str, int]] = {}
+    required = {"CLARTICOLO", "CLCOLORE", "LIVELLOLPZ", "PREZZOLPZ"}
+    if required.issubset(df.columns) and not categorized.empty:
+        categorized["_article_key"] = categorized["CLARTICOLO"].map(
+            lambda value: clean_text(value).upper()
+        )
+        categorized["_customer_key"] = categorized["_article_key"].map(
+            lambda article: article_customers.get(article[:4], "")
+        )
+        categorized["_color_key"] = categorized["CLCOLORE"].map(_signature_code)
+        categorized["_level_key"] = categorized["LIVELLOLPZ"].map(_signature_number)
+        categorized["_price_key"] = categorized["PREZZOLPZ"].map(_signature_number)
+        peer_categories: dict[tuple, set[str]] = {}
+        for customer, color, level, price, category in categorized[
+            ["_customer_key", "_color_key", "_level_key", "_price_key", "CATEGORY"]
+        ].dropna(subset=["_level_key", "_price_key"]).itertuples(index=False, name=None):
+            if customer and color:
+                peer_categories.setdefault((customer, color, level, price), set()).add(
+                    _format_category(category)
+                )
+
+        for article, rows in review.groupby("CLARTICOLO", sort=False):
+            article_key = clean_text(article).upper()
+            customer = article_customers.get(article_key[:4], "")
+            if not customer:
+                continue
+            article_suggestions: dict[str, int] = {}
+            signatures = rows[["CLCOLORE", "LIVELLOLPZ", "PREZZOLPZ"]].drop_duplicates()
+            for color, level, price in signatures.itertuples(index=False, name=None):
+                level_key = _signature_number(level)
+                price_key = _signature_number(price)
+                color_key = _signature_code(color)
+                if level_key is None or price_key is None or not color_key:
+                    continue
+                for candidate in peer_categories.get((customer, color_key, level_key, price_key), ()):
+                    article_suggestions[candidate] = article_suggestions.get(candidate, 0) + 1
+            suggestions[article_key] = article_suggestions
+
+    rows_out = []
+    for article, rows in review.groupby("CLARTICOLO", sort=False):
+        article_key = clean_text(article).upper()
+        candidates = suggestions.get(article_key, {})
+        suggestion = next(iter(candidates)) if len(candidates) == 1 else ""
+        rows_out.append({
+            "articolo": article_key,
+            "descrizione": next(
+                (clean_text(value) for value in rows.get("DESCRIZARTICOLOLI", pd.Series(dtype=object)) if clean_text(value)),
+                "",
+            ),
+            "customer": article_customers.get(article_key[:4], ""),
+            "colori": rows["CLCOLORE"].nunique() if "CLCOLORE" in rows.columns else len(rows),
+            "suggestion": suggestion,
+            "evidence": candidates.get(suggestion, 0) if suggestion else 0,
+        })
+    return pd.DataFrame(rows_out, columns=columns).sort_values("articolo").reset_index(drop=True)
+
+
 def category_for_article(article) -> str:
     """Reference category for an article, whether or not it has any Listini row.
 
@@ -161,7 +321,7 @@ def category_for_article(article) -> str:
     key = clean_text(article).upper()
     if not key:
         return ""
-    mapping = _reference_category_map()
+    mapping = _reference_category_map() | _load_category_overrides()
     category = mapping.get(key, "")
     if not category and key[:1] in {"C", "G"}:
         twin = ("G" if key[0] == "C" else "C") + key[1:]
@@ -214,6 +374,9 @@ def enrich_categories(df: pd.DataFrame) -> pd.DataFrame:
     article_keys = out["CLARTICOLO"].map(lambda value: clean_text(value).upper())
     out["CATEGORY"] = article_keys.map(article_categories).fillna("")
     out["CATEGORY"] = provided_category.where(provided_category.ne(""), out["CATEGORY"])
+    overrides = _load_category_overrides()
+    manual_categories = article_keys.map(overrides).fillna("")
+    out["CATEGORY"] = manual_categories.where(manual_categories.ne(""), out["CATEGORY"])
     customer_col = _find_column(out.columns, "CUSTOMER", "CLIENTE", "CLCLIENTE", "CODCLIENTE")
     marca_col = _find_column(out.columns, "MARCA", "BRAND", "MARCHIO")
     if customer_col and marca_col:
@@ -361,11 +524,11 @@ def load_prezzi(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:
     try:
         source = Path(path).resolve()
         stat = source.stat()
-        # 7: CLCOLORE/LIVELLOLPZ round-trip fix (older SQLite frames lost
-        # leading zeros). The reference-map stat is included because CATEGORY
-        # is baked into the cached frame from data/prezzi_category_map.json.
+        # 8: include the category reference and manual-override fingerprints;
+        # both are baked into CATEGORY in the cached frame.
         fingerprint = (
-            7, str(source), stat.st_mtime_ns, stat.st_size, reference_map_fingerprint(),
+            8, str(source), stat.st_mtime_ns, stat.st_size,
+            reference_map_fingerprint(), _category_overrides_fingerprint(),
         )
     except OSError:
         pass

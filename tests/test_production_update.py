@@ -110,6 +110,56 @@ def test_unknown_article_with_conflicting_peer_categories_is_flagged_for_review(
     assert "no unambiguous Category match" in issue["message"]
 
 
+def test_master_data_category_review_assignments_persist_and_reapply(tmp_path, monkeypatch):
+    reference_map = tmp_path / "category-map.json"
+    reference_map.write_text(
+        '{"MED-Cottone": ["C010003S"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(prezzi, "_REFERENCE_MAP_PATH", reference_map)
+    monkeypatch.setattr(
+        prezzi, "_CATEGORY_OVERRIDES_PATH",
+        tmp_path / "settings" / "prezzi_category_overrides.json",
+    )
+    prezzi._load_reference_category_map.cache_clear()
+    try:
+        frame = pd.DataFrame([
+            {"CLARTICOLO": "C010003S", "DESCRIZARTICOLOLI": "Known",
+             "CLCOLORE": "00101", "LIVELLOLPZ": 1, "PREZZOLPZ": 4.0},
+            {"CLARTICOLO": "C010999S", "DESCRIZARTICOLOLI": "Review",
+             "CLCOLORE": "00101", "LIVELLOLPZ": 1, "PREZZOLPZ": 4.0},
+            {"CLARTICOLO": "C010999S", "DESCRIZARTICOLOLI": "Review",
+             "CLCOLORE": "00777", "LIVELLOLPZ": 1, "PREZZOLPZ": 6.0},
+        ])
+
+        enriched = prezzi.enrich_categories(frame)
+        review = prezzi.category_review_table(enriched)
+        assert review.to_dict("records") == [{
+            "articolo": "C010999S",
+            "descrizione": "Review",
+            "customer": "med",
+            "colori": 2,
+            "suggestion": "MED-Cottone",
+            "evidence": 1,
+        }]
+
+        prezzi.save_category_override("c010999s", "MED-COTTONE")
+        assigned = prezzi.enrich_categories(frame)
+        assert assigned["CATEGORY"].tolist() == ["MED-Cottone"] * 3
+        assert not assigned.get(
+            "_CATEGORY_REVIEW", pd.Series(False, index=assigned.index)
+        ).any()
+        assert prezzi.load_category_overrides() == {"C010999S": "MED-Cottone"}
+        assert prezzi.category_for_article("C010999S") == "MED-Cottone"
+
+        prezzi.remove_category_override("C010999S")
+        restored = prezzi.enrich_categories(frame)
+        assert (restored.loc[restored["CLARTICOLO"] == "C010999S", "CATEGORY"] == "").all()
+        assert restored.loc[restored["CLARTICOLO"] == "C010999S", "_CATEGORY_REVIEW"].all()
+    finally:
+        prezzi._load_reference_category_map.cache_clear()
+
+
 def test_color_code_lookup_pads_to_five_digits():
     frame = pd.DataFrame({
         "CLARTICOLO": ["C100"], "CLCOLORE": ["123"],

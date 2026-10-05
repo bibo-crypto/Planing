@@ -163,10 +163,15 @@ class PrezziTab(ttk.Frame):
         if source_path and Path(source_path).is_file():
             self._load_path(source_path, save_cache=False)
 
-    def _load_path(self, path: str, save_cache: bool) -> None:
+    def _load_path(self, path: str, save_cache: bool, force: bool = False, on_done=None) -> None:
         normalized_path = str(Path(path).resolve())
-        if self._base_df is not None and not self._base_df.empty and normalized_path == self._loaded_source_path:
+        if (
+            not force and self._base_df is not None and not self._base_df.empty
+            and normalized_path == self._loaded_source_path
+        ):
             self.status_var.set(f"{Path(path).name} — {len(self._base_df)} price rows")
+            if on_done:
+                on_done()
             return
         self._uploading = True
         self._btn_upload.config(state="disabled")
@@ -224,10 +229,20 @@ class PrezziTab(ttk.Frame):
                     if self._on_shared_cache_changed:
                         self._on_shared_cache_changed()
                 self._apply_search_and_sort()
+                if on_done:
+                    on_done()
 
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def reapply_categories(self, on_done=None) -> None:
+        """Reload the current Listini source against saved category overrides."""
+        if not self._loaded_source_path:
+            if on_done:
+                on_done()
+            return
+        self._load_path(self._loaded_source_path, save_cache=False, force=True, on_done=on_done)
 
     # ------------------------------------------------------------------
     # Search + sort + render

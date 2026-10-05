@@ -839,7 +839,7 @@ class OverviewTab(ttk.Frame):
             for item in price_anomalies_df.to_dict("records")
             if str(item.get("colore", "")).strip()
         })
-        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "partita_colore", "prezzo", "prezzo_lisini", "ordine", "riga", "bagno", "mc", "issue"]
+        price_anomalies_cols = ["cliente", "articolo", "codice", "colore", "prezzo", "prezzo_lisini", "ordine", "riga", "partita_colore", "bagno", "mc", "issue"]
         self._add_card(
             8, "💲 Errori Prezzo — colori", str(price_problem_colors),
             alert=price_problem_colors > 0,

@@ -18,10 +18,21 @@ from .biglietti_exports import (
     export_word,
     load_create_excel_records,
     move_pg_x_to_orders,
+    pg_x_batch_stock_status,
+    remove_uploaded_pgx_rows,
     save_pg_x_partita,
     update_order_row,
     update_pg_x_row,
 )
+
+
+def _upload_partita_key(value):
+    text = " ".join(str(value or "").split())
+    try:
+        number = float(text.replace(",", "."))
+    except ValueError:
+        return text.casefold()
+    return str(int(number)) if number.is_integer() else str(number)
 
 
 class SharedOrdersActionsMixin:
@@ -381,6 +392,8 @@ class SharedOrdersActionsMixin:
         self.after(0, lambda: self.convert_btn.config(state="normal"))
     def _upload_pgx_gg_file(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
         """Read a two-column Partita Col/Partita GG file and assign every PG-X row."""
+        if getattr(self, "_pgx_upload_running", False):
+            return
         path = filedialog.askopenfilename(parent=parent_window, title="Upload PG-X Partita file", filetypes=[("Excel files", "*.xlsx *.xlsm")])
         if not path:
             return
@@ -394,29 +407,150 @@ class SharedOrdersActionsMixin:
             if col_col is None or col_gg is None:
                 wb.close()
                 return messagebox.showerror("PG-X Upload", "The file must contain exactly the required headers: Partita Col and Partita GG.", parent=parent_window)
-            pairs = [(row[col_col], row[col_gg]) for row in ws.iter_rows(min_row=2, values_only=True) if row[col_col] not in (None, "") and row[col_gg] not in (None, "")]
+            pairs = [
+                (row_number, row[col_col], row[col_gg])
+                for row_number, row in enumerate(
+                    ws.iter_rows(min_row=2, values_only=True), start=2,
+                )
+                if row[col_col] not in (None, "") and row[col_gg] not in (None, "")
+            ]
             wb.close()
         except Exception as exc:
             return messagebox.showerror("PG-X Upload", str(exc), parent=parent_window)
         if not pairs:
             return messagebox.showinfo("PG-X Upload", "No Partita Col/Partita GG rows were found.", parent=parent_window)
 
-        def worker():
+        self._pgx_upload_running = True
+
+        def inspect_file():
             try:
                 _codes, densita_map, vmm_ratio_map, _prices, summary = self._load_common_sources()
-                updated = 0
+                pgx_records = load_create_excel_records(self.shared_excel_path, sheet_name="PG-X")
+                records_by_partita = {}
+                for record in pgx_records:
+                    key = _upload_partita_key(record.colored_batch)
+                    records_by_partita.setdefault(key, []).append(record)
+                ready = []
+                missing = []
                 errors = []
-                for partita_col, partita_gg in pairs:
-                    try:
-                        result = save_pg_x_partita(self.shared_excel_path, str(partita_col), str(partita_gg), densita_map=densita_map, vmm_ratio_map=vmm_ratio_map, magazino_summary=summary, allow_article_mismatch=False)
-                        updated += int(result.get("updated", 0))
-                    except Exception as exc:
-                        errors.append(f"{partita_col}: {exc}")
-                new_datasets = {"Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"), "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X")}
-                self.after(0, lambda: (refresh_records(new_datasets), rebuild(), messagebox.showinfo("PG-X Upload", f"Assigned {updated} row(s)." + ("\n\nErrors:\n" + "\n".join(errors) if errors else ""), parent=parent_window)))
+                for source_row, partita_col, partita_gg in pairs:
+                    article_rows = records_by_partita.get(_upload_partita_key(partita_col), [])
+                    if not article_rows:
+                        errors.append(f"{partita_col}: no matching Partita Col remains in PG-X.")
+                        continue
+                    status = pg_x_batch_stock_status(
+                        [record.article for record in article_rows], str(partita_gg), summary,
+                    )
+                    if status == "available":
+                        ready.append((source_row, partita_col, partita_gg, False))
+                    elif status == "missing":
+                        missing.append((source_row, partita_col, partita_gg))
+                    else:
+                        required = ", ".join(sorted({
+                            raw_articolo_for(record.article)
+                            for record in article_rows
+                        }))
+                        errors.append(
+                            f"{partita_col}: Partita GG {partita_gg} exists in Magazino "
+                            f"but is not for the required raw article(s) {required}; not loaded."
+                        )
+                self.after(
+                    0,
+                    lambda: confirm_missing(
+                        ready, missing, errors, densita_map, vmm_ratio_map, summary,
+                    ),
+                )
             except Exception as exc:
-                self.after(0, lambda exc=exc: messagebox.showerror("PG-X Upload", str(exc), parent=parent_window))
-        threading.Thread(target=worker, daemon=True).start()
+                self.after(0, lambda exc=exc: fail_upload(exc))
+
+        def confirm_missing(ready, missing, errors, densita_map, vmm_ratio_map, summary):
+            approved = []
+            if missing:
+                details = "\n".join(
+                    f"Partita Col {part_col} / Partita GG {part_gg}"
+                    for _source_row, part_col, part_gg in missing
+                )
+                if messagebox.askyesno(
+                    "PG-X Upload - Raw batch not in Magazino",
+                    "These Partita GG values are not present in Magazino. "
+                    "Load them anyway despite the warning?\n\n"
+                    f"{details}",
+                    parent=parent_window,
+                ):
+                    approved = [
+                        (source_row, part_col, part_gg, True)
+                        for source_row, part_col, part_gg in missing
+                    ]
+                else:
+                    errors.extend(
+                        f"{part_col}: skipped because Partita GG {part_gg} is not in Magazino."
+                        for _source_row, part_col, part_gg in missing
+                    )
+            threading.Thread(
+                target=apply_upload,
+                args=(ready + approved, errors, densita_map, vmm_ratio_map, summary),
+                daemon=True,
+            ).start()
+
+        def apply_upload(assignments, errors, densita_map, vmm_ratio_map, summary):
+            updated = 0
+            source_rows_removed = 0
+            successful_source_rows = []
+            for source_row, partita_col, partita_gg, allow_missing in assignments:
+                try:
+                    result = save_pg_x_partita(
+                        self.shared_excel_path, str(partita_col), str(partita_gg),
+                        densita_map=densita_map, vmm_ratio_map=vmm_ratio_map,
+                        magazino_summary=summary,
+                        allow_missing_magazino_batch=allow_missing,
+                        move_to_orders=False,
+                    )
+                    updated += int(result.get("updated", 0))
+                    successful_source_rows.append(source_row)
+                except Exception as exc:
+                    errors.append(f"{partita_col}: {exc}")
+            if successful_source_rows:
+                try:
+                    source_rows_removed = remove_uploaded_pgx_rows(
+                        path, successful_source_rows,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        "Rows were assigned, but could not be removed from the uploaded file: "
+                        f"{exc}"
+                    )
+            try:
+                new_datasets = {
+                    "Orders": load_create_excel_records(self.shared_excel_path, sheet_name="Orders"),
+                    "PG-X": load_create_excel_records(self.shared_excel_path, sheet_name="PG-X"),
+                }
+                self.after(
+                    0,
+                    lambda: finish_upload(
+                        updated, source_rows_removed, errors, new_datasets,
+                    ),
+                )
+            except Exception as exc:
+                self.after(0, lambda exc=exc: fail_upload(exc))
+
+        def finish_upload(updated, source_rows_removed, errors, new_datasets):
+            self._pgx_upload_running = False
+            refresh_records(new_datasets)
+            rebuild()
+            summary_text = f"Assigned {updated} row(s)."
+            if source_rows_removed:
+                summary_text += (
+                    f"\nRemoved {source_rows_removed} processed row(s) from the uploaded file."
+                )
+            if errors:
+                summary_text += "\n\nWarnings / rows not loaded:\n" + "\n".join(errors)
+            messagebox.showinfo("PG-X Upload", summary_text, parent=parent_window)
+
+        def fail_upload(exc):
+            self._pgx_upload_running = False
+            messagebox.showerror("PG-X Upload", str(exc), parent=parent_window)
+
+        threading.Thread(target=inspect_file, daemon=True).start()
     def _smart_auto_assign_pg_x(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
         """Automatically match available raw yarn in Magazino Filato with PG-X rows,
         display an interactive approval modal, and move matched rows to Orders."""
