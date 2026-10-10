@@ -409,7 +409,7 @@ class OverviewTab(ttk.Frame):
     AUTO_REFRESH_MS = 5000
     CARD_GRID_COLUMNS = 20
 
-    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None, on_shared_cache_changed=None, settimana_tab=None):
+    def __init__(self, master, situazione_tab, magazino_tab, biglietti_tab=None, prezzi_tab=None, save_prefs=None, prefs=None, on_shared_cache_changed=None, settimana_tab=None, ensure_heavy_tabs=None):
         super().__init__(master)
         self.situazione_tab = situazione_tab
         self.magazino_tab = magazino_tab
@@ -419,6 +419,7 @@ class OverviewTab(ttk.Frame):
         self._save_prefs = save_prefs
         self._prefs = prefs or {}
         self._on_shared_cache_changed = on_shared_cache_changed
+        self._ensure_heavy_tabs = ensure_heavy_tabs
         p_dir = self._prefs.get("master_data_dir")
         self._data_folder = Path(p_dir) if p_dir and Path(p_dir).is_dir() else None
 
@@ -594,6 +595,16 @@ class OverviewTab(ttk.Frame):
 
     def _on_sync_all_data(self) -> None:
         from tkinter import messagebox
+        # Master-data synchronization needs the Create/Order consumers. They
+        # are intentionally lazy at startup, so materialize them only for
+        # this operation instead of paying their parser/import cost on every
+        # application launch.
+        if self._ensure_heavy_tabs:
+            try:
+                self._ensure_heavy_tabs()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Startup", f"Could not prepare required pages:\n{exc}")
+                return
         # Reload the persisted value on every update click. This covers the
         # case where Overview was rebuilt or another tab replaced its prefs
         # mapping after the folder was selected.

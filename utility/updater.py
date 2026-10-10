@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 import zipfile
 
 
-DEFAULT_APP_VERSION = "1.1.3"
+DEFAULT_APP_VERSION = "1.1.4"
 GITHUB_REPOSITORY = "bibo-crypto/Planing"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"

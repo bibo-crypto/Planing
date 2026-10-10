@@ -16,7 +16,7 @@ import pandas as pd
 import parsers.situazione_loaders as data_loaders
 from calculate import situazione_settimana as logic
 from gui.tabs.situazione_tab import SourceRow
-from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
+from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache, save_dfm_workbook
 from parsers.prod_lookup import load_prod_cache, save_prod_cache
 from utility.excel_io import safe_save_workbook
 from utility.path_manager import source_path, save_source
@@ -138,7 +138,7 @@ class SettimanaTab(ttk.Frame):
     def _refresh_source_labels_from_cache(self):
         """Immediately display remembered file names on startup before async load."""
         dfm_cache = load_dfm_cache()
-        dfm_path = dfm_cache.get("source_path") or str(source_path("dfm", existing_only=True) or "")
+        dfm_path = str(dfm_cache.get("source_path") or "")
         if dfm_path and Path(dfm_path).is_file():
             self.source_rows["dfm"].set_status(True, f"● {Path(dfm_path).name}")
 
@@ -150,7 +150,7 @@ class SettimanaTab(ttk.Frame):
     def sync_shared_dfm(self):
         """Load the DFM selected in either page from the shared persistent cache."""
         cache = load_dfm_cache()
-        dfm_path = cache.get("source_path") or str(source_path("dfm", existing_only=True) or "")
+        dfm_path = str(cache.get("source_path") or "")
         source_path_obj = Path(str(dfm_path))
         if not source_path_obj.is_file() or self._shared_dfm_path == str(source_path_obj):
             return
@@ -170,7 +170,7 @@ class SettimanaTab(ttk.Frame):
         if self._shared_syncing:
             return
         dfm_cache = load_dfm_cache()
-        dfm_path = str(dfm_cache.get("source_path") or source_path("dfm", existing_only=True) or "")
+        dfm_path = str(dfm_cache.get("source_path") or "")
         prod_cache = load_prod_cache()
         prod_path = str(prod_cache.get("source_path") or source_path("data_prod", existing_only=True) or "")
         needs_dfm = bool(dfm_path and os.path.isfile(dfm_path) and self._shared_dfm_path != dfm_path)
@@ -215,13 +215,11 @@ class SettimanaTab(ttk.Frame):
 
     def _save_shared_dfm(self, path):
         try:
-            entries = build_dfm_lookup(Path(path))
-            if entries:
-                save_dfm_cache(entries, Path(path).name, Path(path))
-                save_source("dfm", path)
-                self._shared_dfm_path = str(Path(path))
-                if self._on_shared_cache_changed:
-                    self._on_shared_cache_changed()
+            counts = save_dfm_workbook(Path(path), Path(path).name)
+            self._shared_dfm_path = str(Path(path))
+            if self._on_shared_cache_changed:
+                self._on_shared_cache_changed()
+            logger.info("DFM imported into SQLite: %s", counts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared DFM reference: %s", exc)
 

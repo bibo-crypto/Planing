@@ -1,0 +1,2 @@
+# Batch files must have Windows line endings wherever the repository is cloned.
+*.bat text eol=crlf

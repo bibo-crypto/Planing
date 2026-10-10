@@ -251,23 +251,16 @@ def _load_articoli_marca_map_uncached(path: Path) -> tuple[dict[str, str], list[
 
 
 def load_articoli_marca_lookup() -> dict[str, str]:
-    """Convenience: re-read whatever Articoli.xlsx was last uploaded via
-    the Biglietti tab's own Articoli button (path cached in
-    articoli_cache.py), returning {} if none has been uploaded yet.
-    load_articoli_marca_map is itself disk-cached (see utility.disk_cache),
-    so repeat calls across tabs -- or across app restarts, for an
-    unchanged file -- skip the Excel parse without needing a second cache
-    layer here."""
+    """Return Articoli Marca from SQLite first; Excel is upload-only."""
     try:
-        import utility.articoli_cache as articoli_cache
+        from utility.source_manager import load as load_source
+        frame = load_source("articoli_marca")
+        if frame is not None and not frame.empty and {"articolo", "marca"}.issubset(frame.columns):
+            return {str(r.articolo).strip().upper(): str(r.marca).strip()
+                    for r in frame.itertuples(index=False) if str(r.articolo).strip() and str(r.marca).strip()}
     except Exception:
-        return {}
-    cache = articoli_cache.load_articoli_cache()
-    path = cache.get("source_path")
-    if not path or not Path(path).is_file():
-        return {}
-    marca_map, _errors = load_articoli_marca_map(Path(path))
-    return marca_map
+        pass
+    return {}
 
 
 def _titolo_lookup(articolo: str, codes_map: dict[str, str]) -> str:
@@ -289,34 +282,59 @@ def _titolo_lookup(articolo: str, codes_map: dict[str, str]) -> str:
 # here since the Prezzi tab already provides one).
 # ---------------------------------------------------------------------------
 
-_PREZZO_LOOKUP_CACHE: tuple[str, int, int, dict[tuple, tuple], str] | None = None
+_PREZZO_LOOKUP_CACHE: tuple[str, int, int, tuple, dict[tuple, tuple], str] | None = None
 
 
 def load_prezzo_lookup() -> tuple[dict[tuple, tuple], str]:
-    """Returns (lookup, source_file_name). Empty lookup + '' if nothing has
-    been uploaded to the Prezzi tab yet."""
+    """Runtime lookup: SQLite first, with a one-time legacy-file fallback."""
     global _PREZZO_LOOKUP_CACHE
+    try:
+        from utility import situazione_db
+        from utility.source_manager import is_current, load as load_source, source_name
+        from calculate import prezzi as prezzi_logic
+        if is_current("listini"):
+            # Keyed by the snapshot's CONTENT fingerprint: a new Listini with the same
+            # number of rows and columns (only prices changed) must not reuse the old
+            # lookup, and checking it first avoids re-reading ~10k rows on every call.
+            fingerprint = situazione_db.snapshot_fingerprint("listini")
+            if fingerprint:
+                key = ("sqlite", fingerprint, prezzi_logic.category_sources_fingerprint())
+                if _PREZZO_LOOKUP_CACHE and _PREZZO_LOOKUP_CACHE[:3] == key:
+                    return _PREZZO_LOOKUP_CACHE[3], _PREZZO_LOOKUP_CACHE[4]
+                df = load_source("listini")
+                if df is not None and not df.empty:
+                    # Rows saved before a category was assigned/removed keep their old
+                    # CATEGORY; re-applying the rules makes manual assignments count.
+                    df = prezzi_logic.enrich_categories(df)
+                    lookup = prezzi_logic.build_price_lookup(df)
+                    name = source_name("listini") or "SQLite"
+                    _PREZZO_LOOKUP_CACHE = (*key, lookup, name)
+                    return lookup, name
+    except Exception:
+        pass
+    # Legacy/test compatibility: if an installation has no SQLite Listini
+    # snapshot yet, allow the explicitly configured workbook to be imported.
     try:
         import utility.prezzi_cache as prezzi_cache
         import calculate.prezzi as prezzi_logic
+        cache = prezzi_cache.load_prezzi_cache()
+        path = cache.get("source_path")
+        if not path or not Path(path).is_file():
+            return {}, ""
+        source = Path(path)
+        stat = source.stat()
+        key = (str(source), stat.st_mtime_ns, stat.st_size, prezzi_logic.category_sources_fingerprint())
+        if _PREZZO_LOOKUP_CACHE and _PREZZO_LOOKUP_CACHE[:4] == key:
+            return _PREZZO_LOOKUP_CACHE[4], _PREZZO_LOOKUP_CACHE[5]
+        df, errors = prezzi_logic.load_prezzi(path)
+        if df is None or df.empty or errors:
+            return {}, ""
+        lookup = prezzi_logic.build_price_lookup(df)
+        source_file = cache.get("source_file", "")
+        _PREZZO_LOOKUP_CACHE = (*key, lookup, source_file)
+        return lookup, source_file
     except Exception:
         return {}, ""
-    cache = prezzi_cache.load_prezzi_cache()
-    path = cache.get("source_path")
-    if not path or not Path(path).is_file():
-        return {}, ""
-    source = Path(path)
-    stat = source.stat()
-    cache_key = (str(source), stat.st_mtime_ns, stat.st_size)
-    if _PREZZO_LOOKUP_CACHE and _PREZZO_LOOKUP_CACHE[:3] == cache_key:
-        return _PREZZO_LOOKUP_CACHE[3], _PREZZO_LOOKUP_CACHE[4]
-    df, _errors = prezzi_logic.load_prezzi(path)
-    if df is None or df.empty:
-        return {}, ""
-    lookup = prezzi_logic.build_price_lookup(df)
-    source_file = cache.get("source_file", "")
-    _PREZZO_LOOKUP_CACHE = (*cache_key, lookup, source_file)
-    return lookup, source_file
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +470,27 @@ def apply_machine_surcharge(price: Any, machine: Any) -> Any:
 # both keyed by Partita (raw_batch / "Partita GG").
 # ---------------------------------------------------------------------------
 
-def load_densita_query(path: Path) -> tuple[dict[int, dict[str, Any]], list[str]]:
+def load_densita_query(path: Path | None = None) -> tuple[dict[int, dict[str, Any]], list[str]]:
+    """Return Densita data from SQLite first; *path* is legacy migration only."""
+    try:
+        from utility.source_manager import load as load_source
+        frame = load_source("densita_lookup")
+        if frame is not None and not frame.empty and "partita" in frame.columns:
+            out = {}
+            for row in frame.itertuples(index=False):
+                partita = int(row.partita)
+                values = {}
+                for field in ("peso_net", "color_tube", "densita"):
+                    if hasattr(row, field):
+                        value = getattr(row, field)
+                        if value is not None and str(value) != "nan":
+                            values[field] = value
+                out[partita] = values
+            return out, []
+    except Exception:
+        pass
+    if path is None or not Path(path).is_file():
+        return {}, ["Densita' Query is not stored in SQLite yet. Upload it once to update the database."]
     from utility import disk_cache
     return disk_cache.cached_load(
         "densita_query", path, lambda: _load_densita_query_uncached(path),
@@ -499,7 +537,24 @@ def _load_densita_query_uncached(path: Path) -> tuple[dict[int, dict[str, Any]],
 # different file from the raw-yarn Magazino used elsewhere in the app.
 # ---------------------------------------------------------------------------
 
-def load_vmm22_ratio_from_magazino(path: Path) -> tuple[dict[int, float], list[str]]:
+def load_vmm22_ratio_from_magazino(path: Path | None) -> tuple[dict[int, float], list[str]]:
+    """{PARTITA: kg-per-cone}, using the SQLite Magazino snapshot first."""
+    try:
+        from utility.source_manager import load as load_source
+        frame = load_source("magazino_summary")
+        if frame is not None and not frame.empty and {"partita", "mag_rocche", "mag_peso"}.issubset(frame.columns):
+            ratio = {}
+            for row in frame.itertuples(index=False):
+                rocche = float(getattr(row, "mag_rocche") or 0)
+                peso = float(getattr(row, "mag_peso") or 0)
+                if rocche:
+                    ratio[int(row.partita)] = peso / rocche
+            if ratio:
+                return ratio, []
+    except Exception:
+        pass
+    if path is None or not Path(path).is_file():
+        return {}, ["Magazino is not stored in SQLite yet. Upload it once to update the database."]
     """{PARTITA: kg-per-cone} for VMM22, from the same raw Magazino Filato
     export already uploaded elsewhere in the app (Magazino Filato /
     Ordine Kamal tabs, cached path in magazino_cache.py) -- no separate

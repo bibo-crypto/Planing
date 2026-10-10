@@ -113,3 +113,15 @@ def summarize_by_partita(magazino_df):
         mag_rocche=("colli", "sum"), mag_peso=("esistenza", "sum"),
     ).rename(columns={"titulo": "titolo"})
     return grouped[["articolo", "titolo", "partita", "mag_rocche", "mag_peso"]].sort_values(["articolo", "partita"])
+
+
+def load_magazino_snapshot(articolo_prefix=None):
+    """Load normalized Magazino summary from SQLite without touching Excel."""
+    from utility.source_manager import load as load_source
+    df = load_source("magazino_summary")
+    if df is None or df.empty:
+        return None, ["Magazino is not stored in SQLite yet. Upload it once to update the database."]
+    if articolo_prefix is not None and "articolo" in df.columns:
+        prefixes = (articolo_prefix,) if isinstance(articolo_prefix, str) else tuple(articolo_prefix)
+        df = df[df["articolo"].astype(str).str.startswith(prefixes)]
+    return df.reset_index(drop=True), []

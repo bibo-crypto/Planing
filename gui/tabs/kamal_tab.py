@@ -75,7 +75,7 @@ class KamalTab(ttk.Frame):
         # itself) and has no competing per-tab preference to conflict with,
         # unlike Magazino/LOTTI above -- so it's safe to do proactively here,
         # fixing the gap where a returning session wouldn't reflect an
-        # already-uploaded DFM until the user re-uploads it this session.
+        # already-uploaded DFM restored from SQLite; a re-upload is only needed to update it.
         self.sync_shared_dfm()
         self.sync_shared_magazino()
         self.sync_shared_lotti()
@@ -347,7 +347,11 @@ class KamalTab(ttk.Frame):
 
         magazino_summary = None
         codes_map = None
-        if self._raw_yarn_path is not None:
+        try:
+            magazino_df, magazino_errors = magazino_logic.load_magazino_snapshot("G170")
+        except Exception:
+            magazino_df, magazino_errors = None, []
+        if magazino_df is None and self._raw_yarn_path is not None:
             self._set_status("Loading raw yarn stock (Magazino)…")
             try:
                 magazino_df, magazino_errors = magazino_logic.load_magazino(
@@ -365,7 +369,11 @@ class KamalTab(ttk.Frame):
             codes_map = {e["articolo"]: e.get("titolo", "") for e in dfm_c170_entries if e.get("titolo")}
 
         lotti_summary = None
-        if self._lotti_path is not None:
+        try:
+            lotti_df, lotti_errors = lotti_logic.load_lotti_snapshot(lotti_logic.RAW_ARTICOLO_PREFIXES)
+        except Exception:
+            lotti_df, lotti_errors = None, []
+        if lotti_df is None and self._lotti_path is not None:
             self._set_status("Loading LOTTI reference…")
             try:
                 lotti_df, lotti_errors = lotti_logic.load_lotti(str(self._lotti_path), articolo_prefix=lotti_logic.RAW_ARTICOLO_PREFIXES)

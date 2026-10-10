@@ -574,6 +574,13 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
         parts = []
         if marca_map:
             save_articoli_cache(p)
+            try:
+                import pandas as pd
+                from utility.source_manager import save as save_source_frame
+                marca_df = pd.DataFrame({"articolo": list(marca_map), "marca": list(marca_map.values())})
+                save_source_frame("articoli_marca", marca_df, p)
+            except Exception:
+                pass
             parts.append(f"{len(marca_map)} articles (Brand/Marca)")
         if titolo_df is not None and not titolo_df.empty:
             situazione_db.save_codes(titolo_df)
@@ -588,6 +595,16 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
             self.densita_path = Path(p)
             self.densita_label.config(text=p, foreground="#111827")
             save_densita_cache(p)
+            try:
+                from exporters.biglietti_exporter import load_densita_query
+                from utility.source_manager import save as save_source_frame
+                import pandas as pd
+                density_map, _ = load_densita_query(Path(p))
+                rows = [{"partita": partita, **values} for partita, values in density_map.items()]
+                if rows:
+                    save_source_frame("densita_lookup", pd.DataFrame(rows), p)
+            except Exception:
+                pass
             if self._on_shared_cache_changed:
                 self._on_shared_cache_changed()
 
@@ -598,28 +615,28 @@ class BigliettiTab(SharedOrdersWindowMixin, SharedOrdersActionsMixin, ttk.Frame)
 
     def _load_common_sources(self):
         codes_map = load_articoli_marca_lookup() or load_articoli_titolo_map()
-        densita_map = {}
-        if self.densita_path and self.densita_path.is_file():
-            densita_map, _errors = load_densita_query(self.densita_path)
-        vmm_ratio_map = {}
-        magazino_path = load_magazino_cache().get("source_path")
-        if magazino_path and Path(magazino_path).is_file():
-            vmm_ratio_map, _errors = load_vmm22_ratio_from_magazino(Path(magazino_path))
+        densita_map, _errors = load_densita_query(self.densita_path if self.densita_path and self.densita_path.is_file() else None)
+        vmm_ratio_map, _errors = load_vmm22_ratio_from_magazino(None)
         magazino_summary = None
-        if magazino_path and Path(magazino_path).is_file():
-            from calculate import magazino as magazino_logic
-            magazino_df, _errors = magazino_logic.load_magazino(Path(magazino_path), articolo_prefix=None)
-            magazino_summary = magazino_logic.summarize_by_partita(magazino_df)
-            # Keep Lotto attached to the warehouse summary when the optional
-            # LOTTI source is available. This lets PG-X resolve a Commento
-            # token (PG-<Lotto>-...) before falling back to article matching.
-            lotti_path = load_lotti_cache().get("source_path", "")
-            if lotti_path and Path(lotti_path).is_file():
-                from calculate import lotti as lotti_logic
-                lotti_df, _lotti_errors = lotti_logic.load_lotti(Path(lotti_path))
-                lotti_summary = lotti_logic.summarize_by_partita(lotti_df)
-                if not lotti_summary.empty:
-                    magazino_summary = magazino_summary.merge(lotti_summary, on="partita", how="left")
+        try:
+            from utility.source_manager import load as load_source
+            magazino_summary = load_source("magazino_summary")
+        except Exception:
+            magazino_summary = None
+        if magazino_summary is None or magazino_summary.empty:
+            magazino_path = load_magazino_cache().get("source_path")
+            if magazino_path and Path(magazino_path).is_file():
+                from calculate import magazino as magazino_logic
+                magazino_df, _errors = magazino_logic.load_magazino(Path(magazino_path), articolo_prefix=None)
+                magazino_summary = magazino_logic.summarize_by_partita(magazino_df)
+        # Keep Lotto attached to the warehouse summary from SQLite.
+        try:
+            from utility.source_manager import load as load_source
+            lotti_summary = load_source("lotti_summary")
+            if magazino_summary is not None and not magazino_summary.empty and lotti_summary is not None and not lotti_summary.empty:
+                magazino_summary = magazino_summary.merge(lotti_summary, on="partita", how="left")
+        except Exception:
+            pass
         price_lookup, _price_source = load_prezzo_lookup()
         return codes_map, densita_map, vmm_ratio_map, price_lookup, magazino_summary
 

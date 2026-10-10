@@ -54,17 +54,17 @@ expected to be refined further as more real examples turn up.
 
 Caching
 -------
-Parsing the full DFM export is a one-off, explicit action (via the Elvy
-tab's "Load DFM Color Reference" button). The *filtered* Elvy-only rows
-are then cached as JSON in the same writable per-user AppData directory
-used for settings/logs, so the app doesn't need the original (large)
-DFM.xlsx again until the user reloads a fresh export.
+Parsing the full DFM export is a one-off upload action. The normalized
+filtered rows are persisted in SQLite and restored from SQLite after restart,
+so the original (large) DFM.xlsx is not required again unless the operator
+explicitly uploads a newer source. A fresh upload replaces the corresponding
+prefix snapshot.
 """
 
 from __future__ import annotations
 
-import json
 import re
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -75,8 +75,18 @@ from utility.utils import APP_DATA_DIR, clean_text, logger
 
 CACHE_FILE = APP_DATA_DIR / "settings" / "dfm_color_cache.json"
 
+# DFM is persisted in SQLite. An explicit upload replaces the corresponding
+# snapshot; restart restores the normalized data from SQLite without requiring
+# the original workbook path to remain available.
+_ACTIVE_DFM_CACHE: dict[str, dict[str, Any]] = {}
+
 # Only rows whose ARTICOLODFM starts with this prefix are relevant to Elvy.
 ELVY_ARTICLE_PREFIX = "C130"
+
+# Every customer prefix a DFM upload is saved for (Elvy first).
+SUPPORTED_DFM_PREFIXES = (ELVY_ARTICLE_PREFIX, "C170", "C010", "C011")
+_PAIRS_SNAPSHOT = "dfm:pairs"
+_ACTIVE_DFM_PAIRS: set[tuple[str, str]] | None = None
 
 
 def _cache_file_for(prefix: str) -> Path:
@@ -156,15 +166,25 @@ def _dfm_header_key(value) -> str:
     return re.sub(r"\s+", "", str(value or "")).upper()
 
 
-def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list[dict[str, str]]:
-    """
-    Read *xlsx_path* (a DFM.xlsx-style export) and return the list of rows
-    whose ARTICOLODFM starts with *prefix* (default "C130", Elvy), reduced
-    to just the fields needed for matching: articolo, coloredfm, cldescr,
-    twist, titolo, date (ISO string, for sorting — "" if unparseable).
+class DfmReference:
+    """What ONE read of a DFM workbook yields."""
+
+    def __init__(self, entries: dict[str, list[dict[str, str]]], pairs: set[tuple[str, str]]):
+        self.entries = entries      # prefix -> lookup rows (articolo, coloredfm, cldescr, twist, titolo, date)
+        self.pairs = pairs          # every (ARTICOLODFM, COLOREDFM), any prefix, even without CLDESCR
+
+
+def build_dfm_reference(xlsx_path: Path, prefixes: tuple[str, ...] = SUPPORTED_DFM_PREFIXES) -> DfmReference:
+    """Read *xlsx_path* (a DFM.xlsx-style export) once.
+
+    Per prefix: the rows whose ARTICOLODFM starts with it, reduced to the fields
+    needed for matching. Plus the set of every (ARTICOLODFM, COLOREDFM) pair in
+    the file -- including rows without CLDESCR and articles of other customers --
+    which is what Ordine MED's "Check Articolo" needs: has this Articolo+Colore
+    combination ever been dyed?
     """
     wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
-    ws = wb.active
+    ws = wb["DFM"] if "DFM" in wb.sheetnames else wb.active
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
     headers = [_dfm_header_key(h) for h in header_row]
@@ -178,19 +198,22 @@ def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list
         )
     col_idx = {name: headers.index(name) for name in REQUIRED_COLUMNS}
 
-    entries: list[dict[str, str]] = []
+    entries: dict[str, list[dict[str, str]]] = {prefix: [] for prefix in prefixes}
+    pairs: set[tuple[str, str]] = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
         articolo = clean_text(row[col_idx["ARTICOLODFM"]])
-        if not articolo.startswith(prefix):
+        if not articolo:
             continue
-
         coloredfm = clean_text(row[col_idx["COLOREDFM"]])
+        pairs.add((articolo.upper(), coloredfm))
+        prefix = next((p for p in prefixes if articolo.startswith(p)), None)
+        if prefix is None:
+            continue
         cldescr = clean_text(row[col_idx["CLDESCR"]])
         if not coloredfm or not cldescr:
             continue
-
         date = _parse_date(row[col_idx["DATAINS"]])
-        entries.append({
+        entries[prefix].append({
             "articolo": articolo,
             "coloredfm": coloredfm,
             "cldescr": cldescr,
@@ -201,10 +224,102 @@ def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list
 
     wb.close()
     logger.info(
-        "Built DFM colour reference: %d Elvy row(s) from %s",
-        len(entries), xlsx_path.name,
+        "Built DFM reference from %s: %s; %d Articolo/Colore pair(s)",
+        xlsx_path.name, ", ".join(f"{p}={len(rows)}" for p, rows in entries.items()), len(pairs),
     )
-    return entries
+    return DfmReference(entries, pairs)
+
+
+def build_dfm_lookup(xlsx_path: Path, prefix: str = ELVY_ARTICLE_PREFIX) -> list[dict[str, str]]:
+    """Lookup rows for a single *prefix* (default "C130", Elvy); see build_dfm_reference."""
+    return build_dfm_reference(xlsx_path, (prefix,)).entries[prefix]
+
+
+def _dfm_snapshot_name(prefix: str) -> str:
+    return f"dfm:{clean_text(prefix).upper()}"
+
+
+def _entries_frame(entries: list[dict[str, str]]) -> pd.DataFrame:
+    return pd.DataFrame(list(entries or []))
+
+
+def save_dfm_workbook(
+    source_path: Path,
+    source_name: str | None = None,
+    prefixes: tuple[str, ...] = SUPPORTED_DFM_PREFIXES,
+) -> dict[str, int]:
+    """Import one DFM workbook into SQLite for every supported customer prefix.
+
+    The workbook is an update input only. Runtime consumers use the snapshots
+    created here (per-prefix lookups + every Articolo/Colore pair), all from a
+    single read of the file. Empty prefixes are saved as empty snapshots too,
+    so an upload with no rows for a customer cannot resurrect an older snapshot.
+    """
+    source_path = Path(source_path)
+    source_name = source_name or source_path.name
+    reference = build_dfm_reference(source_path, prefixes)
+    counts: dict[str, int] = {}
+    for prefix in prefixes:
+        entries = reference.entries.get(prefix, [])
+        save_dfm_cache(entries, source_name, source_path, prefix=prefix, invalidate_others=False)
+        counts[prefix] = len(entries)
+    save_dfm_pairs(reference.pairs, source_path)
+    # One explicit workbook upload is one logical source. Store its metadata
+    # after all snapshots are committed.
+    try:
+        from utility import situazione_db as db
+        db.save_upload(
+            "dfm", source_name, sum(counts.values()), "ok",
+            f"DFM imported: {counts}", file_path=str(source_path),
+        )
+    except Exception as exc:
+        logger.warning("Could not persist DFM upload metadata: %s", exc)
+    return counts
+
+
+def save_dfm_pairs(pairs: set[tuple[str, str]], source_path: Path | None = None) -> bool:
+    """Persist every Articolo/Colore pair of the uploaded DFM; True when it changed."""
+    global _ACTIVE_DFM_PAIRS
+    ordered = sorted(pairs)
+    _ACTIVE_DFM_PAIRS = set(ordered)
+    try:
+        from utility import situazione_db as db
+        db.init_db()
+        frame = pd.DataFrame(ordered, columns=["articolo", "coloredfm"])
+        return bool(db.save_frame_cache(_PAIRS_SNAPSHOT, frame, source_path=source_path))
+    except Exception as exc:
+        logger.warning("Could not persist DFM Articolo/Colore pairs: %s", exc)
+        return True
+
+
+def load_dfm_pairs() -> set[tuple[str, str]]:
+    """Every (ARTICOLODFM, COLOREDFM) pair of the saved DFM, straight from SQLite.
+
+    Ordine MED's "Check Articolo" uses this, so it works after a restart with no
+    workbook on disk and counts rows the lookup snapshots leave out (no CLDESCR,
+    other customers). A DFM saved before pairs existed falls back to the rows of
+    all four lookup snapshots (a subset) until the DFM is uploaded again.
+    """
+    global _ACTIVE_DFM_PAIRS
+    if _ACTIVE_DFM_PAIRS is not None:
+        return _ACTIVE_DFM_PAIRS
+    try:
+        from utility import situazione_db as db
+        db.init_db()
+        frame = db.load_frame_cache(_PAIRS_SNAPSHOT)
+        if frame is not None and not frame.empty:
+            _ACTIVE_DFM_PAIRS = {
+                (clean_text(a).upper(), clean_text(c))
+                for a, c in zip(frame["articolo"], frame["coloredfm"]) if clean_text(a)
+            }
+            return _ACTIVE_DFM_PAIRS
+    except Exception as exc:
+        logger.warning("Could not restore DFM Articolo/Colore pairs: %s", exc)
+    return {
+        (clean_text(e.get("articolo")).upper(), clean_text(e.get("coloredfm")))
+        for prefix in SUPPORTED_DFM_PREFIXES for e in load_dfm_entries_by_prefix(prefix)
+        if clean_text(e.get("articolo"))
+    }
 
 
 def save_dfm_cache(
@@ -212,40 +327,85 @@ def save_dfm_cache(
     source_name: str,
     source_path: Path | None = None,
     prefix: str = ELVY_ARTICLE_PREFIX,
-) -> None:
-    """Persist *entries* (plus metadata) to the cache file for *prefix*."""
+    invalidate_others: bool = True,
+) -> bool:
+    """Persist the normalized DFM lookup in SQLite and keep an in-memory copy.
+
+    SQLite is the source of truth across application restarts. A fresh upload
+    replaces the corresponding prefix snapshot, even when the file has the
+    same path/name as yesterday's export. Returns True when the stored data
+    changed. Saving the default prefix on its own drops the other prefixes (they
+    came from the previous upload); save_dfm_workbook saves them all itself and
+    passes invalidate_others=False.
+    """
+    global _ACTIVE_DFM_PAIRS
+    payload: dict[str, Any] = {
+        "source_file": source_name,
+        "source_path": str(source_path) if source_path else "",
+        "loaded_at": datetime.now().isoformat(timespec="seconds"),
+        "entries": list(entries or []),
+    }
+    _ACTIVE_DFM_CACHE[prefix] = payload
+    changed = True
     try:
-        cache_file = _cache_file_for(prefix)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {
-            "source_file": source_name,
-            "source_path": str(source_path) if source_path else "",
-            "loaded_at": datetime.now().isoformat(timespec="seconds"),
-            "entries": entries,
-        }
-        cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not save DFM colour cache (%s): %s", prefix, exc)
+        from utility import situazione_db as db
+        db.init_db()
+        # Saving the default prefix on its own is a fresh explicit DFM upload: the
+        # other prefixes' snapshots and the Articolo/Colore pairs come from the
+        # previous upload and are stale until the new workbook is read for them.
+        if prefix == ELVY_ARTICLE_PREFIX and invalidate_others:
+            conn = db.get_conn()
+            stale = [_dfm_snapshot_name(p) for p in SUPPORTED_DFM_PREFIXES if p != prefix] + [_PAIRS_SNAPSHOT]
+            for name in stale:
+                conn.execute("DELETE FROM source_snapshot WHERE source_name=?", (name,))
+                conn.execute("DELETE FROM source_snapshot_row WHERE source_name=?", (name,))
+            conn.commit(); conn.close()
+            for other in [key for key in _ACTIVE_DFM_CACHE if key != prefix]:
+                del _ACTIVE_DFM_CACHE[other]
+            _ACTIVE_DFM_PAIRS = None
+        changed = bool(db.save_frame_cache(_dfm_snapshot_name(prefix), _entries_frame(entries), source_path=source_path))
+    except Exception as exc:
+        logger.warning("Could not persist DFM snapshot for %s: %s", prefix, exc)
+    # Remove legacy JSON caches so there is one persistence authority.
+    try:
+        legacy = _cache_file_for(prefix)
+        if legacy.exists():
+            legacy.unlink()
+    except OSError as exc:
+        logger.warning("Could not remove legacy DFM cache (%s): %s", prefix, exc)
+    return changed
+
+
+def active_dfm_source() -> Path | None:
+    """Return the persisted DFM path when it still exists; the data itself
+    remains usable from SQLite even when the original workbook is gone."""
+    source = clean_text(load_dfm_cache().get("source_path"))
+    return Path(source) if source and Path(source).is_file() else None
 
 
 def load_dfm_cache(prefix: str = ELVY_ARTICLE_PREFIX) -> dict[str, Any]:
-    """
-    Load the cached DFM reference for *prefix* from disk.
-    Returns {"source_file": "", "loaded_at": "", "entries": []} if no
-    cache exists yet or it can't be read.
-    """
-    empty: dict[str, Any] = {
-        "source_file": "", "source_path": "", "loaded_at": "", "entries": []
-    }
+    """Load DFM from memory first, then SQLite after application restart."""
+    payload = _ACTIVE_DFM_CACHE.get(prefix)
+    if payload is not None:
+        return payload
     try:
-        cache_file = _cache_file_for(prefix)
-        if cache_file.is_file():
-            data = json.loads(cache_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("entries"), list):
-                return data
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not load DFM colour cache (%s): %s", prefix, exc)
-    return empty
+        from utility import situazione_db as db
+        db.init_db()
+        frame = db.load_frame_cache(_dfm_snapshot_name(prefix))
+        if frame is not None and not frame.empty:
+            entries = frame.fillna("").to_dict(orient="records")
+            uploads = db.get_upload("dfm") or {}
+            payload = {
+                "source_file": uploads.get("file_name", ""),
+                "source_path": uploads.get("file_path", ""),
+                "loaded_at": uploads.get("uploaded_at", ""),
+                "entries": [{str(k): clean_text(v) for k, v in row.items()} for row in entries],
+            }
+            _ACTIVE_DFM_CACHE[prefix] = payload
+            return payload
+    except Exception as exc:
+        logger.warning("Could not restore DFM snapshot for %s: %s", prefix, exc)
+    return {"source_file": "", "source_path": "", "loaded_at": "", "entries": []}
 
 
 # ---------------------------------------------------------------------------
@@ -497,32 +657,27 @@ def is_first_time_dyeing(
 
 
 def load_dfm_entries_by_prefix(prefix: str) -> list[dict[str, str]]:
+    """Return persisted DFM entries for a customer prefix.
+
+    The SQLite snapshot is sufficient; the original workbook is only needed
+    when the operator explicitly uploads a new DFM.
     """
-    Filtered to a different article prefix -- e.g. "C170" for Kamal,
-    instead of the Elvy-only "C130" cache. The source DFM file's path is
-    remembered in the Elvy cache, whichever page uploaded it. Results are
-    cached per prefix (dfm_color_cache_<prefix>.json); re-parsing the raw
-    DFM export (which can be 20k+ rows) only happens when that file has
-    actually changed since it was last cached for this prefix. Returns []
-    if no DFM file has been uploaded yet, or it's no longer at that path.
-    """
-    elvy_cache = load_dfm_cache()
-    source_path = elvy_cache.get("source_path", "")
-    if not source_path or not Path(source_path).is_file():
-        return []
-
-    prefix_cache = load_dfm_cache(prefix=prefix)
-    if prefix_cache.get("source_path") == source_path and prefix_cache.get("entries"):
-        return prefix_cache["entries"]
-
-    try:
-        entries = build_dfm_lookup(Path(source_path), prefix=prefix)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not load DFM entries for prefix %s: %s", prefix, exc)
-        return []
-
-    save_dfm_cache(entries, Path(source_path).name, Path(source_path), prefix=prefix)
-    return entries
+    cached = load_dfm_cache(prefix=prefix)
+    if cached.get("entries"):
+        return cached["entries"]
+    # During the current explicit upload, another prefix can be derived lazily
+    # from the same workbook. After restart, the SQLite snapshot is used and no
+    # workbook is required.
+    source_path = clean_text(load_dfm_cache().get("source_path"))
+    if source_path and Path(source_path).is_file():
+        try:
+            entries = build_dfm_lookup(Path(source_path), prefix=prefix)
+            if entries:
+                save_dfm_cache(entries, Path(source_path).name, Path(source_path), prefix=prefix)
+                return entries
+        except Exception as exc:
+            logger.warning("Could not derive DFM entries for prefix %s: %s", prefix, exc)
+    return []
 
 
 def find_articolo_by_titolo(entries: list[dict[str, str]], titolo: str) -> str:

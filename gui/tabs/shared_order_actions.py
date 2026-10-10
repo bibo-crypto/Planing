@@ -393,6 +393,8 @@ class SharedOrdersActionsMixin:
     def _upload_pgx_gg_file(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):
         """Read a two-column Partita Col/Partita GG file and assign every PG-X row."""
         if getattr(self, "_pgx_upload_running", False):
+            messagebox.showinfo("PG-X Upload", "An upload is already running. Please wait for it to finish.",
+                                parent=parent_window)
             return
         path = filedialog.askopenfilename(parent=parent_window, title="Upload PG-X Partita file", filetypes=[("Excel files", "*.xlsx *.xlsm")])
         if not path:
@@ -464,6 +466,15 @@ class SharedOrdersActionsMixin:
                 self.after(0, lambda exc=exc: fail_upload(exc))
 
         def confirm_missing(ready, missing, errors, densita_map, vmm_ratio_map, summary):
+            # Any failure here (for example the window was closed while the
+            # question was open) must release the "upload running" flag, or every
+            # later upload would be silently ignored until the app restarts.
+            try:
+                _confirm_missing(ready, missing, errors, densita_map, vmm_ratio_map, summary)
+            except Exception as exc:  # noqa: BLE001
+                fail_upload(exc)
+
+        def _confirm_missing(ready, missing, errors, densita_map, vmm_ratio_map, summary):
             approved = []
             if missing:
                 details = "\n".join(
@@ -548,7 +559,10 @@ class SharedOrdersActionsMixin:
 
         def fail_upload(exc):
             self._pgx_upload_running = False
-            messagebox.showerror("PG-X Upload", str(exc), parent=parent_window)
+            try:
+                messagebox.showerror("PG-X Upload", str(exc), parent=parent_window)
+            except Exception:  # noqa: BLE001 -- the window may already be gone
+                self._logger.exception("PG-X Upload failed: %s", exc)
 
         threading.Thread(target=inspect_file, daemon=True).start()
     def _smart_auto_assign_pg_x(self, parent_window, datasets, refresh_records, rebuild, partita_gg_var):

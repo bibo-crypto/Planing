@@ -292,8 +292,10 @@ def test_script_runs_on_its_own_without_the_rest_of_the_project(repo, tmp_path):
     assert not (repo / "logs").exists()                     # no app logging side effects
 
 
-def test_publish_bat_is_ascii_with_windows_line_endings():
+def test_publish_bat_is_ascii_with_consistent_line_endings():
     raw = (Path(publish.__file__).resolve().parent / "publish.bat").read_bytes()
     raw.decode("ascii")
-    assert raw.count(b"\r\n") == raw.count(b"\n")
+    # Git may check the file out with CRLF (Windows) or LF (a plain Linux clone);
+    # what must never happen is a mix of both.
+    assert raw.count(b"\r\n") in (0, raw.count(b"\n"))
     assert b"publish.py %*" in raw

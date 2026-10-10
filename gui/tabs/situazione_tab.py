@@ -7,6 +7,7 @@ validated separately, and per-Partita Old/New Comment history is kept in
 a local SQLite database (see situazione_db.py) instead of copy-pasted
 sheets.
 """
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
@@ -137,7 +138,11 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
         # yet the first time _load_table_from_db() runs.
         self.magazino_tab = None
 
-        db.init_db()
+        # SQLite initialization and state restoration are intentionally
+        # deferred until after Tk has painted the first window. The database
+        # remains the source of truth, but reading thousands of partita rows
+        # must not block construction of the UI.
+        self._db_restore_scheduled = False
 
         self.loaded_frames = {}   # key -> DataFrame (validated, ready to merge)
         self.sort_state = {}      # column -> ascending bool
@@ -156,10 +161,6 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
         self._shared_dfm_path = ""
         self._shared_prod_path = ""
         self._copertura_revision = 0
-        cached_copertura = db.load_frame_cache("copertura")
-        if isinstance(cached_copertura, pd.DataFrame) and not cached_copertura.empty:
-            self.loaded_frames["copertura"] = cached_copertura
-            self._copertura_revision += 1
         self._child_windows = {}
         self._price_densita_syncing = False
 
@@ -167,10 +168,59 @@ class SituazioneTab(SituationSourcesMixin, SituationRefreshMixin, ttk.Frame):
         self._build_toolbar()
         self._build_treeview()
         self._refresh_source_labels_from_db()
-        # Show the last SQLite snapshot immediately.  Excel files are restored
-        # later in a worker, so the application opens against the cache first
-        # and refreshes when the latest source files have finished loading.
-        self._load_table_from_db()
+        # Restore SQLite state only after first paint. This is deliberately
+        # asynchronous from the UI lifecycle; no Excel workbook is opened.
+        self.after_idle(self._restore_sqlite_startup)
+
+    def _restore_sqlite_startup(self) -> None:
+        """Restore the local SQLite state without blocking first paint."""
+        if self._db_restore_scheduled or not self.winfo_exists():
+            return
+        self._db_restore_scheduled = True
+
+        def worker():
+            try:
+                db.init_db()
+                cached_copertura = db.load_frame_cache("copertura")
+                states = db.get_all_states()
+                result = pd.DataFrame(states.values())
+                error = None
+            except Exception as exc:  # noqa: BLE001
+                cached_copertura, result, error = None, pd.DataFrame(), exc
+
+            def apply_result():
+                if not self.winfo_exists():
+                    return
+                if isinstance(cached_copertura, pd.DataFrame) and not cached_copertura.empty:
+                    self.loaded_frames["copertura"] = cached_copertura
+                    self._copertura_revision += 1
+                if error:
+                    logger.warning("Situazione: SQLite startup restore failed: %s", error)
+                    return
+                self.current_df = result
+                self._data_revision += 1
+                if not self.current_df.empty and "bagno" in self.current_df.columns:
+                    self.current_df = self.current_df.sort_values(
+                        by="bagno", ascending=True, key=lambda s: s.astype(str)
+                    )
+                    self.sort_state["bagno"] = False
+                self._recompute_raw_yarn_match()
+                self.current_df = business_logic.compute_delivery_dates(self.current_df)
+                if "prezzo" not in self.current_df.columns:
+                    self.current_df["prezzo"] = ""
+                self.current_df["prezzo_lisini"] = ""
+                self.current_df["densita"] = ""
+                self._render_tree(self.current_df)
+                self._recompute_prezzo_densita_async()
+                for callback in tuple(self._table_loaded_callbacks):
+                    try:
+                        callback()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Situazione: could not update dependent view: %s", exc)
+
+            self.after(0, apply_result)
+
+        threading.Thread(target=worker, name="planing-situazione-sqlite-restore", daemon=True).start()
 
     def on_shown(self) -> None:
         """Restore shared Excel sources when the Situation page is opened."""

@@ -76,24 +76,17 @@ G/C article-prefix rule remains business logic rather than a separate table.
 Changes are saved in `settings/master_data.json` and are picked up on the
 next application start.
 
-## Central database (postponed)
+## SQLite-first source architecture
 
-A central business database is deliberately not part of this phase. Existing
-source-path caches, the Situazione upload log, and the new local JSON stores
-remain in place. A future database phase can add migrations, permissions,
-history, and shared records after the operating rules and backup strategy are
-approved.
+SQLite is the local runtime source of truth. Excel workbooks are **import/update inputs only**. After a successful upload, normalized data is persisted as a SQLite snapshot and runtime consumers restore that snapshot after restart. The original workbook path is metadata and is not required for normal operation.
+
+When a workbook is uploaded again, its normalized fingerprint is compared with the stored snapshot. Identical data keeps the existing snapshot and can show a "No changes" warning; changed data replaces the snapshot. File-path fallback exists only to migrate installations that predate SQLite snapshots.
+
 ## Local SQLite persistence
 
-A central business database is still outside this phase. The existing local
-SQLite files retain operational records and derived snapshots; the shared
-`planning_orders.sqlite3` also stores a fingerprinted cache of normalized
-Listini rows so unchanged Excel files do not need to be reparsed on each
-launch. Cache entries are invalidated when the Listini source file changes.
-Listini Category values come from the bundled `data/prezzi_category_map.json`
-reference, with unknown articles inferred only from same-customer rows that
-match color, level, and price. Source-path settings remain in their existing
-JSON files.
+`utility/situazione_db.py` owns the normalized source snapshots, upload metadata, and operational state. Shared sources such as DFM, Articoli, Listini, Densita, Magazino, LOTTI, Produzione, Copertura, Wincoint, Uscita, and Qualita are restored from SQLite on startup. `utility/source_manager.py` is the small runtime facade used by cross-tab consumers.
+
+The old `*_cache.py` files remain as compatibility metadata stores (last filename/path and migration support); they are not the runtime data source. `settings/`, `cache/`, and source workbook paths may disappear without invalidating an already-imported snapshot.
 
 Packaging/build tooling stays at the repo root since it isn't application
 code: `main.spec`, `build.bat`, `installer.iss`, `requirements.txt`,
@@ -234,3 +227,34 @@ in their None-vs-0.0 failure return. Merging any of these would risk
 silently changing parsed values across pipelines that are already
 verified against real data -- if you're looking at this thinking "these
 should be one function," they were considered and kept apart on purpose.
+
+
+## Runtime data lifecycle (v1.1.3)
+
+- Excel uploads are parsed by `parsers/` and business rules live in `calculate/`.
+- Small operational state is persisted in SQLite (`utility/situazione_db.py`).
+- File-location caches are lightweight JSON metadata under the per-user AppData directory.
+- DFM is SQLite-backed like the other normalized sources. A fresh DFM upload replaces the stored normalized snapshot and its customer-prefix lookups; restart restores the snapshot without requiring the workbook.
+- Listini category resolution follows: manual/reference category -> explicit Listini Customer/Marca when present -> article-prefix customer + Articoli Marca (only when Articoli has a Marca for the article; otherwise it stays unplaced rather than joining a bare `MED -` category) -> peer inference/review. Everything that feeds `CATEGORY` (reference map, manual overrides, the Articoli file) is part of `prezzi.category_sources_fingerprint()`, which every cache of categorised data must include in its key.
+- UI refresh notifications are debounced so a burst of shared-source changes produces one sync pass.
+
+## SQLite-first source persistence (v1.1.5)
+
+Uploaded/normalized source data is persisted as SQLite snapshots. On restart, the application restores the normalized snapshot first and does not require the original Excel workbook to remain at its old path. Re-uploading a source compares the normalized data fingerprint: identical data triggers a warning and keeps the existing snapshot; changed data replaces the snapshot. DFM follows the same rule, including the normalized customer-prefix lookups used by Ordine MED/Kamal.
+
+## Runtime rules added in the 1.1.8 review
+
+- **Lazy pages are imported with `import` statements** (`make_*` factories in `gui/gui.py`), never `__import__("...")`:
+  PyInstaller only bundles modules it sees in import statements. `tests/test_runtime_fixes.py` checks this.
+- **The scheduled PG-X e-mail report lives in the Create page's constructor.** When the schedule is enabled the page is
+  built in the background after first paint (`pgx_schedule_enabled`), otherwise the report would never fire.
+- **SQLite snapshots keep their column types** (`source_snapshot.column_meta`): date columns come back as datetimes, so
+  `compute_situation` gives the same result from restored frames as from freshly parsed ones. An identical re-upload does
+  not rewrite the rows.
+- **A snapshot older than its file is not served** (`utility.source_manager.is_current/load`): if the file registered for
+  Magazino / Lotti / Listini / Densità / Articoli (path cache) differs from the one the snapshot was built from -- another
+  page registered a new file, or today's export overwrote the same file name -- callers fall back to reading the file, which
+  refreshes the snapshot. If the workbook is gone the snapshot is trusted (SQLite-first).
+- **DFM is read once per upload** (`save_dfm_workbook`): lookups for every customer prefix plus every Articolo/Colore pair
+  (`dfm:pairs`, used by Ordine MED's Check Articolo, including rows without CLDESCR and other customers).
+- **Startup never opens a modal**: Situazione refreshes at launch only when all six sources are available.

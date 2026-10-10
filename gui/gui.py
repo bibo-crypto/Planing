@@ -111,6 +111,12 @@ class _QueueHandler(logging.Handler):
 # Main Application Window
 # ---------------------------------------------------------------------------
 
+def pgx_schedule_enabled(prefs) -> bool:
+    """True when the scheduled PG-X e-mail report is switched on and has a recipient."""
+    schedule = (prefs or {}).get("pgx_report_schedule") or {}
+    return bool(schedule.get("enabled") and str(schedule.get("recipient", "")).strip())
+
+
 class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWorkflowMixin, tk.Tk):
     """
     Root Tk window.  All UI widgets live here.
@@ -185,6 +191,7 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
 
         # Thread-safe log queue (shared by both tabs)
         self._log_queue: "queue.Queue[str]" = queue.Queue()
+        self._shared_refresh_after_id = None
 
         # Let Tk paint the main window before constructing the tabs.  Several
         # tabs restore cached Excel data during construction; doing that before
@@ -346,16 +353,20 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # SQLite must be initialized before any tab tries to restore runtime
+        # state. A clean installation has no database file yet, so every
+        # schema used by the UI must exist before Situazione/DFM are created.
+        from utility import situazione_db
+        situazione_db.init_db()
+
         """Build all widgets."""
-        from gui.tabs.biglietti_tab import BigliettiTab
-        from gui.tabs.kamal_tab import KamalTab
+        # Only the pages needed for the landing dashboard are imported on the
+        # critical startup path. Heavy order/conversion pages import their
+        # parser/export stacks only when first opened.
         from gui.tabs.magazino_filato_tab import MagazinoFilatoTab
-        from gui.tabs.ordine_med_tab import OrdineMedTab
         from gui.tabs.overview_tab import OverviewTab
         from gui.tabs.prezzi_tab import PrezziTab
-        from gui.tabs.situazione_settimana_tab import SettimanaTab
         from gui.tabs.situazione_tab import SituazioneTab
-        from gui.tabs.master_data_tab import MasterDataTab
 
         def startup_step(text: str) -> None:
             self._startup_label.config(text=text)
@@ -440,17 +451,78 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         notebook.add(elvy_tab, text="Data Elvy")
         self._build_elvy_tab(elvy_tab)
 
-        # ── Biglietti: ERP order -> ELVY/MED workbook + Word tickets ──
-        startup_step("Loading Create (EXCEL+Biglietti)...")
-        self._biglietti_tab = BigliettiTab(
-            notebook, self._prefs, self._save_prefs, logger,
-            on_shared_cache_changed=self._on_shared_cache_changed,
-            on_notification=self._add_notification,
-        )
-        notebook.add(self._biglietti_tab, text="Create (EXCEL+Biglietti)")
+        # ── Deferred heavy pages ───────────────────────────────────────
+        # Heavy parser/export tabs are represented by lightweight frames at
+        # startup.  Their real widgets and dependencies are constructed only
+        # when the operator opens the page.  This removes pandas/openpyxl/
+        # pdfplumber work from the critical first-paint path without changing
+        # any business logic inside the pages themselves.
+        self._lazy_builders = {}
 
-        # ── Ordine: Ordine Elvy + Ordine Kamal, grouped under one parent tab ──
-        startup_step("Loading Order pages...")
+        # The page factories use ordinary import statements, not __import__("..."):
+        # PyInstaller only bundles modules it can see in import statements, so a
+        # page reachable through a string alone is missing from the installed exe
+        # and stays blank there (it works from source, which hides the problem).
+        def make_biglietti(parent):
+            from gui.tabs.biglietti_tab import BigliettiTab
+            return BigliettiTab(
+                parent, self._prefs, self._save_prefs, logger,
+                on_shared_cache_changed=self._on_shared_cache_changed,
+                on_notification=self._add_notification,
+            )
+
+        def make_kamal(parent):
+            from gui.tabs.kamal_tab import KamalTab
+            return KamalTab(parent, on_shared_cache_changed=self._on_shared_cache_changed)
+
+        def make_ordine_med(parent):
+            from gui.tabs.ordine_med_tab import OrdineMedTab
+            return OrdineMedTab(
+                parent, situazione_tab=self._situazione_tab, prefs=self._prefs,
+                save_prefs=self._save_prefs, logger=logger,
+                on_shared_cache_changed=self._on_shared_cache_changed,
+                on_notification=self._add_notification,
+            )
+
+        def make_settimana(parent):
+            from gui.tabs.situazione_settimana_tab import SettimanaTab
+            return SettimanaTab(parent, on_shared_cache_changed=self._on_shared_cache_changed)
+
+        def make_master_data(parent):
+            from gui.tabs.master_data_tab import MasterDataTab
+            return MasterDataTab(
+                parent, on_data_changed=self._refresh_notification_badge,
+                prezzi_tab=self._prezzi_tab,
+            )
+
+        def lazy_page(parent_book, text, builder):
+            placeholder = ttk.Frame(parent_book)
+            parent_book.add(placeholder, text=text)
+            self._lazy_builders[str(placeholder)] = (placeholder, builder)
+            return placeholder
+
+        def build_into(placeholder, factory, attr_name):
+            current = getattr(self, attr_name, None)
+            if current is not None and current.winfo_exists():
+                return current
+            child = factory(placeholder)
+            child.pack(fill="both", expand=True)
+            setattr(self, attr_name, child)
+            self._lazy_builders.pop(str(placeholder), None)
+            return child
+
+        # Create (EXCEL+Biglietti) is one of the heaviest pages at startup.
+        biglietti_placeholder = lazy_page(
+            notebook,
+            "Create (EXCEL+Biglietti)",
+            lambda ph: build_into(
+                ph,
+                lambda parent: make_biglietti(parent),
+                "_biglietti_tab",
+            ),
+        )
+
+        # ── Ordine: lightweight parent, heavy children on demand ─────────
         ordine_parent = ttk.Frame(notebook)
         notebook.add(ordine_parent, text="Ordine")
         ordine_notebook = ttk.Notebook(ordine_parent)
@@ -460,18 +532,26 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         ordine_notebook.add(po_tab, text="Ordine Elvy")
         self._build_po_tab(po_tab)
 
-        self._kamal_tab = KamalTab(ordine_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
-        ordine_notebook.add(self._kamal_tab, text="Ordine Kamal")
-
-        self._ordine_med_tab = OrdineMedTab(
-            ordine_notebook, situazione_tab=None, prefs=self._prefs,
-            save_prefs=self._save_prefs, logger=logger,
-            on_shared_cache_changed=self._on_shared_cache_changed,
-            on_notification=self._add_notification,
+        kamal_placeholder = lazy_page(
+            ordine_notebook,
+            "Ordine Kamal",
+            lambda ph: build_into(
+                ph,
+                lambda parent: make_kamal(parent),
+                "_kamal_tab",
+            ),
         )
-        ordine_notebook.add(self._ordine_med_tab, text="Ordine Med")
+        ordine_med_placeholder = lazy_page(
+            ordine_notebook,
+            "Ordine Med",
+            lambda ph: build_into(
+                ph,
+                lambda parent: make_ordine_med(parent),
+                "_ordine_med_tab",
+            ),
+        )
 
-        # ── Invoice: Bolla Med + Invoice Elvy, grouped under one parent tab ──
+        # ── Invoice: existing lightweight workflows stay eager ───────────
         startup_step("Loading Invoice pages...")
         invoice_parent = ttk.Frame(notebook)
         notebook.add(invoice_parent, text="Invoice")
@@ -486,11 +566,9 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         invoice_notebook.add(elvy_invoice_tab, text="Invoice Elvy")
         self._build_elvy_invoice_tab(elvy_invoice_tab)
 
-        # ── Situazione: Situazione Generale + Situazione Settimanale ──
+        # ── Situazione: core dashboard data is kept eager, but its DB restore
+        # is scheduled after first paint (see SituazioneTab) ───────────────
         startup_step("Loading Situation pages...")
-        # Situazione tab is a self-contained module (situazione_tab.py) — it
-        # manages its own uploads, SQLite state, and UI, so it's built by
-        # instantiating it directly rather than through a _build_*_tab method.
         situazione_parent = ttk.Frame(notebook)
         notebook.add(situazione_parent, text="Situazione")
         situazione_notebook = ttk.Notebook(situazione_parent)
@@ -502,13 +580,19 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         )
         situazione_notebook.add(self._situazione_tab, text="Situazione Generale")
 
-        self._settimana_tab = SettimanaTab(situazione_notebook, on_shared_cache_changed=self._on_shared_cache_changed)
-        situazione_notebook.add(self._settimana_tab, text="Situazione Settimanale")
+        settimana_placeholder = lazy_page(
+            situazione_notebook,
+            "Situazione Settimanale",
+            lambda ph: build_into(
+                ph,
+                lambda parent: make_settimana(parent),
+                "_settimana_tab",
+            ),
+        )
 
-        # Ordine Med's Consegna auto-scheduling needs Situazione's live
-        # current_df + Copertura data, which doesn't exist until now.
-        self._ordine_med_tab._situazione_tab = self._situazione_tab
-        self._situazione_tab.ordine_med_tab = self._ordine_med_tab
+        # Ordine Med is linked to Situazione when it is first constructed.
+        self._ordine_med_tab = None
+        self._situazione_tab.ordine_med_tab = None
 
         self._magazino_tab = MagazinoFilatoTab(notebook, on_shared_cache_changed=self._on_shared_cache_changed)
         notebook.add(self._magazino_tab, text="Magazino Filato")
@@ -521,11 +605,15 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         )
         notebook.add(self._prezzi_tab, text="Prezzi")
 
-        self._master_data_tab = MasterDataTab(
-            notebook, on_data_changed=self._refresh_notification_badge,
-            prezzi_tab=self._prezzi_tab,
+        master_placeholder = lazy_page(
+            notebook,
+            "Master Data",
+            lambda ph: build_into(
+                ph,
+                lambda parent: make_master_data(parent),
+                "_master_data_tab",
+            ),
         )
-        notebook.add(self._master_data_tab, text="Master Data")
 
         log_tab = ttk.Frame(notebook)
         notebook.add(log_tab, text="Log")
@@ -539,6 +627,38 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
         # "Filato Disponibile" column from it.
         self._situazione_tab.magazino_tab = self._magazino_tab
 
+        def _ensure_heavy_tabs() -> None:
+            """Materialize only the heavy consumers required by a bulk sync."""
+            lazy = self._lazy_builders.get(str(biglietti_placeholder))
+            if lazy is not None:
+                lazy[1](lazy[0])
+            if getattr(self, "_overview_tab", None) is not None:
+                self._overview_tab.biglietti_tab = getattr(self, "_biglietti_tab", None)
+                self._overview_tab.settimana_tab = getattr(self, "_settimana_tab", None)
+
+        def _start_background_schedules() -> None:
+            """Keep the scheduled PG-X e-mail report running without opening the Create page.
+
+            The report timer is started by the Create page's constructor, which is
+            lazy now: until that page was opened the scheduled report would never
+            fire. Only when a schedule is actually enabled is the page built (after
+            first paint, still hidden); everyone else keeps the faster start.
+            """
+            if not pgx_schedule_enabled(self._prefs):
+                return
+            lazy = self._lazy_builders.get(str(biglietti_placeholder))
+            if lazy is None:
+                return
+            try:
+                lazy[1](lazy[0])
+                if getattr(self, "_overview_tab", None) is not None:
+                    self._overview_tab.biglietti_tab = getattr(self, "_biglietti_tab", None)
+                logger.info("PG-X report schedule is enabled: Create page loaded in the background")
+            except Exception:  # noqa: BLE001 -- a failure here must never stop the application starting
+                logger.exception("Could not start the scheduled PG-X report")
+
+        self.after(2500, _start_background_schedules)
+
         # ── Overview: built last since it reads from the tabs above, but
         # inserted first so it's the landing page.
         startup_step("Loading Overview...")
@@ -546,25 +666,45 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
             notebook,
             self._situazione_tab,
             self._magazino_tab,
-            biglietti_tab=self._biglietti_tab,
+            biglietti_tab=getattr(self, "_biglietti_tab", None),
             prezzi_tab=self._prezzi_tab,
             save_prefs=self._save_prefs,
             prefs=self._prefs,
             on_shared_cache_changed=self._on_shared_cache_changed,
-            settimana_tab=self._settimana_tab,
+            settimana_tab=getattr(self, "_settimana_tab", None),
+            ensure_heavy_tabs=_ensure_heavy_tabs,
         )
         notebook.insert(0, self._overview_tab, text="📊 Overview")
         notebook.select(0)
 
         def _on_any_tab_changed(_event=None) -> None:
+            # Materialize only the page the operator actually selected.
+            # Building a page may import pandas/openpyxl/pdfplumber and may
+            # restore caches, so none of that belongs on the first-paint path.
+            widget = getattr(_event, "widget", notebook)
+            try:
+                selected = widget.select()
+                lazy = self._lazy_builders.get(selected)
+                if lazy is not None:
+                    placeholder, builder = lazy
+                    child = builder(placeholder)
+                    if child is not None:
+                        # builder() already packs the real child.
+                        self._lazy_builders.pop(selected, None)
+            except Exception as exc:
+                logger.exception("Could not lazy-load selected page: %s", exc)
+
             try:
                 if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._situazione_tab):
                     self._situazione_tab.on_shown()
             except tk.TclError:
                 pass
             try:
-                if notebook.select() == str(situazione_parent) and situazione_notebook.select() == str(self._settimana_tab):
-                    self._settimana_tab.on_shown()
+                selected_child = situazione_notebook.select()
+                if selected_child and selected_child == str(settimana_placeholder):
+                    child = getattr(self, "_settimana_tab", None)
+                    if child is not None:
+                        child.on_shown()
             except tk.TclError:
                 pass
             try:
@@ -598,7 +738,21 @@ class ConverterApp(PurchaseOrderWorkflowMixin, BollaWorkflowMixin, ElvyInvoiceWo
             pass
 
     def _on_shared_cache_changed(self) -> None:
-        """Refresh every consumer after any shared source is uploaded."""
+        """Coalesce shared-source notifications into one refresh pass.
+
+        Several uploads can trigger the same callback in quick succession;
+        rebuilding every consumer for each event wastes work and causes UI
+        churn. A short Tk debounce keeps the existing sync behavior intact.
+        """
+        try:
+            if self._shared_refresh_after_id is not None:
+                self.after_cancel(self._shared_refresh_after_id)
+        except tk.TclError:
+            self._shared_refresh_after_id = None
+        self._shared_refresh_after_id = self.after(75, self._refresh_shared_cache_changed_now)
+
+    def _refresh_shared_cache_changed_now(self) -> None:
+        self._shared_refresh_after_id = None
         self._refresh_magazino_status()
         if hasattr(self, "_situazione_tab"):
             self._situazione_tab.sync_shared_async()

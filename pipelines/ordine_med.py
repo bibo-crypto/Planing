@@ -346,7 +346,27 @@ def compute_check_articolo(records: list[OrdineMedRow], dfm_pairs: set[tuple[str
 _FILATO_DISPONIBILE_CACHE: tuple[str, int, int, dict] | None = None
 
 
-def load_filato_disponibile(path: Path) -> dict[int, int]:
+def load_filato_disponibile(path: Path | None = None) -> dict[int, int]:
+    """Return Filato Disponibile from SQLite first; *path* is legacy migration only.
+
+    {PARTITA: Mag.Rocche} -- filters to the same stock semantics as the
+    original workbook loader.
+    """
+    try:
+        from utility.source_manager import load as load_source
+        frame = load_source("magazino_summary")
+        if frame is not None and not frame.empty and {"partita", "mag_rocche"}.issubset(frame.columns):
+            out = {}
+            for row in frame.itertuples(index=False):
+                try:
+                    out[int(float(row.partita))] = int(float(row.mag_rocche or 0))
+                except (TypeError, ValueError):
+                    continue
+            return out
+    except Exception:
+        pass
+    if path is None or not Path(path).is_file():
+        return {}
     """{PARTITA: Mag.Rocche} -- filters to MAGAZZINO in {900160, 900910},
     excludes committed stock (MAGAZZINO=900160 and ORDINE=0), sums COLLI
     per PARTITA. Verified against real data.

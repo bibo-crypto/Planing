@@ -158,6 +158,16 @@ class OrdineMedTab(ttk.Frame):
         self.densita_path = Path(path)
         self._lbl_densita.config(text=str(self.densita_path), foreground="black")
         save_densita_cache(path)
+        try:
+            from exporters.biglietti_exporter import load_densita_query
+            from utility.source_manager import save as save_source_frame
+            import pandas as pd
+            density_map, _ = load_densita_query(Path(path))
+            rows = [{"partita": partita, **values} for partita, values in density_map.items()]
+            if rows:
+                save_source_frame("densita_lookup", pd.DataFrame(rows), path)
+        except Exception:
+            pass
         if self._on_shared_cache_changed:
             self._on_shared_cache_changed()
 
@@ -237,11 +247,12 @@ class OrdineMedTab(ttk.Frame):
 
             dfm_pairs = set()
             try:
-                import utility.situazione_db as situazione_db
-                dfm_info = situazione_db.get_all_uploads().get("dfm", {})
-                dfm_path = dfm_info.get("file_path")
-                if dfm_path and Path(dfm_path).is_file():
-                    dfm_pairs = ordine_med.load_dfm_articolo_colore(Path(dfm_path))
+                # DFM is persisted as a normalized SQLite snapshot. The raw workbook
+                # is not required after upload or after an application restart.
+                # Every Articolo/Colore pair of the saved DFM, all customer prefixes, from
+                # SQLite -- so "Check Articolo" works after a restart without the workbook.
+                from parsers.dfm_lookup import load_dfm_pairs
+                dfm_pairs = load_dfm_pairs()
             except Exception:
                 dfm_pairs = set()
             ordine_med.compute_check_articolo(records, dfm_pairs)
@@ -259,13 +270,9 @@ class OrdineMedTab(ttk.Frame):
             ordine_med.assign_consegna(records, machine_totals)
             ordine_med.compute_data_riconsegna(records)
 
-            densita_map = {}
-            if self.densita_path and self.densita_path.is_file():
-                densita_map, _errors = load_densita_query(self.densita_path)
+            densita_map, _errors = load_densita_query(self.densita_path if self.densita_path and self.densita_path.is_file() else None)
 
-            stock_map = {}
-            if self.magazino_path and self.magazino_path.is_file():
-                stock_map = ordine_med.load_filato_disponibile(self.magazino_path)
+            stock_map = ordine_med.load_filato_disponibile(self.magazino_path if self.magazino_path and self.magazino_path.is_file() else None)
             availability = ordine_med.compute_filato_availability(records, densita_map, stock_map)
             missing_articles = sorted({a.articolo for a in availability if a.mag_rocche is None})
             if missing_articles and self._on_notification:

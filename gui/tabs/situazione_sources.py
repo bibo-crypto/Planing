@@ -10,7 +10,7 @@ from tkinter import messagebox
 
 import parsers.situazione_loaders as data_loaders
 import utility.situazione_db as db
-from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache
+from parsers.dfm_lookup import build_dfm_lookup, load_dfm_cache, save_dfm_cache, save_dfm_workbook
 from parsers.prod_lookup import load_prod_cache, save_prod_cache
 from utility.path_manager import save_source, source_path
 from utility.utils import logger
@@ -72,107 +72,111 @@ class SituationSourcesMixin:
         if missing:
             summary.append("Not available:\n- " + "\n- ".join(missing))
         messagebox.showinfo("Upload Data", "\n\n".join(summary) or "No saved file paths found.")
-    def _auto_restore_saved_files(self):
-        """Restore saved upload paths and refresh once at application start.
+    def _refresh_after_restore(self):
+        """Rebuild the Situazione table at startup, but only when every source is available.
 
-        Loading is done off the Tk thread because the source workbooks can be
-        large.  The automatic refresh deliberately preserves comment history:
-        opening the program must rebuild the table, not advance New Comm. to
-        Old Comm.
+        With a source missing, _on_refresh() opens a "Missing files" box -- noise at
+        every launch for an operator who simply hasn't uploaded that file yet.
+        """
+        missing = [key for key in SOURCE_ORDER if key not in self.loaded_frames]
+        if missing:
+            logger.info("Situazione: startup refresh skipped, no saved data yet for: %s", ", ".join(missing))
+            return
+        try:
+            self._on_refresh(preserve_comment_history=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Situazione: SQLite startup refresh failed: %s", exc)
+
+    def _auto_restore_saved_files(self):
+        """Restore normalized source data from SQLite first.
+
+        The original Excel files are optional after a successful upload. They
+        are only read again when the operator explicitly uploads/replaces a
+        source. A source with no snapshot yet (saved by an older version) is
+        parsed once from its saved path and its snapshot is written, so the next
+        start is SQLite only.
         """
         if getattr(self, "_auto_restore_started", False):
             return
         self._auto_restore_started = True
         uploads = db.get_all_uploads()
+        restored = []
+        for key in SOURCE_ORDER:
+            frame = db.load_frame_cache(key)
+            if frame is not None and not frame.empty:
+                self.loaded_frames[key] = frame
+                restored.append(key)
+                if key == "copertura":
+                    self._copertura_revision += 1
+                if key in self.source_rows:
+                    self.source_rows[key].set_status(True, f"✅ {len(frame)} rows (SQLite)")
+        codes = db.load_frame_cache("codes")
+        if codes is not None and not codes.empty:
+            db.save_codes(codes)
+            self.codes_row.set_status(True, f"✅ Saved ({len(codes)} codes) (SQLite)")
+            restored.append("codes")
+        listini = db.load_frame_cache("listini")
+        if listini is not None and not listini.empty:
+            self.listini_row.set_status(True, f"✅ Saved ({len(listini)} rows) (SQLite)")
+            restored.append("listini")
+        if restored:
+            logger.info("Situazione: restored %s from SQLite", ", ".join(restored))
 
-        # The SQLite snapshot is already the fast local cache for the
-        # Situazione grid. If none of the saved source workbooks changed since
-        # their last upload, do not parse all six Excel files on every startup.
-        # The user can still use Upload Data when a fresh rebuild is needed.
-        if self._saved_snapshot_is_current(uploads):
-            self._startup_snapshot_current = True
-            # The SQLite snapshot is enough for the main grid, but the
-            # Copertura dashboard also needs the physical machine column.
-            self._restore_saved_copertura(uploads)
-            logger.info("Situazione: startup snapshot is current; skipped Excel restore")
-            return
-
-        paths = {
-            key: str(uploads.get(key, {}).get("file_path", ""))
-            for key in SOURCE_ORDER + ["codes"]
-        }
-        if not any(paths.values()):
+        # Sources with no snapshot but a saved workbook that still exists: one-time upgrade.
+        legacy = {}
+        for key in SOURCE_ORDER + ["codes"]:
+            if key in restored:
+                continue
+            path = str(uploads.get(key, {}).get("file_path", ""))
+            if path and os.path.isfile(path):
+                legacy[key] = path
+        if not legacy:
+            self._startup_snapshot_current = bool(restored)
+            self._refresh_after_restore()
             return
 
         self._startup_restore_in_progress = True
 
         def worker():
-            loaded = {}
-            errors = {}
-            for key in SOURCE_ORDER:
-                # DFM is an explicit-upload-only reference; never parse the
-                # saved historical workbook during startup.
-                if key == "dfm":
-                    continue
-                path = paths.get(key, "")
-                if not path:
-                    errors[key] = "not saved"
-                    continue
-                if not os.path.isfile(path):
-                    errors[key] = f"file not found: {path}"
-                    continue
+            loaded, errors = {}, {}
+            for key, path in legacy.items():
                 try:
-                    df, load_errors = data_loaders.LOADERS[key][1](path)
-                    if load_errors or df is None or df.empty:
-                        errors[key] = "; ".join(load_errors) if load_errors else "file is empty"
+                    if key == "codes":
+                        df, load_errors = data_loaders.load_codes(path)
                     else:
+                        df, load_errors = data_loaders.LOADERS[key][1](path)
+                    if not load_errors and df is not None and not df.empty:
                         loaded[key] = df
+                    else:
+                        errors[key] = "; ".join(load_errors) if load_errors else "file is empty"
                 except Exception as exc:  # noqa: BLE001
                     errors[key] = str(exc)
-
-            codes_df = None
-            codes_error = None
-            codes_path = paths.get("codes", "")
-            if codes_path:
-                if os.path.isfile(codes_path):
-                    try:
-                        codes_df, load_errors = data_loaders.load_codes(codes_path)
-                        if load_errors or codes_df is None or codes_df.empty:
-                            codes_error = "; ".join(load_errors) if load_errors else "file is empty"
-                    except Exception as exc:  # noqa: BLE001
-                        codes_error = str(exc)
-                else:
-                    codes_error = f"file not found: {codes_path}"
 
             def apply_result():
                 self._startup_restore_in_progress = False
                 for key, df in loaded.items():
+                    try:
+                        db.save_frame_cache(key, df, source_path=legacy[key])
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Could not cache %s in SQLite: %s", key, exc)
+                    if key == "codes":
+                        db.save_codes(df)
+                        self.codes_row.set_status(True, f"✅ Saved ({len(df)} codes)")
+                        continue
                     self.loaded_frames[key] = df
+                    if key == "copertura":
+                        self._copertura_revision += 1
                     self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
-                    db.save_upload(key, os.path.basename(paths[key]), len(df), "ok",
-                                   f"✅ {len(df)} rows - {os.path.basename(paths[key])}",
-                                   file_path=paths[key])
-                for key, error in errors.items():
-                    if key in self.source_rows:
-                        self.source_rows[key].set_status(False, f"❌ {error}")
-                if codes_df is not None and not codes_error:
-                    db.save_codes(codes_df)
-                    self.codes_row.set_status(True, f"✅ Saved ({len(codes_df)} codes)")
-                    db.save_upload("codes", os.path.basename(codes_path), len(codes_df), "ok",
-                                   f"✅ Saved ({len(codes_df)} codes) - {os.path.basename(codes_path)}",
-                                   file_path=codes_path)
-                elif codes_error:
-                    self.codes_row.set_status(False, f"❌ {codes_error}")
-
-                if not errors:
-                    self._on_refresh(preserve_comment_history=True)
-                else:
-                    logger.warning("Situazione: automatic restore skipped refresh; missing/invalid files: %s",
-                                   ", ".join(errors))
+                    if key == "dfm":
+                        self._save_shared_dfm(legacy[key])
+                if errors:
+                    logger.warning("Situazione: legacy startup restore had errors: %s", errors)
+                self._refresh_after_restore()
 
             self.after(0, apply_result)
 
         threading.Thread(target=worker, daemon=True).start()
+
     def _restore_saved_copertura(self, uploads):
         """Restore Copertura even when the main Situazione snapshot is current."""
         info = uploads.get("copertura", {}) if isinstance(uploads, dict) else {}
@@ -199,22 +203,10 @@ class SituationSourcesMixin:
         threading.Thread(target=worker, daemon=True).start()
     @staticmethod
     def _saved_snapshot_is_current(uploads):
-        """Return True when the SQLite table can be used without Excel I/O."""
+        """SQLite snapshots are authoritative; source files may be offline/moved."""
         if not db.get_all_states():
             return False
-        for key in SOURCE_ORDER:
-            info = uploads.get(key, {})
-            path = info.get("file_path", "")
-            uploaded_at = info.get("uploaded_at", "")
-            if info.get("status") != "ok" or not path or not os.path.isfile(path) or not uploaded_at:
-                return False
-            try:
-                uploaded_timestamp = datetime.fromisoformat(str(uploaded_at)).timestamp()
-                if os.path.getmtime(path) > uploaded_timestamp + 1:
-                    return False
-            except (OSError, TypeError, ValueError):
-                return False
-        return True
+        return bool(db.load_frame_cache("copertura") is not None)
     def sync_shared_dfm(self):
         """DFM is intentionally never restored from disk at startup.
 
@@ -244,7 +236,7 @@ class SituationSourcesMixin:
 
         def worker():
             prod_result = None
-            # DFM deliberately omitted: it is an explicit-upload-only source.
+            # DFM data is restored from its SQLite snapshot; the workbook is upload-only.
             if prod_path and os.path.isfile(prod_path) and self._shared_prod_path != prod_path:
                 try:
                     prod_result = data_loaders.load_data_prod(prod_path)
@@ -324,16 +316,16 @@ class SituationSourcesMixin:
 
         threading.Thread(target=worker, daemon=True).start()
     def _save_shared_dfm(self, path):
-        """Update the shared DFM cache when Situazione is the upload source."""
+        """Persist one uploaded DFM workbook for all supported customer prefixes."""
         try:
-            entries = build_dfm_lookup(Path(path))
-            if entries:
-                save_dfm_cache(entries, Path(path).name, Path(path))
-                self._shared_dfm_path = str(Path(path))
-                if self._on_shared_cache_changed:
-                    self._on_shared_cache_changed()
+            counts = save_dfm_workbook(Path(path), Path(path).name)
+            self._shared_dfm_path = str(Path(path))
+            if self._on_shared_cache_changed:
+                self._on_shared_cache_changed()
+            logger.info("DFM imported into SQLite: %s", counts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update shared DFM reference: %s", exc)
+
     def sync_shared_prod(self):
         """Load the Produzione file selected in either page from the shared cache."""
         cache = load_prod_cache()
@@ -385,12 +377,14 @@ class SituationSourcesMixin:
             return
 
         self.loaded_frames[key] = df
+        try:
+            changed = db.save_frame_cache(key, df, source_path=display_path)
+            if not changed:
+                logger.info("Situazione: %s upload is identical to the SQLite snapshot", key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not cache %s in SQLite: %s", key, exc)
         if key == "copertura":
             self._copertura_revision += 1
-            try:
-                db.save_frame_cache("copertura", df)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not cache Copertura in SQLite: %s", exc)
         msg = f"✅ {len(df)} rows - {os.path.basename(display_path)}"
         self.source_rows[key].set_status(True, f"✅ {len(df)} rows")
         db.save_upload(key, os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
@@ -415,10 +409,17 @@ class SituationSourcesMixin:
             return
 
         db.save_codes(df)
+        try:
+            changed = db.save_frame_cache("codes", df, source_path=display_path)
+        except Exception as exc:
+            changed = True
+            logger.warning("Could not cache Articoli in SQLite: %s", exc)
         save_source("articoli", display_path)
         msg = f"✅ Saved ({len(df)} codes) - {os.path.basename(display_path)}"
         self.codes_row.set_status(True, msg)
         db.save_upload("codes", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
+        if not changed:
+            messagebox.showwarning("No changes", "Articoli is identical to the data already stored in SQLite; the existing database data was kept.")
         logger.info("Situazione: yarn codes reference updated — %d codes (%s)", len(df), os.path.basename(display_path))
 
         # Also feed Biglietti's Marca-based Titolo cache, so uploading
@@ -431,6 +432,13 @@ class SituationSourcesMixin:
             marca_map, _errors = biglietti_exporter.load_articoli_marca_map(Path(path))
             if marca_map:
                 articoli_cache.save_articoli_cache(display_path)
+                try:
+                    import pandas as pd
+                    from utility.source_manager import save as save_source_frame
+                    marca_df = pd.DataFrame({"articolo": list(marca_map), "marca": list(marca_map.values())})
+                    save_source_frame("articoli_marca", marca_df, display_path)
+                except Exception:
+                    pass
         except Exception:
             pass
     def _handle_listini_upload(self, _key, path, cache_path=None):
@@ -449,10 +457,17 @@ class SituationSourcesMixin:
             return
 
         prezzi_cache.save_prezzi_cache(display_path)
+        try:
+            changed = db.save_frame_cache("listini", df, source_path=display_path)
+        except Exception as exc:
+            changed = True
+            logger.warning("Could not cache Listini in SQLite: %s", exc)
         save_source("listini", display_path)
         msg = f"✅ Saved ({len(df)} rows) - {os.path.basename(display_path)}"
         self.listini_row.set_status(True, msg)
         db.save_upload("listini", os.path.basename(display_path), len(df), "ok", msg, file_path=str(display_path))
+        if not changed:
+            messagebox.showwarning("No changes", "Listini is identical to the data already stored in SQLite; the existing database data was kept.")
         logger.info("Situazione: Listini (Prezzi) updated — %d rows (%s)", len(df), os.path.basename(display_path))
         self.refresh_prezzo_densita()
     def _refresh_source_labels_from_db(self):

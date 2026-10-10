@@ -15,6 +15,7 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 
 from calculate import prezzi as logic
+from utility import notifications
 from utility.prezzi_cache import load_prezzi_cache, save_prezzi_cache
 from utility.excel_io import safe_save_workbook
 from utility.path_manager import save_source
@@ -158,6 +159,43 @@ class PrezziTab(ttk.Frame):
         self._load_path(path, save_cache=True)
 
     def _restore_from_cache(self) -> None:
+        # SQLite is the runtime source of truth. The original workbook path is
+        # metadata only and is deliberately not required after restart.
+        try:
+            from utility.source_manager import load as load_source, source_name
+            cached = load_source("listini")
+        except Exception:
+            cached = None
+        if cached is not None and not cached.empty:
+            try:
+                # The snapshot holds the categories as they were at upload time; the
+                # rules may have changed since (a category assigned in Master Data).
+                cached = logic.enrich_categories(cached)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Prezzi: couldn't re-apply category rules to the saved Listini: %s", exc)
+            self._base_df = cached.copy(deep=True)
+            self.prezzi_df = self._base_df
+            self._loaded_source_path = "sqlite://listini"
+            self._loaded_file_name = source_name("listini") or "SQLite"
+            validated = True
+            try:
+                self._validation_issues = list(logic.validate_price_data(self._base_df))
+            except Exception:
+                self._validation_issues = []
+                validated = False
+            if validated:
+                try:
+                    # A category assigned in Master Data closes its review notification.
+                    notifications.resolve_missing("prezzi-", {issue["key"] for issue in self._validation_issues})
+                except Exception:  # noqa: BLE001
+                    logger.exception("Prezzi: couldn't auto-resolve fixed notifications")
+            if self._on_notifications:
+                self._on_notifications([{**issue, "page": "Prezzi"} for issue in self._validation_issues])
+            # (_refresh_tree_chunked() does not exist: calling it raised AttributeError
+            # on every start that had Listini in SQLite, so the table stayed empty.)
+            self._apply_search_and_sort()
+            return
+        # Legacy installations: one-time migration from an existing workbook.
         cache = load_prezzi_cache()
         source_path = cache.get("source_path")
         if source_path and Path(source_path).is_file():
@@ -200,6 +238,8 @@ class PrezziTab(ttk.Frame):
                         messagebox.showerror("Error", "\n".join(errors))
                     else:
                         logger.warning("Prezzi: could not restore cached file: %s", "; ".join(errors))
+                    if on_done:
+                        on_done()
                     return
                 # Articoli may be uploaded after Listini; enrich again here
                 # so the Category column and category rules are immediately
@@ -215,6 +255,16 @@ class PrezziTab(ttk.Frame):
                 self._update_status(len(self._base_df))
                 if validation_error is not None:
                     logger.warning("Prezzi: price validation failed: %s", validation_error)
+                if validation_error is None:
+                    # `issues` is the complete list for this file, so open
+                    # "prezzi-*" notifications missing from it were fixed (a
+                    # corrected Listini, or a category just assigned) and close.
+                    # Never after a failed validation: an empty list would then
+                    # look like "everything is fixed".
+                    try:
+                        notifications.resolve_missing("prezzi-", {issue["key"] for issue in issues})
+                    except Exception:  # noqa: BLE001 -- housekeeping must never break the load
+                        logger.exception("Prezzi: couldn't auto-resolve fixed notifications")
                 if self._on_notifications:
                     self._on_notifications([
                         {**issue, "page": "Prezzi"}
@@ -226,6 +276,11 @@ class PrezziTab(ttk.Frame):
                 if save_cache:
                     save_prezzi_cache(path)
                     save_source("listini", path)
+                    try:
+                        from utility.source_manager import save as save_source_frame
+                        save_source_frame("listini", df, path)
+                    except Exception:  # noqa: BLE001 -- the upload itself succeeded
+                        logger.exception("Prezzi: couldn't save the Listini snapshot in SQLite")
                     if self._on_shared_cache_changed:
                         self._on_shared_cache_changed()
                 self._apply_search_and_sort()
@@ -239,6 +294,19 @@ class PrezziTab(ttk.Frame):
     def reapply_categories(self, on_done=None) -> None:
         """Reload the current Listini source against saved category overrides."""
         if not self._loaded_source_path:
+            if on_done:
+                on_done()
+            return
+        if self._uploading:
+            # A load is already running and may have read the categories before
+            # this change; reloading once it is done keeps the newest result last.
+            self.after(300, lambda: self.reapply_categories(on_done))
+            return
+        if str(self._loaded_source_path).startswith("sqlite://"):
+            # The data came from SQLite, so there is no workbook to read again
+            # ("sqlite://listini" is a label, not a path): re-run the category
+            # rules on the saved rows instead.
+            self._restore_from_cache()
             if on_done:
                 on_done()
             return
@@ -504,17 +572,31 @@ class PrezziTab(ttk.Frame):
         if anomalies.empty:
             ttk.Label(frame, text="No price changes of 10% or more found.").grid(row=0, column=0)
         else:
-            for _, row in anomalies.iterrows():
-                try:
-                    tag = "up" if float(row["pct_change"]) > 0 else "down"
-                except (TypeError, ValueError):
-                    tag = "up"
-                tree.insert("", "end", values=(
-                    row["CLARTICOLO"], row["CLCOLORE"], row["CLDESCR"], row.get("CATEGORY", ""),
-                    f"{float(row['old_price']):.2f}" if str(row["old_price"]) else "",
-                    f"{float(row['new_price']):.2f}" if str(row["new_price"]) else "",
-                    f"{float(row['pct_change']):+.1f}%" if str(row["pct_change"]) else "", row["changed_on"], row.get("issue", ""),
-                ), tags=(tag,))
+            # Treeview insertion is a Tk operation and can freeze the window
+            # for thousands of anomalies. Insert small batches and yield back
+            # to Tk between them, exactly like the main Prezzi table.
+            rows = anomalies.to_dict(orient="records")
+            batch_size = 150
+
+            def insert_batch(start: int = 0) -> None:
+                if not window.winfo_exists():
+                    return
+                for row in rows[start:start + batch_size]:
+                    try:
+                        tag = "up" if float(row.get("pct_change", 0)) > 0 else "down"
+                    except (TypeError, ValueError):
+                        tag = "up"
+                    tree.insert("", "end", values=(
+                        row.get("CLARTICOLO", ""), row.get("CLCOLORE", ""), row.get("CLDESCR", ""), row.get("CATEGORY", ""),
+                        f"{float(row['old_price']):.2f}" if str(row.get("old_price", "")) else "",
+                        f"{float(row['new_price']):.2f}" if str(row.get("new_price", "")) else "",
+                        f"{float(row['pct_change']):+.1f}%" if str(row.get("pct_change", "")) else "", row.get("changed_on", ""), row.get("issue", ""),
+                    ), tags=(tag,))
+                next_start = start + batch_size
+                if next_start < len(rows):
+                    window.after(1, insert_batch, next_start)
+
+            insert_batch()
 
         def export_anomalies():
             if anomalies.empty:

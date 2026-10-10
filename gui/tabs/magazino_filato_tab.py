@@ -59,29 +59,40 @@ class MagazinoFilatoTab(ttk.Frame):
         self.after_idle(self.sync_shared_async)
 
     def _restore_summary_from_cache(self):
-        """Restore the last Magazino summary without opening the workbook."""
+        """Restore the normalized Magazino summary from SQLite only."""
+        try:
+            from utility.source_manager import load as load_source, source_name
+            summary = load_source("magazino_summary")
+            if summary is not None and not summary.empty:
+                required = {"articolo", "partita", "mag_rocche", "mag_peso"}
+                if required.issubset(summary.columns):
+                    self.magazino_summary = summary.copy()
+                    self._base_df = summary.copy()
+                    self._shared_path = "sqlite://magazino_summary"
+                    self.status_var.set(f"✅ SQLite: {len(summary)} batches - {source_name('magazino_summary')}")
+                    self._data_revision += 1
+                    self._recompute()
+                    return
+        except Exception as exc:
+            logger.warning("Could not restore Magazino from SQLite: %s", exc)
+
+        # Legacy cache fallback for installations created before SQLite snapshots.
         cache = load_magazino_cache()
         rows = cache.get("summary_rows")
-        source_path = str(cache.get("source_path", ""))
         if not isinstance(rows, list) or not rows:
             return
         try:
             summary = pd.DataFrame(rows)
             required = {"articolo", "partita", "mag_rocche", "mag_peso"}
-            if not required.issubset(summary.columns):
-                return
-            self.magazino_summary = summary
-            self._base_df = summary.copy()
-            # Leave _shared_path empty so sync_shared_async still validates the
-            # current workbook in the background after showing this cache.
-            self.status_var.set(
-                f"✅ Cached: {len(summary)} batches" +
-                (f" - {Path(source_path).name}" if source_path else "")
-            )
-            self._data_revision += 1
-            self._recompute()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not restore Magazino summary cache: %s", exc)
+            if required.issubset(summary.columns):
+                self.magazino_summary = summary
+                self._base_df = summary.copy()
+                self._shared_path = "legacy-cache://magazino"
+                self.status_var.set(f"✅ Cached: {len(summary)} batches")
+                self._data_revision += 1
+                self._recompute()
+        except Exception as exc:
+            logger.warning("Could not restore legacy Magazino summary cache: %s", exc)
 
     def _restore_shared_lotti(self):
         cache = load_lotti_cache()
@@ -129,9 +140,26 @@ class MagazinoFilatoTab(ttk.Frame):
         self._recompute()
 
     def sync_shared_lotti_async(self):
-        """Restore LOTTI in a worker so opening the app stays responsive."""
+        """Restore normalized LOTTI data from SQLite; Excel is upload-only."""
         if self._lotti_syncing:
             return
+        try:
+            from utility import situazione_db
+            from utility.source_manager import is_current, load as load_source, source_name
+            if is_current("lotti_summary"):
+                fingerprint = situazione_db.snapshot_fingerprint("lotti_summary")
+                if fingerprint and fingerprint == getattr(self, "_restored_lotti_fp", None):
+                    return
+                cached = load_source("lotti_summary")
+                if cached is not None and not cached.empty:
+                    self.lotti_summary = cached.copy(deep=True)
+                    self._shared_lotti_path = "sqlite://lotti_summary"
+                    self._restored_lotti_fp = fingerprint
+                    self.lotti_status_var.set(f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - SQLite ({source_name('lotti_summary')})")
+                    self._recompute()
+                    return
+        except Exception:
+            pass
         source_path = str(load_lotti_cache().get("source_path", ""))
         if not source_path or not Path(source_path).is_file() or self._shared_lotti_path == source_path:
             return
@@ -150,6 +178,12 @@ class MagazinoFilatoTab(ttk.Frame):
                     return
                 self.lotti_summary = lotti_logic.summarize_by_partita(df)
                 self._shared_lotti_path = source_path
+                try:
+                    from utility.source_manager import save as save_source_frame
+                    save_source_frame("lotti_data", df, source_path)
+                    save_source_frame("lotti_summary", self.lotti_summary, source_path)
+                except Exception:
+                    pass
                 self.lotti_status_var.set(
                     f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {Path(source_path)}"
                 )
@@ -255,6 +289,11 @@ class MagazinoFilatoTab(ttk.Frame):
                 self._base_df = self.magazino_summary.copy()
                 self._shared_path = display_path
                 save_magazino_cache(display_path, self.magazino_summary)
+                try:
+                    from utility.source_manager import save as save_source_frame
+                    save_source_frame("magazino_summary", self.magazino_summary, display_path)
+                except Exception:
+                    pass
                 if self._on_shared_cache_changed:
                     self._on_shared_cache_changed()
                 self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {os.path.basename(display_path)}")
@@ -288,6 +327,12 @@ class MagazinoFilatoTab(ttk.Frame):
         self.lotti_summary = lotti_logic.summarize_by_partita(df)
         self._shared_lotti_path = display_path
         save_lotti_cache(display_path)
+        try:
+            from utility.source_manager import save as save_source_frame
+            save_source_frame("lotti_data", df, display_path)
+            save_source_frame("lotti_summary", self.lotti_summary, display_path)
+        except Exception:
+            pass
         if self._on_shared_cache_changed:
             self._on_shared_cache_changed()
         self.lotti_status_var.set(f"✅ {len(self.lotti_summary)} Partita/Lotto pairs - {display_path}")
@@ -296,9 +341,28 @@ class MagazinoFilatoTab(ttk.Frame):
         self._recompute()
 
     def sync_shared_async(self):
-        """Restore a Magazino export selected elsewhere in the app without blocking the UI."""
+        """Restore normalized Magazino data from SQLite; Excel is upload-only."""
         if self._syncing:
             return
+        try:
+            from utility import situazione_db
+            from utility.source_manager import is_current, load as load_source, source_name
+            if is_current("magazino_summary"):
+                fingerprint = situazione_db.snapshot_fingerprint("magazino_summary")
+                if fingerprint and fingerprint == getattr(self, "_restored_magazino_fp", None):
+                    return          # SQLite holds nothing new since the last restore
+                cached = load_source("magazino_summary")
+                if cached is not None and not cached.empty:
+                    self.magazino_summary = cached.copy(deep=True)
+                    self._base_df = self.magazino_summary.copy()
+                    self._data_revision += 1
+                    self._shared_path = "sqlite://magazino_summary"
+                    self._restored_magazino_fp = fingerprint
+                    self.status_var.set(f"✅ {len(self.magazino_summary)} batches - SQLite ({source_name('magazino_summary')})")
+                    self._recompute()
+                    return
+        except Exception:
+            pass
         cache = load_magazino_cache()
         source_path = str(cache.get("source_path", ""))
         if not source_path or self._shared_path == source_path or not os.path.isfile(source_path):
@@ -321,6 +385,12 @@ class MagazinoFilatoTab(ttk.Frame):
                 self._base_df = self.magazino_summary.copy()
                 self._shared_path = source_path
                 save_magazino_cache(source_path, self.magazino_summary)
+                try:
+                    # The file was chosen on another page: bring SQLite up to date with it.
+                    from utility.source_manager import save as save_source_frame
+                    save_source_frame("magazino_summary", self.magazino_summary, source_path)
+                except Exception:
+                    pass
                 self.status_var.set(f"✅ {len(self.magazino_summary)} batches - {source_path}")
                 self._recompute()
                 if self._on_shared_cache_changed:

@@ -33,6 +33,17 @@ MIN_CATEGORY_EVIDENCE = 2
 
 # Memoize the parsed result in-process as well as in SQLite.
 _PREZZI_CACHE: dict[tuple, pd.DataFrame] = {}
+_ARTICOLI_MARCA_CACHE: tuple[str, int, int, dict[str, str]] | None = None
+
+# Business ownership is determined by the article family, not guessed from
+# whatever happens to be present in Listini. Keep this map explicit and easy
+# to audit when a new customer family is introduced.
+CUSTOMER_PREFIX_MAP = {
+    "C010": "MED",
+    "C011": "MED",
+    "C130": "ELVY",
+    "C170": "EL KAMAL",
+}
 
 def _format_codice(value) -> str:
     if pd.isna(value):
@@ -122,6 +133,35 @@ def _category_overrides_fingerprint() -> tuple[int, int] | None:
     except OSError:
         return None
     return (stat.st_mtime_ns, stat.st_size)
+
+
+def _articoli_marca_fingerprint() -> tuple | None:
+    """Fingerprint normalized Articoli Marca in SQLite; legacy path fallback only."""
+    try:
+        from utility.situazione_db import snapshot_fingerprint
+        fp = snapshot_fingerprint("articoli_marca")
+        if fp:
+            return ("sqlite", fp)
+    except Exception:
+        pass
+    try:
+        from utility.articoli_cache import load_articoli_cache
+        source = clean_text(load_articoli_cache().get("source_path"))
+        stat = Path(source).stat() if source else None
+        return ("legacy", stat.st_mtime_ns, stat.st_size) if stat else None
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def category_sources_fingerprint() -> tuple:
+    """Fingerprint of everything that decides an article's category.
+
+    The bundled reference map plus the user's manual assignments. Any cache
+    that holds data with CATEGORY (or a price lookup built from it) must
+    include this in its key, or it keeps serving the old categories after an
+    assignment is added or removed in Master Data > Category Review.
+    """
+    return (reference_map_fingerprint(), _category_overrides_fingerprint(), _articoli_marca_fingerprint())
 
 
 @lru_cache(maxsize=1)
@@ -221,15 +261,21 @@ def remove_category_override(article: str) -> None:
 
 
 def known_categories(df: pd.DataFrame | None = None) -> list[str]:
-    categories = set(_reference_category_map().values())
-    categories.update(_load_category_overrides().values())
+    """Every category name in use, each listed once however it is capitalised.
+
+    The bundled map spells names as in the JSON ("MED-COTTONE") while the
+    Listini data carries the display form ("MED-Cottone"); both are passed
+    through _format_category so the dropdown doesn't show the same category twice.
+    """
+    names = list(_reference_category_map().values()) + list(_load_category_overrides().values())
     if df is not None and not df.empty and "CATEGORY" in df.columns:
-        categories.update(
-            _format_category(value)
-            for value in df["CATEGORY"].dropna()
-            if clean_text(value)
-        )
-    return sorted((category for category in categories if category), key=str.casefold)
+        names += [value for value in df["CATEGORY"].dropna() if clean_text(value)]
+    unique: dict[str, str] = {}
+    for name in names:
+        formatted = _format_category(name)
+        if formatted:
+            unique.setdefault(formatted.casefold(), formatted)
+    return sorted(unique.values(), key=str.casefold)
 
 
 def override_warning(article: str, category: str) -> str:
@@ -329,6 +375,48 @@ def category_for_article(article) -> str:
     return _format_category(category) if category else ""
 
 
+def customer_for_article(article) -> str:
+    """Resolve the business customer from the article family prefix."""
+    key = clean_text(article).upper()
+    return CUSTOMER_PREFIX_MAP.get(key[:4], "")
+
+
+def _load_articoli_marca_lookup() -> dict[str, str]:
+    """Read normalized Articoli Marca from SQLite first; legacy Excel only for migration."""
+    global _ARTICOLI_MARCA_CACHE
+    try:
+        from utility.situazione_db import snapshot_fingerprint
+        from exporters.biglietti_exporter import load_articoli_marca_lookup
+        fp = snapshot_fingerprint("articoli_marca")
+        if fp:
+            key = ("sqlite", fp)
+            if _ARTICOLI_MARCA_CACHE and _ARTICOLI_MARCA_CACHE[:2] == key:
+                return _ARTICOLI_MARCA_CACHE[2]
+            result = {clean_text(k).upper(): clean_text(v) for k, v in load_articoli_marca_lookup().items() if clean_text(k)}
+            _ARTICOLI_MARCA_CACHE = (*key, result)
+            return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Prezzi: SQLite Articoli Marca lookup failed: %s", exc)
+    try:
+        from utility.articoli_cache import load_articoli_cache
+        cache = load_articoli_cache()
+        source = clean_text(cache.get("source_path"))
+        if not source or not Path(source).is_file():
+            return {}
+        path = Path(source)
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if _ARTICOLI_MARCA_CACHE and _ARTICOLI_MARCA_CACHE[:3] == key:
+            return _ARTICOLI_MARCA_CACHE[3]
+        from exporters.biglietti_exporter import load_articoli_marca_lookup
+        result = {clean_text(k).upper(): clean_text(v) for k, v in load_articoli_marca_lookup().items() if clean_text(k)}
+        _ARTICOLI_MARCA_CACHE = (*key, result)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Prezzi: could not load legacy Articoli Marca lookup: %s", exc)
+        return {}
+
+
 def _category_customer_map(article_categories: dict[str, str]) -> dict[str, str]:
     customers: dict[str, str] = {}
     ambiguous: set[str] = set()
@@ -363,7 +451,13 @@ def _signature_number(value):
 
 
 def enrich_categories(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    # Review flags describe the previous pass. A frame that is enriched again (restored
+    # from SQLite, or after a category was assigned) must not keep a stale "needs review"
+    # on an article that has been placed meanwhile: when nothing is unplaced any more the
+    # code below never touches the column, so the old flags would survive and keep the
+    # review notification alive.
+    out = df.drop(columns=[c for c in ("_CATEGORY_REVIEW", "_CATEGORY_SUGGESTION", "_CATEGORY_EVIDENCE")
+                           if c in df.columns])
     provided_category = (
         out["CATEGORY"].map(clean_text)
         if "CATEGORY" in out.columns
@@ -386,6 +480,24 @@ def enrich_categories(df: pd.DataFrame) -> pd.DataFrame:
         category = category.mask(customer.eq(""), marca).mask(marca.eq(""), customer)
         fill_category = out["CATEGORY"].eq("") & category.ne("")
         out.loc[fill_category, "CATEGORY"] = category[fill_category]
+
+    # Preferred fallback for articles not covered by the static category map:
+    # customer comes from the article family, Marca comes from Articoli.xlsx.
+    # This also makes C170/EL KAMAL a first-class customer instead of relying
+    # on peer inference or an incomplete category reference file.
+    if out["CATEGORY"].eq("").any():
+        marca_map = _load_articoli_marca_lookup()
+        if marca_map:
+            explicit_customer = article_keys.map(customer_for_article)
+            explicit_marca = article_keys.map(marca_map).fillna("").map(clean_text)
+            category = explicit_customer + " - " + explicit_marca
+            category = category.mask(explicit_customer.eq(""), explicit_marca)
+            # Without a Marca there is nothing to group the article by: "MED - "
+            # alone would put every Marca-less MED article into one shared
+            # category and let unrelated articles inherit each other's prices.
+            # Those articles stay unplaced (peer inference / Category Review).
+            fill_category = out["CATEGORY"].eq("") & explicit_marca.ne("")
+            out.loc[fill_category, "CATEGORY"] = category[fill_category].map(_format_category)
 
     unknown_mask = out["CATEGORY"].eq("") & article_keys.ne("")
     if unknown_mask.any():
@@ -524,12 +636,10 @@ def load_prezzi(path: str | Path) -> tuple[pd.DataFrame | None, list[str]]:
     try:
         source = Path(path).resolve()
         stat = source.stat()
-        # 8: include the category reference and manual-override fingerprints;
-        # both are baked into CATEGORY in the cached frame.
-        fingerprint = (
-            8, str(source), stat.st_mtime_ns, stat.st_size,
-            reference_map_fingerprint(), _category_overrides_fingerprint(),
-        )
+        # 9: every input of CATEGORY is in the key (reference map, manual
+        # overrides and the uploaded Articoli file behind the Marca fallback):
+        # the category is baked into the cached frame.
+        fingerprint = (9, str(source), stat.st_mtime_ns, stat.st_size, *category_sources_fingerprint())
     except OSError:
         pass
     if fingerprint is not None:
